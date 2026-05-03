@@ -309,6 +309,8 @@ jobs:
         with:
           dotnet-version: "10.0.x"
       - uses: mlugg/setup-zig@v2
+        with:
+          use-cache: false
       - uses: oven-sh/setup-bun@v2
       - uses: ruby/setup-ruby@v1
         with:
