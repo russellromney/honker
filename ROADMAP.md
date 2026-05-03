@@ -132,6 +132,12 @@ Shipped in PR #29, with follow-up release prep in PR #33.
 
 > After: Phase Wake Parity · Before: 1.0 release prep
 
+> **Status:** core + Python + Node shipped in PR #30 (universal polling
+> SQLITE_BUSY fix, opt-in `kernel`/`shm` backends behind Cargo features,
+> sync baseline handshake, watcher-death propagation). Polling soaked
+> 600 s under sustained writes — every commit observed, integrity ok.
+> Remaining work: bring Bun, Go, Rust, Ruby, C++, Elixir to parity.
+
 The experimental `kernel` and `shm` watcher backends ship in
 `honker-core` and are wired through Python and Node only. Bring the
 remaining bindings to parity so users can opt in from any language.
