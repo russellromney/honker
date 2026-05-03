@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sqlite3
 import subprocess
 import sys
-import textwrap
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -186,6 +187,20 @@ async def stream_read(db_path, stream_name, consumer, count):
         close_db(db)
 
 
+async def listen_once(db_path, channel):
+    db = honker.open(db_path)
+    try:
+        it = db.listen(channel)
+        print("READY", flush=True)
+        note = await asyncio.wait_for(it.__anext__(), timeout=IDLE_POLL_S)
+        print("RESULT " + json.dumps({{
+            "payload": note.payload,
+            "seen_at": time.time(),
+        }}, sort_keys=True), flush=True)
+    finally:
+        close_db(db)
+
+
 def raw_sql_enqueue(db_path, ext_path, commit):
     conn = sqlite3.connect(db_path)
     conn.enable_load_extension(True)
@@ -193,11 +208,13 @@ def raw_sql_enqueue(db_path, ext_path, commit):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("SELECT honker_bootstrap()")
     conn.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, email TEXT)")
+    order_id = 2 if commit == "commit" else 1
+    email = "alice@example.com" if commit == "commit" else "rollback@example.com"
     conn.execute("BEGIN IMMEDIATE")
-    conn.execute("INSERT INTO orders (id, email) VALUES (1, 'alice@example.com')")
+    conn.execute("INSERT INTO orders (id, email) VALUES (?, ?)", (order_id, email))
     conn.execute(
         "SELECT honker_enqueue(?, ?, NULL, NULL, 0, 3, NULL)",
-        ("emails", json.dumps({{"to": "alice@example.com", "order_id": 1}})),
+        ("emails", json.dumps({{"to": email, "order_id": order_id}})),
     )
     if commit == "commit":
         conn.commit()
@@ -228,6 +245,8 @@ async def main():
         await lock_waiter(sys.argv[2], sys.argv[3], sys.argv[4])
     elif role == "stream-read":
         await stream_read(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    elif role == "listen-once":
+        await listen_once(sys.argv[2], sys.argv[3])
     elif role == "raw-sql-enqueue":
         raw_sql_enqueue(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
@@ -262,15 +281,23 @@ def _run(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
 
 def _line(proc: subprocess.Popen, timeout: float = 12.0) -> str:
     assert proc.stdout is not None
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    lines: queue.Queue[str | None] = queue.Queue(maxsize=1)
+
+    def reader() -> None:
         line = proc.stdout.readline()
-        if line:
-            return line.strip()
-        if proc.poll() is not None:
-            break
-    stderr = ""
-    if proc.stderr is not None:
+        lines.put(line.strip() if line else None)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    try:
+        line = lines.get(timeout=timeout)
+        if line is not None:
+            return line
+    except queue.Empty:
+        pass
+
+    stderr = "<still running>"
+    if proc.poll() is not None and proc.stderr is not None:
         stderr = proc.stderr.read()
     raise AssertionError(f"child produced no line; rc={proc.poll()} stderr={stderr}")
 
@@ -320,12 +347,18 @@ def test_crashed_worker_claim_is_reclaimed_by_sleeping_worker(db_path):
     assert _json_line(_line(crashed), prefix="CLAIMED ") == {"kind": "recover"}
     crashed.wait(timeout=5.0)
     assert crashed.returncode == 0
+    rows = db.query(
+        "SELECT claim_expires_at FROM _honker_jobs WHERE queue='reclaim'"
+    )
+    claim_expires_at = int(rows[0]["claim_expires_at"])
 
     rescuer = _spawn("claim", db_path, "reclaim", "rescuer")
     try:
         assert _line(rescuer) == "READY"
         got = _json_line(_line(rescuer, timeout=8.0))
         assert got["payload"] == {"kind": "recover"}
+        assert got["claimed_at"] >= claim_expires_at - 0.05
+        assert got["claimed_at"] <= claim_expires_at + 3.0
         _finish(rescuer)
     finally:
         if rescuer.poll() is None:
@@ -346,12 +379,17 @@ def test_retry_backoff_wakes_then_exhausts_to_dead(db_path):
     finally:
         if first.poll() is None:
             first.kill()
+    retry_due_at = int(
+        db.query("SELECT run_at FROM _honker_jobs WHERE queue='retry'")[0]["run_at"]
+    )
 
     second = _spawn("retry-claim", db_path, "retry", "retry-b", "0")
     try:
         assert _line(second) == "READY"
         second_retry = _json_line(_line(second, timeout=8.0), prefix="RETRIED ")
         assert second_retry["payload"] == {"kind": "retry"}
+        assert second_retry["at"] >= retry_due_at - 0.05
+        assert second_retry["at"] <= retry_due_at + 3.0
         _finish(second)
     finally:
         if second.poll() is None:
@@ -451,6 +489,44 @@ def test_stream_consumer_replays_then_resumes_after_saved_offset(db_path):
             second.kill()
 
 
+def test_live_stream_subscriber_wakes_on_new_event(db_path):
+    db = honker.open(db_path)
+    stream = db.stream("live-orders")
+
+    reader = _spawn("stream-read", db_path, "live-orders", "dashboard-live", "1")
+    try:
+        assert _line(reader) == "READY"
+        published_at = time.time()
+        stream.publish({"n": 1, "kind": "created"})
+
+        got = _json_line(_line(reader, timeout=8.0))
+        assert got == [
+            {"offset": 1, "payload": {"n": 1, "kind": "created"}},
+        ]
+        assert time.time() - published_at < 5.0
+        _finish(reader)
+    finally:
+        if reader.poll() is None:
+            reader.kill()
+
+
+def test_live_notification_listener_wakes_on_new_notify(db_path):
+    db = honker.open(db_path)
+
+    listener = _spawn("listen-once", db_path, "orders")
+    try:
+        assert _line(listener) == "READY"
+        with db.transaction() as tx:
+            tx.notify("orders", {"order_id": 1, "kind": "created"})
+
+        got = _json_line(_line(listener, timeout=8.0))
+        assert got["payload"] == {"order_id": 1, "kind": "created"}
+        _finish(listener)
+    finally:
+        if listener.poll() is None:
+            listener.kill()
+
+
 @pytest.mark.skipif(
     EXT_PATH is None or not HAS_LOAD_EXTENSION,
     reason="loadable extension is unavailable in this Python/sqlite build",
@@ -479,7 +555,7 @@ def test_raw_sql_transaction_enqueue_wakes_python_worker(db_path):
         assert committed.stdout.strip() == "COMMIT"
 
         got = _json_line(_line(worker, timeout=8.0))
-        assert got["payload"] == {"order_id": 1, "to": "alice@example.com"}
+        assert got["payload"] == {"order_id": 2, "to": "alice@example.com"}
         _finish(worker)
 
         db = honker.open(db_path)
