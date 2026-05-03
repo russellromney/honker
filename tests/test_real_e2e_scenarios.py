@@ -176,10 +176,13 @@ async def stream_read(db_path, stream_name, consumer, count):
             save_every_n=0,
             save_every_s=0,
         )
-        print("READY", flush=True)
         out = []
-        for _ in range(int(count)):
-            event = await asyncio.wait_for(it.__anext__(), timeout=IDLE_POLL_S)
+        for i in range(int(count)):
+            next_event = asyncio.create_task(it.__anext__())
+            if i == 0:
+                await asyncio.sleep(0.1)
+                print("READY", flush=True)
+            event = await asyncio.wait_for(next_event, timeout=IDLE_POLL_S)
             out.append({{"offset": event.offset, "payload": event.payload}})
             stream.save_offset(consumer, event.offset)
         print("RESULT " + json.dumps(out, sort_keys=True), flush=True)
@@ -191,8 +194,10 @@ async def listen_once(db_path, channel):
     db = honker.open(db_path)
     try:
         it = db.listen(channel)
+        next_note = asyncio.create_task(it.__anext__())
+        await asyncio.sleep(0.1)
         print("READY", flush=True)
-        note = await asyncio.wait_for(it.__anext__(), timeout=IDLE_POLL_S)
+        note = await asyncio.wait_for(next_note, timeout=IDLE_POLL_S)
         print("RESULT " + json.dumps({{
             "payload": note.payload,
             "seen_at": time.time(),
@@ -319,6 +324,16 @@ def _finish(proc: subprocess.Popen, timeout: float = 5.0) -> None:
     )
 
 
+def _kill(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.kill()
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        proc.wait(timeout=1.0)
+
+
 def test_delayed_job_wakes_sleeping_worker_process(db_path):
     db = honker.open(db_path)
     q = db.queue("delayed")
@@ -334,8 +349,7 @@ def test_delayed_job_wakes_sleeping_worker_process(db_path):
         assert got["claimed_at"] <= run_at + 3.0
         _finish(worker)
     finally:
-        if worker.poll() is None:
-            worker.kill()
+        _kill(worker)
 
 
 def test_crashed_worker_claim_is_reclaimed_by_sleeping_worker(db_path):
@@ -361,8 +375,7 @@ def test_crashed_worker_claim_is_reclaimed_by_sleeping_worker(db_path):
         assert got["claimed_at"] <= claim_expires_at + 3.0
         _finish(rescuer)
     finally:
-        if rescuer.poll() is None:
-            rescuer.kill()
+        _kill(rescuer)
 
 
 def test_retry_backoff_wakes_then_exhausts_to_dead(db_path):
@@ -377,8 +390,7 @@ def test_retry_backoff_wakes_then_exhausts_to_dead(db_path):
         assert first_retry["payload"] == {"kind": "retry"}
         _finish(first)
     finally:
-        if first.poll() is None:
-            first.kill()
+        _kill(first)
     retry_due_at = int(
         db.query("SELECT run_at FROM _honker_jobs WHERE queue='retry'")[0]["run_at"]
     )
@@ -392,8 +404,7 @@ def test_retry_backoff_wakes_then_exhausts_to_dead(db_path):
         assert second_retry["at"] <= retry_due_at + 3.0
         _finish(second)
     finally:
-        if second.poll() is None:
-            second.kill()
+        _kill(second)
 
     rows = db.query(
         "SELECT state, attempts, last_error FROM _honker_jobs WHERE queue='retry'"
@@ -421,14 +432,12 @@ async def test_wait_result_wakes_when_worker_process_saves_result(db_path):
             assert _json_line(_line(worker), prefix="SAVED ") == {"sum": 7}
             _finish(worker)
         finally:
-            if worker.poll() is None:
-                worker.kill()
+            _kill(worker)
 
         assert _json_line(_line(waiter)) == {"sum": 7}
         _finish(waiter)
     finally:
-        if waiter.poll() is None:
-            waiter.kill()
+        _kill(waiter)
 
 
 def test_rate_limit_is_shared_across_processes(db_path):
@@ -458,8 +467,7 @@ def test_named_lock_blocks_cross_process_until_crashed_holder_ttl(db_path):
         assert _line(waiter, timeout=6.0) == "ACQUIRED"
         _finish(waiter)
     finally:
-        if waiter.poll() is None:
-            waiter.kill()
+        _kill(waiter)
 
 
 def test_stream_consumer_replays_then_resumes_after_saved_offset(db_path):
@@ -475,8 +483,7 @@ def test_stream_consumer_replays_then_resumes_after_saved_offset(db_path):
         assert [row["payload"] for row in got_first] == [{"n": 1}]
         _finish(first)
     finally:
-        if first.poll() is None:
-            first.kill()
+        _kill(first)
 
     second = _spawn("stream-read", db_path, "orders", "dashboard", "1")
     try:
@@ -485,8 +492,7 @@ def test_stream_consumer_replays_then_resumes_after_saved_offset(db_path):
         assert [row["payload"] for row in got_second] == [{"n": 2}]
         _finish(second)
     finally:
-        if second.poll() is None:
-            second.kill()
+        _kill(second)
 
 
 def test_live_stream_subscriber_wakes_on_new_event(db_path):
@@ -506,8 +512,7 @@ def test_live_stream_subscriber_wakes_on_new_event(db_path):
         assert time.time() - published_at < 5.0
         _finish(reader)
     finally:
-        if reader.poll() is None:
-            reader.kill()
+        _kill(reader)
 
 
 def test_live_notification_listener_wakes_on_new_notify(db_path):
@@ -523,8 +528,7 @@ def test_live_notification_listener_wakes_on_new_notify(db_path):
         assert got["payload"] == {"order_id": 1, "kind": "created"}
         _finish(listener)
     finally:
-        if listener.poll() is None:
-            listener.kill()
+        _kill(listener)
 
 
 @pytest.mark.skipif(
@@ -562,5 +566,4 @@ def test_raw_sql_transaction_enqueue_wakes_python_worker(db_path):
         rows = db.query("SELECT COUNT(*) AS c FROM orders")
         assert rows[0]["c"] == 1
     finally:
-        if worker.poll() is None:
-            worker.kill()
+        _kill(worker)
