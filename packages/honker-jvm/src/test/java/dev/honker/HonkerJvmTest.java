@@ -715,6 +715,46 @@ class HonkerJvmTest {
     }
 
     @Test
+    void explicitKernelWatcherDeliversCommittedNotificationsAndSkipsRolledBackRows() {
+        try (Database db = openWithBackend("kernel-semantics.db", WatcherBackend.KERNEL_EVENTS)) {
+            try (Listener listener = db.listen("kernel")) {
+                waitUntil(Duration.ofSeconds(2), () -> db.updateWatcherBackend() == WatcherBackend.KERNEL_EVENTS,
+                    "explicit kernel watcher should become active");
+
+                assertThrows(RuntimeException.class, () -> db.transactionVoid(tx -> {
+                    tx.notify("kernel", "{\"rolled_back\":true}");
+                    throw new RuntimeException("rollback");
+                }));
+                assertTrue(listener.next(Duration.ofMillis(250)).isEmpty(), "rolled-back notify must not be delivered");
+
+                db.notify("kernel", "{\"committed\":true}");
+                Notification n = listener.next(Duration.ofSeconds(2)).orElseThrow();
+                assertEquals("{\"committed\":true}", n.payloadJson());
+            }
+        }
+    }
+
+    @Test
+    void explicitKernelWatcherWakesWorkerBeforeFallbackPoll() throws Exception {
+        try (Database db = openWithBackend("kernel-worker.db", WatcherBackend.KERNEL_EVENTS)) {
+            Queue queue = db.queue("kernel-worker");
+            CountDownLatch handled = new CountDownLatch(1);
+            try (WorkerHandle ignored = queue.worker(
+                "worker",
+                job -> handled.countDown(),
+                WorkerOptions.builder().idlePollInterval(Duration.ofSeconds(30)).build()
+            )) {
+                waitUntil(Duration.ofSeconds(2), () -> db.updateWatcherBackend() == WatcherBackend.KERNEL_EVENTS,
+                    "kernel worker watcher should become active");
+                long start = System.nanoTime();
+                queue.enqueue("{\"kernel\":true}");
+                assertTrue(handled.await(5, TimeUnit.SECONDS));
+                assertWakeBeforeFallback(start, Duration.ofSeconds(5), Duration.ofSeconds(30));
+            }
+        }
+    }
+
+    @Test
     void rapidEnqueuesDoNotLoseWorkerWakeTicks() throws Exception {
         try (Database db = openWithLongFallback("rapid-worker.db")) {
             Queue queue = db.queue("rapid");
@@ -865,6 +905,29 @@ class HonkerJvmTest {
     }
 
     @Test
+    void childJvmKernelListenerWakesWhenParentNotifies() throws Exception {
+        Path dbPath = tmp.resolve("kernel-listener-multiprocess.db");
+        Path extension = NativeLoader.resolve(OpenOptions.defaults());
+        Path ready = tmp.resolve("kernel-listener-child.ready");
+        Path done = tmp.resolve("kernel-listener-child.done");
+        Process child = startChild("listener-kernel-marker", dbPath, extension, ready, done);
+        try {
+            waitUntil(Duration.ofSeconds(5), () -> Files.isRegularFile(ready), "child kernel listener should become ready");
+            try (Database db = Honker.open(dbPath, OpenOptions.builder()
+                .extensionPath(extension)
+                .fallbackPollInterval(Duration.ofSeconds(30))
+                .build())) {
+                db.notify("multiprocess-listen", "{\"from\":\"parent\"}");
+            }
+            waitUntil(Duration.ofSeconds(5), () -> Files.isRegularFile(done), "child kernel listener should receive parent notify");
+            assertEquals("{\"from\":\"parent\"}", Files.readString(done, StandardCharsets.UTF_8));
+            assertEquals(0, child.waitFor());
+        } finally {
+            child.destroyForcibly();
+        }
+    }
+
+    @Test
     void pythonStdlibSqliteInteropBothDirections() throws Exception {
         Path dbPath = tmp.resolve("interop.db");
         Path ext = NativeLoader.resolve(OpenOptions.defaults());
@@ -1003,6 +1066,13 @@ class HonkerJvmTest {
         long elapsedMillis = Duration.ofNanos(System.nanoTime() - startNanos).toMillis();
         assertTrue(elapsedMillis < 1_000,
             "wake took " + elapsedMillis + "ms; this looks like fallback polling near " + fallbackMillis + "ms");
+    }
+
+    private static void assertWakeBeforeFallback(long startNanos, Duration ceiling, Duration fallback) {
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startNanos);
+        assertTrue(elapsed.compareTo(ceiling) < 0,
+            "wake took " + elapsed.toMillis() + "ms; expected below " + ceiling.toMillis()
+                + "ms and far below fallback " + fallback.toMillis() + "ms");
     }
 
     private static void sleep(long millis) {

@@ -12,11 +12,11 @@ packaged-install proof, and what CI actually proves.
 
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
 
-Some bindings expose an experimental mmap-of-`<db>-shm` watcher in WAL
-mode. It reads SQLite's wal-index `iChange` counter directly, but AUTO
-backend modes stay conservative and use `PRAGMA data_version`. The
-stable semantics stay the same: wake on committed updates, ignore
-rolled-back work, and re-read SQLite state after every wake.
+Some bindings expose experimental watcher backends, such as mmap of
+`<db>-shm` in WAL mode or kernel file events. AUTO backend modes stay
+conservative and use `PRAGMA data_version`. The stable semantics stay
+the same: wake on committed updates, ignore rolled-back work, and
+re-read SQLite state after every wake.
 
 > Experimental. API may change.
 

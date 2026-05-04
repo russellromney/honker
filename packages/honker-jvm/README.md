@@ -15,7 +15,8 @@ Current shape:
   and task-worker loops backed by one shared watcher per `Database`,
   plus deadline wakes
 - watcher backends: `AUTO` / `PRAGMA_DATA_VERSION` for the stable
-  PRAGMA watcher, plus explicit experimental `MMAP_SHM`
+  PRAGMA watcher, plus explicit experimental `MMAP_SHM` and
+  `KERNEL_EVENTS`
 - explicit task registry helpers
 - Python-parity wake tests: subscribe-before-snapshot races,
   cross-process listener/worker/stream wake, delayed deadlines, concurrent
@@ -73,10 +74,13 @@ try (Database db = Honker.open("app.db", OpenOptions.builder()
 ```
 
 `AUTO` and `PRAGMA_DATA_VERSION` use the stable `PRAGMA data_version`
-watcher. `MMAP_SHM` is explicitly experimental and can be selected for
-tests/benchmarks. `SQLITE_FCNTL_DATA_VERSION` is intentionally not
-exposed as a backend; Honker's proof scripts show it is not a correct
-idle cross-connection watcher.
+watcher. `MMAP_SHM` and `KERNEL_EVENTS` are explicitly experimental and
+can be selected for tests/benchmarks. `KERNEL_EVENTS` uses Java's
+directory watch service over the database, WAL, and SHM filenames; it
+may emit spurious wakes and its latency is platform/JDK dependent, so
+consumers still re-read SQLite state after every wake. `SQLITE_FCNTL_DATA_VERSION`
+is intentionally not exposed as a backend; Honker's proof scripts show
+it is not a correct idle cross-connection watcher.
 
 ## Local test
 

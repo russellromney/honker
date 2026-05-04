@@ -9,6 +9,10 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchEvent;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -18,6 +22,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -132,7 +137,8 @@ final class SharedUpdateWatcher implements AutoCloseable {
                     closeQuietly(source);
                     source = null;
                     wakeSubscribers();
-                    if (options.backend() == WatcherBackend.MMAP_SHM && e instanceof HonkerException) {
+                    if ((options.backend() == WatcherBackend.MMAP_SHM || options.backend() == WatcherBackend.KERNEL_EVENTS)
+                        && e instanceof HonkerException) {
                         throw e;
                     }
                 }
@@ -167,6 +173,9 @@ final class SharedUpdateWatcher implements AutoCloseable {
         }
         if (options.backend() == WatcherBackend.MMAP_SHM) {
             return new ShmVersionSource(path);
+        }
+        if (options.backend() == WatcherBackend.KERNEL_EVENTS) {
+            return new KernelVersionSource(path);
         }
         return new PragmaVersionSource(path);
     }
@@ -310,6 +319,68 @@ final class SharedUpdateWatcher implements AutoCloseable {
 
         private static Path shmPath(Path dbPath) {
             return Path.of(dbPath.toString() + "-shm");
+        }
+    }
+
+    private static final class KernelVersionSource implements VersionSource {
+        private final WatchService watchService;
+        private final Set<Path> watchedNames;
+        private long version;
+
+        KernelVersionSource(Path dbPath) throws IOException {
+            Path parent = dbPath.getParent();
+            if (parent == null) {
+                parent = Path.of(".").toAbsolutePath().normalize();
+            }
+            this.watchService = parent.getFileSystem().newWatchService();
+            parent.register(
+                watchService,
+                StandardWatchEventKinds.ENTRY_CREATE,
+                StandardWatchEventKinds.ENTRY_MODIFY,
+                StandardWatchEventKinds.ENTRY_DELETE,
+                StandardWatchEventKinds.OVERFLOW
+            );
+            Path fileName = dbPath.getFileName();
+            this.watchedNames = Set.of(
+                fileName,
+                Path.of(fileName + "-wal"),
+                Path.of(fileName + "-shm")
+            );
+        }
+
+        @Override
+        public long version() {
+            WatchKey key;
+            while ((key = watchService.poll()) != null) {
+                boolean matched = false;
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
+                        matched = true;
+                        continue;
+                    }
+                    Object context = event.context();
+                    if (context instanceof Path p && watchedNames.contains(p)) {
+                        matched = true;
+                    }
+                }
+                if (!key.reset()) {
+                    throw new HonkerException("kernel watcher key became invalid");
+                }
+                if (matched) {
+                    version++;
+                }
+            }
+            return version;
+        }
+
+        @Override
+        public WatcherBackend backend() {
+            return WatcherBackend.KERNEL_EVENTS;
+        }
+
+        @Override
+        public void close() throws IOException {
+            watchService.close();
         }
     }
 

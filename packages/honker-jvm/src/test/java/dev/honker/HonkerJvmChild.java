@@ -26,6 +26,8 @@ public final class HonkerJvmChild {
             listenerMarker(dbPath, extensionPath, readyPath, donePath, WatcherBackend.PRAGMA_DATA_VERSION);
         } else if ("listener-mmap-marker".equals(mode)) {
             listenerMarker(dbPath, extensionPath, readyPath, donePath, WatcherBackend.MMAP_SHM);
+        } else if ("listener-kernel-marker".equals(mode)) {
+            listenerMarker(dbPath, extensionPath, readyPath, donePath, WatcherBackend.KERNEL_EVENTS);
         } else if ("stream-marker".equals(mode)) {
             streamMarker(dbPath, extensionPath, readyPath, donePath);
         } else {
