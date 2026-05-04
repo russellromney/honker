@@ -122,4 +122,52 @@ maybe("phase mantle", () => {
       expect(job.ack()).toBe(false);
     });
   });
+
+  test("paused schedule does not emit on tick", async () => {
+    let _db: any;
+    const dir = mkdtempSync(join(tmpdir(), "honker-bun-mantle-"));
+    const dbPath = join(dir, "t.db");
+    const db = open(dbPath, extPath!);
+    try {
+      const sched = new Scheduler(db);
+      sched.add({ name: "due", queue: "emails", cron: "@every 1s", payload: { x: 1 } });
+      await new Promise((r) => setTimeout(r, 1100));
+      sched.pause("due");
+      const future = Math.floor(Date.now() / 1000) + 5;
+      const fires = sched.tick(future);
+      expect(fires.length).toBe(0);
+      sched.resume("due");
+      const fires2 = sched.tick(future);
+      expect(fires2.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("get_job misses after ack (separate from cancel)", () => {
+    withDb((db) => {
+      const q = db.queue("emails");
+      const id = q.enqueue({ to: "x" });
+      const job = q.claimOne("worker-1")!;
+      expect(job.ack()).toBe(true);
+      expect(q.getJob(id)).toBeNull();
+    });
+  });
+
+  test("update payload null vs omitted distinction", () => {
+    withDb((db) => {
+      const sched = new Scheduler(db);
+      sched.add({ name: "t", queue: "q", cron: "0 9 * * *", payload: { v: 1 } });
+      // Omitted payload — leaves alone.
+      sched.update("t", { priority: 7 });
+      let row = sched.list().find((r) => r.name === "t")!;
+      expect(JSON.parse(row.payload).v).toBe(1);
+      expect(row.priority).toBe(7);
+      // payload: null — write JSON null.
+      sched.update("t", { payload: null });
+      row = sched.list().find((r) => r.name === "t")!;
+      expect(JSON.parse(row.payload)).toBeNull();
+    });
+  });
 });

@@ -78,6 +78,25 @@ def test_schedule_update_mutates_fields(tmp_path):
     assert sched.update("missing", payload={}) is False
 
 
+def test_schedule_update_payload_null_vs_omitted(tmp_path):
+    """`payload=None` writes JSON null; omitting the kwarg leaves the
+    payload column alone. The _UNSET sentinel makes this distinction
+    expressible from Python."""
+    db = honker.open(str(tmp_path / "t.db"))
+    sched = Scheduler(db)
+    sched.add(name="t", queue="q", schedule=crontab("0 9 * * *"), payload={"v": 1})
+
+    # Omitting payload leaves it untouched.
+    assert sched.update("t", priority=7) is True
+    row = sched.list()[0]
+    assert json.loads(row["payload"]) == {"v": 1}
+
+    # payload=None writes JSON null explicitly.
+    assert sched.update("t", payload=None) is True
+    row = sched.list()[0]
+    assert json.loads(row["payload"]) is None
+
+
 def test_schedule_update_no_fields_is_noop(tmp_path):
     """update() with no field args returns False without waking the
     leader or modifying state. Caller intent must be explicit."""

@@ -133,4 +133,54 @@ defmodule PhaseMantleTest do
     assert {:ok, true} = Honker.Queue.cancel(db, id)
     assert {:ok, false} = Honker.Job.ack(db, job)
   end
+
+  test "paused schedule does not emit on tick", ctx do
+    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    :ok =
+      Honker.Scheduler.add(db,
+        name: "due",
+        queue: "emails",
+        schedule: "@every 1s",
+        payload: %{"x" => 1}
+      )
+
+    Process.sleep(1100)
+    assert {:ok, true} = Honker.Scheduler.pause(db, "due")
+
+    {:ok, fires} = Honker.Scheduler.tick(db)
+    assert fires == [], "paused schedule must not emit; got #{inspect(fires)}"
+
+    assert {:ok, true} = Honker.Scheduler.resume(db, "due")
+    {:ok, fires2} = Honker.Scheduler.tick(db)
+    assert length(fires2) >= 1, "resumed schedule should emit; got #{inspect(fires2)}"
+  end
+
+  test "get_job misses after ack (separate from cancel)", ctx do
+    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    {:ok, id} = Honker.Queue.enqueue(db, "emails", %{"to" => "x"})
+    {:ok, job} = Honker.Queue.claim_one(db, "emails", "worker-1")
+    assert {:ok, true} = Honker.Job.ack(db, job)
+    assert {:ok, nil} = Honker.Queue.get_job(db, id)
+  end
+
+  test "update payload null vs omitted distinction", ctx do
+    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    :ok =
+      Honker.Scheduler.add(db,
+        name: "t",
+        queue: "q",
+        schedule: "0 9 * * *",
+        payload: %{"v" => 1}
+      )
+
+    # Omitted payload — leaves alone.
+    assert {:ok, true} = Honker.Scheduler.update(db, "t", priority: 7)
+    {:ok, rows} = Honker.Scheduler.list(db)
+    assert Jason.decode!(Enum.at(rows, 0)["payload"])["v"] == 1
+
+    # payload: nil — explicitly write JSON null.
+    assert {:ok, true} = Honker.Scheduler.update(db, "t", payload: nil)
+    {:ok, rows} = Honker.Scheduler.list(db)
+    assert Jason.decode!(Enum.at(rows, 0)["payload"]) == nil
+  end
 end

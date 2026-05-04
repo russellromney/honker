@@ -107,4 +107,57 @@ public sealed class PhaseMantleTests
         Assert.True(q.Cancel(jobId));
         Assert.False(job.Ack());
     }
+
+    [Fact]
+    public void PausedScheduleDoesNotEmitOnTick()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var sched = db.Scheduler();
+        sched.Add(new ScheduledTask("due", "emails",
+            Payload: new { x = 1 }, Cron: "@every 1s"));
+
+        Thread.Sleep(1100);
+        Assert.True(sched.Pause("due"));
+
+        var fires = sched.Tick(DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 5);
+        Assert.Empty(fires);
+
+        Assert.True(sched.Resume("due"));
+        var fires2 = sched.Tick(DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 5);
+        Assert.NotEmpty(fires2);
+    }
+
+    [Fact]
+    public void GetJobMissesAfterAck()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var q = db.Queue("emails");
+        var id = q.Enqueue(new { to = "x" });
+        var job = q.ClaimOne("worker-1")!;
+        Assert.True(job.Ack());
+        // Row gone after ack — get_job misses just like after cancel.
+        Assert.Null(q.GetJob(id));
+    }
+
+    [Fact]
+    public void UpdatePayloadNullVsOmitted()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var sched = db.Scheduler();
+        sched.Add(new ScheduledTask("t", "q",
+            Payload: new { v = 1 }, Cron: "0 9 * * *"));
+
+        // Omitted payload — leaves alone.
+        Assert.True(sched.Update("t", new ScheduleUpdate().WithPriority(7)));
+        var row = sched.List().First();
+        Assert.Equal(1, JsonDocument.Parse(row.Payload).RootElement.GetProperty("v").GetInt32());
+
+        // payload: null — explicitly write JSON null.
+        Assert.True(sched.Update("t", new ScheduleUpdate().WithPayload(null)));
+        row = sched.List().First();
+        Assert.Equal(JsonValueKind.Null, JsonDocument.Parse(row.Payload).RootElement.ValueKind);
+    }
 }

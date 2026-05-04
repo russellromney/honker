@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Phase Mantle: Scheduler lifecycle (pause/resume/list/update) +
@@ -208,5 +209,86 @@ func TestCancelProcessingInvalidatesAck(t *testing.T) {
 	acked, _ := job.Ack()
 	if acked {
 		t.Fatal("ack should return false after cancel (same shape as expired claim)")
+	}
+}
+
+func TestPausedScheduleDoesNotEmit(t *testing.T) {
+	db := openMantle(t)
+	sched := db.Scheduler()
+	if err := sched.Add(ScheduledTask{
+		Name: "due", Queue: "emails", Schedule: "@every 1s",
+		Payload: map[string]any{"x": 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := sched.Pause("due"); err != nil {
+		t.Fatal(err)
+	}
+
+	fires, err := sched.Tick()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fires) != 0 {
+		t.Fatalf("paused schedule must not emit; got %v", fires)
+	}
+
+	// Resume and tick again — now it fires.
+	if _, err := sched.Resume("due"); err != nil {
+		t.Fatal(err)
+	}
+	fires2, _ := sched.Tick()
+	if len(fires2) < 1 {
+		t.Fatalf("resumed schedule should emit; got %v", fires2)
+	}
+}
+
+func TestGetJobMissesAfterAck(t *testing.T) {
+	db := openMantle(t)
+	q := db.Queue("emails", QueueOptions{})
+	id, _ := q.Enqueue(map[string]any{"to": "x"}, EnqueueOptions{})
+	job, _ := q.ClaimOne("worker-1")
+	if acked, _ := job.Ack(); !acked {
+		t.Fatal("ack should succeed on fresh claim")
+	}
+	row, _ := q.GetJob(id)
+	if row != nil {
+		t.Fatalf("get_job after ack should be nil, got %+v", row)
+	}
+}
+
+func TestUpdatePayloadNullVsOmitted(t *testing.T) {
+	db := openMantle(t)
+	sched := db.Scheduler()
+	if err := sched.Add(ScheduledTask{
+		Name: "t", Queue: "q", Schedule: "0 9 * * *",
+		Payload: map[string]any{"v": 1.0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Omitted payload — leaves it alone.
+	priority := int64(7)
+	ok, _ := sched.Update("t", ScheduleUpdate{Priority: &priority})
+	if !ok {
+		t.Fatal("priority-only update should succeed")
+	}
+	rows, _ := sched.List()
+	var payload map[string]any
+	_ = json.Unmarshal([]byte(rows[0].Payload), &payload)
+	if payload["v"] != 1.0 {
+		t.Fatalf("payload should be untouched: %v", payload)
+	}
+
+	// payload: any(nil) — explicitly write JSON null.
+	var nullPayload any = nil
+	ok, _ = sched.Update("t", ScheduleUpdate{Payload: &nullPayload})
+	if !ok {
+		t.Fatal("payload-null update should succeed")
+	}
+	rows, _ = sched.List()
+	if rows[0].Payload != "null" {
+		t.Fatalf("payload should be JSON null, got %q", rows[0].Payload)
 	}
 }

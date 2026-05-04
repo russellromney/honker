@@ -172,3 +172,47 @@ test('cancel of processing job invalidates ack', () => {
     cleanup();
   }
 });
+
+test('paused schedule does not emit on tick', async () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  let db;
+  try {
+    db = open(dbPath);
+    const sched = new honker.Scheduler(db);
+    // schedule with next_fire_at in the past
+    sched.add({ name: 'due', queue: 'emails', cron: '@every 1s', payload: { x: 1 } });
+    await new Promise((r) => setTimeout(r, 1100));
+    sched.pause('due');
+
+    const future = Math.floor(Date.now() / 1000) + 5;
+    const fires = sched.tick(future);
+    assert.equal(fires.length, 0, `paused schedule must not emit; got ${JSON.stringify(fires)}`);
+
+    // Resume and tick again — now it fires.
+    sched.resume('due');
+    const fires2 = sched.tick(future);
+    assert.ok(fires2.length >= 1, `resumed schedule should emit; got ${JSON.stringify(fires2)}`);
+  } finally {
+    cleanup();
+  }
+});
+
+test('queue.getJob misses after ack (separate from cancel)', () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  let db;
+  try {
+    db = open(dbPath);
+    const q = db.queue('emails');
+    const tx = db.transaction();
+    const jid = q.enqueueTx(tx, { to: 'x' });
+    tx.commit();
+
+    const job = q.claimOne('worker-1');
+    assert.equal(job.id, jid);
+    assert.equal(job.ack(), true);
+    // After ack the row is gone — get_job misses just like after cancel.
+    assert.equal(q.getJob(jid), null);
+  } finally {
+    cleanup();
+  }
+});

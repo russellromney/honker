@@ -184,3 +184,94 @@ fn cancel_processing_invalidates_ack() {
     // Worker's ack now returns false (same shape as expired claim).
     assert!(!job.ack().unwrap());
 }
+
+#[test]
+fn paused_schedule_does_not_emit_on_tick() {
+    let (_tmp, db) = open_db();
+    let sched = db.scheduler();
+    sched
+        .add(ScheduledTask {
+            name: "due".into(),
+            queue: "emails".into(),
+            schedule: "@every 1s".into(),
+            payload: json!({"x": 1}),
+            priority: 0,
+            expires_s: None,
+        })
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    sched.pause("due").unwrap();
+
+    let fires = sched.tick().unwrap();
+    assert_eq!(
+        fires.len(),
+        0,
+        "paused schedule must not emit; got {fires:?}"
+    );
+
+    // Resume and tick again — now it fires.
+    sched.resume("due").unwrap();
+    let fires2 = sched.tick().unwrap();
+    assert!(
+        !fires2.is_empty(),
+        "resumed schedule should emit; got {fires2:?}"
+    );
+}
+
+#[test]
+fn queue_get_job_misses_after_ack() {
+    let (_tmp, db) = open_db();
+    let q = db.queue("emails", QueueOpts::default());
+    let id = q.enqueue(&json!({"to": "x"}), EnqueueOpts::default()).unwrap();
+
+    let job = q.claim_one("worker-1").unwrap().unwrap();
+    assert_eq!(job.id, id);
+    assert!(job.ack().unwrap());
+    // Row gone after ack — get_job misses just like after cancel.
+    assert!(q.get_job(id).unwrap().is_none());
+}
+
+#[test]
+fn update_payload_null_vs_omitted() {
+    let (_tmp, db) = open_db();
+    let sched = db.scheduler();
+    sched
+        .add(ScheduledTask {
+            name: "t".into(),
+            queue: "q".into(),
+            schedule: "0 9 * * *".into(),
+            payload: json!({"v": 1}),
+            priority: 0,
+            expires_s: None,
+        })
+        .unwrap();
+
+    // Omitted payload — payload field stays as Default (None).
+    sched
+        .update(
+            "t",
+            ScheduleUpdate {
+                priority: Some(7),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let row = sched.list().unwrap().into_iter().find(|r| r.name == "t").unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+    assert_eq!(payload, json!({"v": 1}));
+    assert_eq!(row.priority, 7);
+
+    // payload: Some(Value::Null) — explicitly write JSON null.
+    sched
+        .update(
+            "t",
+            ScheduleUpdate {
+                payload: Some(serde_json::Value::Null),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let row = sched.list().unwrap().into_iter().find(|r| r.name == "t").unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
+    assert!(payload.is_null());
+}

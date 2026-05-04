@@ -126,4 +126,46 @@ class PhaseMantleTest < Minitest::Test
     assert_equal true, q.cancel(job_id)
     assert_equal false, job.ack
   end
+
+  def test_paused_schedule_does_not_emit_on_tick
+    db = open_db
+    sched = Honker::Scheduler.new(db)
+    sched.add(name: "due", queue: "emails", schedule: "@every 1s",
+              payload: { x: 1 })
+    sleep 1.1
+    assert_equal true, sched.pause("due")
+
+    fires = sched.tick(Time.now.to_i + 5)
+    assert_empty fires, "paused schedule must not emit; got #{fires.inspect}"
+
+    assert_equal true, sched.resume("due")
+    fires2 = sched.tick(Time.now.to_i + 5)
+    refute_empty fires2, "resumed schedule should emit; got #{fires2.inspect}"
+  end
+
+  def test_get_job_misses_after_ack
+    db = open_db
+    q = db.queue("emails")
+    job_id = q.enqueue({ to: "x" })
+    job = q.claim_one("worker-1")
+    assert_equal true, job.ack
+    # Row gone after ack — get_job misses just like after cancel.
+    assert_nil q.get_job(job_id)
+  end
+
+  def test_update_payload_null_vs_omitted
+    db = open_db
+    sched = Honker::Scheduler.new(db)
+    sched.add(name: "t", queue: "q", schedule: "0 9 * * *", payload: { v: 1 })
+
+    # Omitted payload — leaves it alone.
+    assert_equal true, sched.update("t", priority: 7)
+    row = sched.list[0]
+    assert_equal({ "v" => 1 }, JSON.parse(row["payload"]))
+
+    # payload: nil — explicitly write JSON null.
+    assert_equal true, sched.update("t", payload: nil)
+    row = sched.list[0]
+    assert_nil JSON.parse(row["payload"])
+  end
 end

@@ -4,12 +4,15 @@
 #include "honker.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -123,6 +126,52 @@ void test_cancel_processing_invalidates_ack(const char* ext) {
     std::cout << "cancel_processing_invalidates_ack: ok\n";
 }
 
+void test_paused_schedule_does_not_emit(const char* ext) {
+    auto db = open_db(fs::temp_directory_path() / "honker-cpp-mantle-paused-tick.db", ext);
+    auto sched = db.scheduler();
+    sched.add("due", "emails", "@every 1s", R"({"x":1})", 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    assert(sched.pause("due") == true);
+
+    const auto future = static_cast<int64_t>(std::time(nullptr)) + 5;
+    auto fires = sched.tick(future);
+    assert(fires.empty() && "paused schedule must not emit");
+
+    assert(sched.resume("due") == true);
+    auto fires2 = sched.tick(future);
+    assert(!fires2.empty() && "resumed schedule should emit");
+    std::cout << "paused_schedule_does_not_emit: ok\n";
+}
+
+void test_get_job_misses_after_ack(const char* ext) {
+    auto db = open_db(fs::temp_directory_path() / "honker-cpp-mantle-getack.db", ext);
+    auto q = db.queue("emails");
+    auto id = q.enqueue(R"({"to":"x"})");
+    auto job = q.claim_one("worker-1");
+    assert(job.has_value());
+    assert(job->ack() == true);
+    // Row gone after ack — get_job misses just like after cancel.
+    assert(q.get_job_json(id).empty());
+    std::cout << "get_job_misses_after_ack: ok\n";
+}
+
+void test_update_payload_null_vs_omitted(const char* ext) {
+    auto db = open_db(fs::temp_directory_path() / "honker-cpp-mantle-payload.db", ext);
+    auto sched = db.scheduler();
+    sched.add("t", "q", "0 9 * * *", R"({"v":1})", 0);
+
+    // Omitted payload (std::nullopt for the payload arg) — leaves alone.
+    assert(sched.update("t", std::nullopt, std::nullopt, std::optional<int64_t>{7}, std::nullopt));
+    auto row = json::parse(sched.list_json())[0];
+    assert(json::parse(row["payload"].get<std::string>())["v"] == 1);
+
+    // payload: explicit "null" string — write JSON null.
+    assert(sched.update("t", std::nullopt, std::string_view{"null"}, std::nullopt, std::nullopt));
+    row = json::parse(sched.list_json())[0];
+    assert(json::parse(row["payload"].get<std::string>()).is_null());
+    std::cout << "update_payload_null_vs_omitted: ok\n";
+}
+
 }  // anonymous namespace
 
 int main() {
@@ -141,6 +190,9 @@ int main() {
         test_update_mutates_and_noop(ext);
         test_cancel_and_get_job(ext);
         test_cancel_processing_invalidates_ack(ext);
+        test_paused_schedule_does_not_emit(ext);
+        test_get_job_misses_after_ack(ext);
+        test_update_payload_null_vs_omitted(ext);
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;
