@@ -1,45 +1,43 @@
-# Binding Support
+# Honker Bindings
 
-Honker's core is Rust. The extension owns the SQLite schema and SQL
-functions. Bindings are thin language wrappers over that same shape.
+This matrix describes wake behavior for maintained bindings. Table /
+SQL compatibility is separate, but every maintained binding now routes
+blocking wake waits through `honker-core`.
 
-This table is meant to be boring and honest. "Yes" means the feature
-has a typed binding and runs in root CI. "SQL" means the extension
-feature is available through raw SQL, but the language wrapper does
-not expose the nice API yet.
+| Binding | Wake implementation | Backend option | `kernel` / `shm` status |
+| --- | --- | --- | --- |
+| Python | `honker-core::SharedUpdateWatcher` | `honker.open(..., watcher_backend=...)` | Supported in source builds with matching Cargo features; hard error when unavailable |
+| Node | `honker-core::SharedUpdateWatcher` | `open(path, maxReaders?, watcherBackend?)` | Supported in source builds with matching Cargo features; hard error when unavailable |
+| Rust wrapper | `honker-core::SharedUpdateWatcher` | `OpenOptions::watcher_backend(...)` | Supported when compiled with matching Cargo features; hard error when unavailable |
+| Go | Extension C ABI -> `honker-core::SharedUpdateWatcher` | `OpenWithOptions(..., OpenOptions{WatcherBackend: ...})` | Supported when the loaded extension is built with matching features; hard error when unavailable |
+| Bun | Extension C ABI -> `honker-core::SharedUpdateWatcher` | `open(..., { watcherBackend })` | Supported when the loaded extension is built with matching features; hard error when unavailable |
+| C++ | Extension C ABI -> `honker-core::SharedUpdateWatcher` | `Database(path, ext_path, watcher_backend)` | Supported when the loaded extension is built with matching features; hard error when unavailable |
+| .NET | Extension C ABI -> `honker-core::SharedUpdateWatcher` | `OpenOptions.WatcherBackend` | Supported when the loaded extension is built with matching features; hard error when unavailable |
+| Ruby | Extension C ABI -> `honker-core::SharedUpdateWatcher` | `watcher_backend:` | Supported when the loaded extension is built with matching features; hard error when unavailable |
+| Elixir | Extension SQL watcher handles -> `honker-core::SharedUpdateWatcher` | `watcher_backend:` | Supported when the loaded extension is built with matching features; hard error when unavailable |
 
-| Binding | Package proof | Queue | Streams | Notify/listen | Scheduler | Wake behavior |
-|---|---:|---:|---:|---:|---:|---|
-| SQLite extension | load smoke | SQL | SQL | notify SQL only | SQL | host language must watch/read |
-| Python `honker` | yes | yes | yes | yes | yes | shared Rust `UpdateWatcher` |
-| Node `@russellthehippo/honker-node` | yes | yes | yes | yes | yes | shared Rust `UpdateWatcher` |
-| .NET `Honker` | yes | yes | yes | yes | yes | .NET `PRAGMA data_version` poller |
-| Rust `honker` | CI | yes | yes | yes | yes | shared Rust `UpdateWatcher` |
-| Go | CI | yes | yes | yes | yes | Go `PRAGMA data_version` poller |
-| Bun `@russellthehippo/honker-bun` | CI | yes | yes | yes | yes | Bun `PRAGMA data_version` poller |
-| C++ | CI | yes | yes | yes | yes | C++ `PRAGMA data_version` poller |
-| Ruby `honker` | yes | yes | yes | notify yes, listen no | yes | no async listener API yet |
-| Elixir `honker` | CI | yes | yes | notify yes, listen no | yes | local update snapshots + PRAGMA polling |
+Core API parity:
 
-## What CI Proves
+| Binding | Transactional outbox | Proof |
+| --- | --- | --- |
+| Python | `db.outbox(...)` | `tests/test_parity.py` / watcher e2e suites |
+| Node | `db.outbox(...)` | `packages/honker-node/test/parity.test.js` |
+| Rust wrapper | `db.outbox(...)` | `packages/honker-rs/tests/surface.rs` |
+| Go | `db.Outbox(...)` | `packages/honker-go/honker_test.go` |
+| Bun | `db.outbox(...)` | `packages/honker-bun/test/parity.test.ts` |
+| C++ | `db.outbox(...)` | `packages/honker-cpp/test/test_parity.cpp` |
+| .NET | `db.Outbox(...)` | `packages/honker-dotnet/tests/Honker.Tests/BindingTests.cs` |
+| Ruby | `db.outbox(...)` | `packages/honker-ruby/spec/parity_spec.rb` |
+| Elixir | `Honker.outbox(...)` | `packages/honker-ex/test/parity_test.exs` |
 
-- PR CI runs Rust core/extension on Linux, macOS, and Windows.
-- PR CI runs Python on Linux, macOS, and Windows.
-- PR CI runs Node on Linux, macOS, and Windows.
-- PR CI runs .NET on Linux, macOS, and Windows.
-- The aggregate Linux binding smoke runs Rust wrapper, Go, .NET
-  Python interop, C++, Bun, Ruby, Elixir, and Ruby <-> Python interop.
-- The packaged-install proof workflow builds and installs Python,
-  Node, Ruby, and .NET packages into clean throwaway consumers.
+Contract:
 
-## What Is Not Proven Yet
-
-- Published registry installs after release. The proof workflow uses
-  locally-built artifacts, which catches packaging shape but not registry
-  permissions or CDN weirdness.
-- Every possible cross-language pair. CI proves representative pairs
-  and shared table behavior. It does not run N x N interop.
-- Long soak on every OS. The scary nightly workflow soaks Linux; PR CI
-  stays shorter.
-- Ruby and Elixir do not yet have the same async listener API as
-  Python/Node/.NET/Rust/Go/Bun/C++.
+- Omitted backend, `"polling"`, and `"poll"` select polling/default
+  behavior. Backend names are exact; case and whitespace are not
+  normalized.
+- Unknown backend names are errors everywhere.
+- Explicit experimental backend requests must never silently fall back
+  to polling.
+- A binding may claim `kernel` / `shm` support only when it routes wake
+  waits through `honker-core` and has backend-isolation tests that
+  cannot pass via fallback polling.

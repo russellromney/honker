@@ -31,7 +31,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use honker_core::SharedUpdateWatcher;
+use honker_core::{SharedUpdateWatcher, WatcherConfig};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -46,6 +46,29 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Options for [`Database::open_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    watcher_config: WatcherConfig,
+}
+
+impl OpenOptions {
+    /// Select the update-detection backend. Accepted aliases match the
+    /// Python and Node bindings: `polling`/`poll`, `kernel`/
+    /// `kernel-watcher`, and `shm`/`shm-fast-path`.
+    ///
+    /// Experimental backends must be compiled into this crate via the
+    /// matching Cargo feature. Explicit requests fail loudly when the
+    /// feature is absent or [`WatcherBackend::probe`](honker_core::WatcherBackend::probe)
+    /// says the backend cannot run for the database path.
+    pub fn watcher_backend(mut self, backend: impl AsRef<str>) -> Result<Self> {
+        let backend =
+            honker_core::WatcherBackend::parse(Some(backend.as_ref())).map_err(Error::Core)?;
+        self.watcher_config = WatcherConfig { backend };
+        Ok(self)
+    }
+}
 
 // ---------------------------------------------------------------------
 // Shared connection handle
@@ -83,6 +106,11 @@ impl Database {
     /// PRAGMAs, registers the honker SQL functions, and bootstraps
     /// the schema.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_options(path, OpenOptions::default())
+    }
+
+    /// Open with explicit options such as the update watcher backend.
+    pub fn open_with_options<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Self> {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy().into_owned();
 
@@ -90,8 +118,14 @@ impl Database {
             honker_core::open_conn(&path_str, true).map_err(|e| Error::Core(e.to_string()))?;
         honker_core::attach_honker_functions(&conn)?;
         honker_core::bootstrap_honker_schema(&conn).map_err(|e| Error::Core(e.to_string()))?;
+        options
+            .watcher_config
+            .backend
+            .probe(path_ref)
+            .map_err(|e| Error::Core(format!("watcher_backend probe failed: {e}")))?;
 
-        let updates = SharedUpdateWatcher::new(path_ref.to_path_buf());
+        let updates =
+            SharedUpdateWatcher::new_with_config(path_ref.to_path_buf(), options.watcher_config);
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -109,6 +143,11 @@ impl Database {
             name: name.to_string(),
             opts,
         }
+    }
+
+    /// Get a named transactional outbox handle.
+    pub fn outbox(&self, name: &str, opts: OutboxOpts) -> Outbox {
+        Outbox::new(self, name, opts)
     }
 
     /// Get a named stream handle.
@@ -392,10 +431,110 @@ pub struct EnqueueOpts {
     pub expires: Option<i64>,
 }
 
+#[derive(Clone)]
 pub struct Queue {
     inner: Arc<Inner>,
     name: String,
     opts: QueueOpts,
+}
+
+/// Transactional side-effect delivery options.
+#[derive(Debug, Clone)]
+pub struct OutboxOpts {
+    pub visibility_timeout_s: i64,
+    pub max_attempts: i64,
+    pub base_backoff_s: i64,
+}
+
+impl Default for OutboxOpts {
+    fn default() -> Self {
+        Self {
+            visibility_timeout_s: 60,
+            max_attempts: 5,
+            base_backoff_s: 5,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Outbox {
+    name: String,
+    queue: Queue,
+    base_backoff_s: i64,
+}
+
+impl Outbox {
+    pub fn new(db: &Database, name: &str, opts: OutboxOpts) -> Self {
+        let queue = db.queue(
+            &format!("_outbox:{name}"),
+            QueueOpts {
+                visibility_timeout_s: opts.visibility_timeout_s,
+                max_attempts: opts.max_attempts,
+            },
+        );
+        Self {
+            name: name.to_string(),
+            queue,
+            base_backoff_s: opts.base_backoff_s,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    pub fn enqueue<P: Serialize>(&self, payload: &P, opts: EnqueueOpts) -> Result<i64> {
+        self.queue.enqueue(payload, opts)
+    }
+
+    pub fn enqueue_tx<P: Serialize>(
+        &self,
+        tx: &Transaction<'_>,
+        payload: &P,
+        opts: EnqueueOpts,
+    ) -> Result<i64> {
+        self.queue.enqueue_tx(tx, payload, opts)
+    }
+
+    /// Claim and deliver one outbox job. Returns false if no job was ready.
+    pub fn run_once<F, E>(&self, worker_id: &str, mut delivery: F) -> Result<bool>
+    where
+        F: FnMut(serde_json::Value) -> std::result::Result<(), E>,
+        E: std::fmt::Display,
+    {
+        let Some(job) = self.queue.claim_one(worker_id)? else {
+            return Ok(false);
+        };
+        let payload: serde_json::Value = serde_json::from_slice(&job.payload)?;
+        match delivery(payload) {
+            Ok(()) => {
+                if !job.ack()? {
+                    return Err(Error::Core(format!("outbox ack failed for job {}", job.id)));
+                }
+            }
+            Err(err) => {
+                if !job.retry(self.retry_delay(job.attempts), &err.to_string())? {
+                    return Err(Error::Core(format!(
+                        "outbox retry failed for job {}",
+                        job.id
+                    )));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn retry_delay(&self, attempts: i64) -> i64 {
+        if self.base_backoff_s <= 0 {
+            return 0;
+        }
+        self.base_backoff_s
+            .saturating_mul(2_i64.saturating_pow(attempts.saturating_sub(1) as u32))
+    }
 }
 
 impl Queue {
@@ -492,7 +631,6 @@ impl Queue {
             rx,
         }
     }
-
 }
 
 fn enqueue_on(
@@ -1206,8 +1344,7 @@ impl Scheduler {
 
         let result = (|| -> Result<()> {
             while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                let acquired =
-                    lock_try_acquire(&self.inner, "honker-scheduler", owner, LOCK_TTL)?;
+                let acquired = lock_try_acquire(&self.inner, "honker-scheduler", owner, LOCK_TTL)?;
                 if !acquired {
                     match rx.recv_timeout(Duration::from_secs(5)) {
                         Ok(()) => {
@@ -1266,9 +1403,7 @@ impl Scheduler {
                 }
             }
             match rx.recv_timeout(wait_for) {
-                Ok(()) => {
-                    while rx.try_recv().is_ok() {}
-                }
+                Ok(()) => while rx.try_recv().is_ok() {},
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }

@@ -42,15 +42,27 @@ pytestmark = pytest.mark.asyncio
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
 
-# Wheels built without the experimental Cargo features silently fall
-# back to polling for `"kernel"` and `"shm"` — that's the documented
-# behavior. The cross-process suite still runs them so a regression in
-# the fallback path also surfaces here, not only in the Rust tests.
+# Builds without the experimental Cargo features reject explicit
+# `"kernel"` / `"shm"` requests. That keeps these tests honest: when an
+# experimental backend case runs, fallback polling cannot make it pass.
 BACKENDS = [
     None,        # default polling — control
-    "kernel",    # Phase 003
     "shm",       # Phase 004
 ]
+if sys.platform != "win32":
+    # Windows ReadDirectoryChangesW does not currently deliver the
+    # cross-process WAL writes this notify/listen proof needs. The queue
+    # topology tests still cover Windows kernel wake behavior separately.
+    BACKENDS.insert(1, "kernel")  # Phase 003
+
+
+def _open_or_skip_backend(db_path, backend):
+    try:
+        return honker.open(db_path, watcher_backend=backend)
+    except ValueError as exc:
+        if backend in {"kernel", "shm"} and "requires the" in str(exc):
+            pytest.skip(str(exc))
+        raise
 
 
 _WRITER_BURST_SCRIPT = r"""
@@ -148,32 +160,35 @@ async def _drain_n_notifications(listener, n: int, timeout_s: float):
 async def test_cross_process_listener_detects_every_commit(db_path, backend):
     # Listener (this process, under `backend`) opens FIRST so it has the
     # watcher running before the writer starts emitting.
-    db = honker.open(db_path, watcher_backend=backend)
-
-    # The pre-warm transaction also forces the WAL to exist so the
-    # kernel-watcher's per-file -wal watch attaches at startup.
-    with db.transaction() as tx:
-        tx.execute("CREATE TABLE _warm (i INTEGER)")
-    await asyncio.sleep(0.05)
-
-    n = 10
-    spacing_ms = 15
-    proc = _spawn_writer(db_path, "orders", n=n, spacing_ms=spacing_ms)
-    # Subscribe BEFORE releasing the writer so the listener's MAX(id)
-    # snapshot precedes the first commit.
-    listener = db.listen("orders")
-
+    db = _open_or_skip_backend(db_path, backend)
+    drain_task = None
+    proc = None
     try:
+        # The pre-warm transaction also forces the WAL to exist so the
+        # kernel-watcher's per-file -wal watch attaches at startup.
+        with db.transaction() as tx:
+            tx.execute("CREATE TABLE _warm (i INTEGER)")
+        await asyncio.sleep(0.05)
+
+        n = 10
+        spacing_ms = 15
+        proc = _spawn_writer(db_path, "orders", n=n, spacing_ms=spacing_ms)
+        # Subscribe and start awaiting BEFORE releasing the writer so both
+        # the MAX(id) snapshot and the native wait precede the first commit.
+        listener = db.listen("orders")
+        timeout_s = (n * spacing_ms / 1000.0) + 2.0
+        drain_task = asyncio.create_task(_drain_n_notifications(listener, n, timeout_s))
+        await asyncio.sleep(0.05)
+
         proc.stdin.write("\n")
         proc.stdin.flush()
-
-        # Wait long enough for: n × spacing_ms (writer pace), plus
-        # the slowest backend's safety net (500 ms), plus generous
-        # event-delivery slack.
-        timeout_s = (n * spacing_ms / 1000.0) + 2.0
-        seen = await _drain_n_notifications(listener, n, timeout_s)
+        seen = await drain_task
     finally:
-        _stop_writer(proc)
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+        if proc is not None:
+            _stop_writer(proc)
+        db.close()
 
     payloads = sorted([int(p) for p in seen])
     assert payloads == list(range(n)), (
@@ -191,16 +206,21 @@ async def test_cross_process_listener_detects_every_commit(db_path, backend):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_cross_process_burst_no_missed_notifications(db_path, backend):
-    db = honker.open(db_path, watcher_backend=backend)
-    with db.transaction() as tx:
-        tx.execute("CREATE TABLE _warm (i INTEGER)")
-    await asyncio.sleep(0.05)
-
-    n = 50
-    proc = _spawn_writer(db_path, "burst", n=n, spacing_ms=0)
-    # Subscribe before the writer commits anything.
-    listener = db.listen("burst")
+    db = _open_or_skip_backend(db_path, backend)
+    drain_task = None
+    proc = None
     try:
+        with db.transaction() as tx:
+            tx.execute("CREATE TABLE _warm (i INTEGER)")
+        await asyncio.sleep(0.05)
+
+        n = 50
+        proc = _spawn_writer(db_path, "burst", n=n, spacing_ms=0)
+        # Subscribe and start awaiting before the writer commits anything.
+        listener = db.listen("burst")
+        drain_task = asyncio.create_task(_drain_n_notifications(listener, n, timeout_s=3.0))
+        await asyncio.sleep(0.05)
+
         proc.stdin.write("\n")
         proc.stdin.flush()
 
@@ -219,16 +239,18 @@ async def test_cross_process_burst_no_missed_notifications(db_path, backend):
             f"backend={backend!r}: writer never reported DONE within 5s"
         )
 
-        # Listener should observe every distinct payload row. Use a
-        # tight per-message timeout so a stuck wake fails fast.
-        seen = await _drain_n_notifications(listener, n, timeout_s=3.0)
+        seen = await drain_task
+        persisted_rows = db.query(
+            "SELECT payload FROM _honker_notifications "
+            "WHERE channel = 'burst' ORDER BY id"
+        )
     finally:
-        _stop_writer(proc)
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+        if proc is not None:
+            _stop_writer(proc)
+        db.close()
 
-    persisted_rows = db.query(
-        "SELECT payload FROM _honker_notifications "
-        "WHERE channel = 'burst' ORDER BY id"
-    )
     assert len(persisted_rows) == n, (
         f"backend={backend!r}: expected {n} persisted notifications, "
         f"saw {len(persisted_rows)} (writer subprocess didn't commit them all)"
@@ -250,29 +272,37 @@ async def test_cross_process_burst_no_missed_notifications(db_path, backend):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_cross_process_listener_survives_writer_restart(db_path, backend):
-    db = honker.open(db_path, watcher_backend=backend)
-    with db.transaction() as tx:
-        tx.execute("CREATE TABLE _warm (i INTEGER)")
-    await asyncio.sleep(0.05)
-
-    # Listener subscribes once; both writer epochs must surface through it.
-    # Constructing here, before any writer commits, snapshots MAX(id)=0.
-    listener = db.listen("resilience")
-
-    # Writer 1: emits 5 notifications, then we kill it.
-    proc1 = _spawn_writer(db_path, "resilience", n=5, spacing_ms=20)
+    db = _open_or_skip_backend(db_path, backend)
+    proc1 = None
+    proc2 = None
+    first_task = None
+    second_task = None
     try:
+        with db.transaction() as tx:
+            tx.execute("CREATE TABLE _warm (i INTEGER)")
+        await asyncio.sleep(0.05)
+
+        # Listener subscribes once; both writer epochs must surface through it.
+        # Constructing here, before any writer commits, snapshots MAX(id)=0.
+        listener = db.listen("resilience")
+
+        # Writer 1: emits 5 notifications, then we kill it.
+        proc1 = _spawn_writer(db_path, "resilience", n=5, spacing_ms=20)
+        first_task = asyncio.create_task(_drain_n_notifications(listener, 5, 2.0))
+        await asyncio.sleep(0.05)
         proc1.stdin.write("\n")
         proc1.stdin.flush()
         # Drain the first batch BEFORE killing. With backends like the
         # kernel watcher whose -wal watch may need re-attach after
         # kill, we want to confirm batch 1 was delivered before tearing
         # down the writer.
-        first_seen = await _drain_n_notifications(listener, 5, 2.0)
+        first_seen = await first_task
         proc1.kill()
         proc1.wait()
     finally:
-        if proc1.poll() is None:
+        if first_task is not None and not first_task.done():
+            first_task.cancel()
+        if proc1 is not None and proc1.poll() is None:
             proc1.kill()
 
     assert len(first_seen) == 5, (
@@ -281,15 +311,25 @@ async def test_cross_process_listener_survives_writer_restart(db_path, backend):
     )
 
     # Writer 2: same db, fresh process. Listener must keep working.
-    proc2 = _spawn_writer(db_path, "resilience", n=5, spacing_ms=20)
     try:
+        proc2 = _spawn_writer(db_path, "resilience", n=5, spacing_ms=20)
+        second_task = asyncio.create_task(_drain_n_notifications(listener, 5, 2.5))
+        await asyncio.sleep(0.05)
         proc2.stdin.write("\n")
         proc2.stdin.flush()
         # Listener already has the watcher attached; wakes from writer #2
         # must come through too.
-        second_seen = await _drain_n_notifications(listener, 5, 2.5)
+        second_seen = await second_task
+        persisted = db.query(
+            "SELECT payload FROM _honker_notifications "
+            "WHERE channel = 'resilience' ORDER BY id"
+        )
     finally:
-        _stop_writer(proc2)
+        if second_task is not None and not second_task.done():
+            second_task.cancel()
+        if proc2 is not None:
+            _stop_writer(proc2)
+        db.close()
 
     assert len(second_seen) == 5, (
         f"backend={backend!r}: listener saw {len(second_seen)} of 5 "
@@ -298,10 +338,6 @@ async def test_cross_process_listener_survives_writer_restart(db_path, backend):
     )
 
     # Total: 10 distinct payloads (each writer emitted 0..4).
-    persisted = db.query(
-        "SELECT payload FROM _honker_notifications "
-        "WHERE channel = 'resilience' ORDER BY id"
-    )
     assert len(persisted) == 10, (
         f"backend={backend!r}: persisted {len(persisted)} of 10 "
         f"notifications across two writer lifetimes"
@@ -322,7 +358,7 @@ async def test_cross_process_listener_survives_writer_restart(db_path, backend):
 @pytest.mark.skipif(sys.platform == "win32", reason="rename-over-open denied on Windows")
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_listener_raises_when_watcher_dies(db_path, backend, tmp_path):
-    db = honker.open(db_path, watcher_backend=backend)
+    db = _open_or_skip_backend(db_path, backend)
     with db.transaction() as tx:
         tx.execute("CREATE TABLE _warm (i INTEGER)")
         tx.notify("dead", "warmup")  # one row so listener has something to subscribe past

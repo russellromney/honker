@@ -40,6 +40,10 @@ public sealed class Database : IDisposable
         connection.Open();
         var resolvedExtensionPath = System.IO.Path.GetFullPath(extensionPath);
         InstallConnection(connection, resolvedExtensionPath, bootstrap: true);
+        using (new UpdatePoller(System.IO.Path.GetFullPath(path), resolvedExtensionPath, options.WatcherBackend))
+        {
+            // Probe the requested core watcher backend at open time.
+        }
         return new Database(path, options, connection, resolvedExtensionPath);
     }
 
@@ -238,7 +242,7 @@ public sealed class Database : IDisposable
 
     internal UpdatePoller CreatePoller()
     {
-        return new UpdatePoller(ConnectionString, Options.UpdatePollInterval);
+        return new UpdatePoller(Path, _extensionPath, Options.WatcherBackend);
     }
 
     internal SqliteConnection CreateReadConnection()

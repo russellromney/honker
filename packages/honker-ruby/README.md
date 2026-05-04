@@ -15,6 +15,14 @@ gem "honker"
 
 You also need the Honker SQLite extension from the main repo.
 
+## Watcher backends
+
+`Honker::Database.new(..., watcher_backend: "polling")` accepts the
+default polling backend aliases (`"polling"` / `"poll"`). Experimental
+`"kernel"` / `"shm"` requests route through `honker-core` via the loaded
+Honker extension and fail loudly if that extension was not built with
+the matching feature.
+
 ## Quick start
 
 ```ruby

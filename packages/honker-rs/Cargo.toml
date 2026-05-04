@@ -14,6 +14,11 @@ categories = ["database", "concurrency"]
 # split into a submodule repo without disturbing the core build.
 [workspace]
 
+[features]
+bundled-sqlite = ["honker-core/bundled-sqlite", "rusqlite/bundled"]
+kernel-watcher = ["honker-core/kernel-watcher"]
+shm-fast-path = ["honker-core/shm-fast-path"]
+
 [dependencies]
 # `path` resolves when this repo is a submodule inside the main
 # honker repo; `version` is what Cargo uses when honker-rs is

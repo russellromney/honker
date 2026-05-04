@@ -44,11 +44,7 @@ fn napi_err(e: impl std::fmt::Display) -> napi::Error {
 fn parse_watcher_backend(backend: Option<String>) -> Result<WatcherConfig> {
     honker_core::WatcherBackend::parse(backend.as_deref())
         .map(|backend| WatcherConfig { backend })
-        .map_err(|other| {
-            napi_err(format!(
-                "unknown watcherBackend {other:?}; valid: null, 'polling', 'kernel', 'shm'"
-            ))
-        })
+        .map_err(napi_err)
 }
 
 // ---------- JSON <-> SQL param conversion ----------
@@ -439,9 +435,9 @@ impl UpdateEvents {
 /// - `"kernel"` — kernel filesystem notifications (experimental)
 /// - `"shm"` — mmap `-shm` fast path (experimental)
 ///
-/// Experimental backends require the corresponding Cargo feature; if a
-/// build doesn't include them, requesting one logs a warning and falls
-/// back to polling.
+/// Experimental backends require the corresponding Cargo feature. Builds
+/// without that feature reject an explicit request instead of silently
+/// falling back to polling.
 #[napi]
 pub fn open(
     path: String,

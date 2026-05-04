@@ -23,8 +23,19 @@ def find_ext_parity
   nil
 end
 
+def require_load_extension_support_parity!
+  return if SQLite3::Database.new(":memory:").respond_to?(:enable_load_extension)
+
+  message = "sqlite3 gem lacks loadable-extension support"
+  if ENV["HONKER_REQUIRE_RUBY_EXTENSION_LOADING"] == "1"
+    flunk message
+  end
+  skip message
+end
+
 class HonkerParityTest < Minitest::Test
   def setup
+    require_load_extension_support_parity!
     ext = find_ext_parity
     skip "honker extension not built" unless ext
     @tmpdir = Dir.mktmpdir("honker-parity-")
@@ -95,6 +106,25 @@ class HonkerParityTest < Minitest::Test
       "SELECT COUNT(*) FROM _honker_notifications WHERE channel='orders'",
     )[0]
     assert_equal 1, count
+  end
+
+  def test_outbox_enqueue_tx_is_transactional_and_delivers
+    delivered = []
+    outbox = @db.outbox("webhook", ->(payload, _job) { delivered << payload["order"] }, base_backoff_s: 0)
+
+    @db.transaction do |tx|
+      outbox.enqueue({ order: 1 }, tx: tx)
+      tx.rollback!
+    end
+    assert_nil outbox.queue.claim_one("w")
+
+    @db.transaction do |tx|
+      outbox.enqueue({ order: 2 }, tx: tx)
+    end
+
+    assert outbox.run_once("w")
+    assert_equal [2], delivered
+    assert_nil outbox.queue.claim_one("w")
   end
 
   # -----------------------------------------------------------------

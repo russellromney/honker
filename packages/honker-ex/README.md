@@ -19,6 +19,15 @@ end
 
 You also need the Honker SQLite extension from the main repo.
 
+## Watcher backends
+
+`Honker.open(path, extension_path: ext, watcher_backend: "polling")`
+accepts the default polling backend aliases (`"polling"` / `"poll"`).
+Experimental `"kernel"` / `"shm"` requests route through `honker-core`
+via SQL watcher handles registered by the loaded Honker extension and
+return `{:error, reason}` if that extension was not built with the
+matching feature.
+
 ## Quick start
 
 ```elixir

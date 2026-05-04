@@ -118,6 +118,33 @@ TEST(transaction_rollback) {
     cleanup(db_path);
 }
 
+TEST(outbox_transactional_delivery) {
+    auto db_path = tmp_db();
+    honker::Database db{db_path, ext};
+    std::vector<int> delivered;
+    auto outbox = db.outbox("webhook", [&](const nlohmann::json& payload) {
+        delivered.push_back(payload.value("order", 0));
+    }, 60, 5, 0);
+
+    {
+        auto tx = db.begin();
+        outbox.enqueue_tx(tx, R"({"order":1})");
+        tx.rollback();
+    }
+    assert(!outbox.queue().claim_one("outbox-worker").has_value());
+
+    {
+        auto tx = db.begin();
+        outbox.enqueue_tx(tx, R"({"order":2})");
+        tx.commit();
+    }
+
+    assert(outbox.run_once("outbox-worker"));
+    assert((delivered == std::vector<int>{2}));
+    assert(!outbox.queue().claim_one("outbox-worker").has_value());
+    cleanup(db_path);
+}
+
 TEST(stream_roundtrip) {
     auto db_path = tmp_db();
     honker::Database db{db_path, ext};
@@ -651,6 +678,7 @@ int main() {
     std::cout << "Running parity tests...\n";
     RUN(transaction_commit);
     RUN(transaction_rollback);
+    RUN(outbox_transactional_delivery);
     RUN(stream_roundtrip);
     RUN(stream_consumer_offset);
     RUN(stream_publish_tx);

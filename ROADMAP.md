@@ -134,18 +134,23 @@ Shipped in PR #29, with follow-up release prep in PR #33.
 
 > **Status:** core + Python + Node shipped in PR #30 (universal polling
 > SQLITE_BUSY fix, opt-in `kernel`/`shm` backends behind Cargo features,
-> sync baseline handshake, watcher-death propagation). Polling soaked
-> 600 s under sustained writes — every commit observed, integrity ok.
-> Remaining work: bring Bun, Go, Rust, Ruby, C++, Elixir to parity.
+> sync baseline handshake, watcher-death propagation). Rust wrapper
+> parity is wired via `OpenOptions::watcher_backend`. Go, Bun, C++,
+> .NET, Ruby, and Elixir are core-backed too: extension consumers route
+> blocking wake waits through the shared extension watcher ABI (or the
+> SQL watcher-handle bridge for Elixir). Polling soaked 600 s under
+> sustained writes — every commit observed, integrity ok.
 
 The experimental `kernel` and `shm` watcher backends ship in
-`honker-core` and are wired through Python and Node only. Bring the
-remaining bindings to parity so users can opt in from any language.
+`honker-core` and every maintained binding routes waits through that
+same implementation. Direct Rust-style bindings call
+`SharedUpdateWatcher` in-process. Extension-backed bindings load the
+watcher ABI from the same `libhonker_ext` they already require; Elixir
+uses SQL watcher-handle functions registered by that extension.
 
 ### Scope
 
-For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
-`honker-cpp`, `honker-ex`:
+For each supported binding:
 
 - Add Cargo features `kernel-watcher` and `shm-fast-path` that forward
   to `honker-core/<feature>` (where the binding has a Cargo.toml).
@@ -157,7 +162,9 @@ For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
 - Call `WatcherBackend::probe(&db_path)` at `open()` time and surface
   failures as the language's idiomatic error type. **No silent
   fallback.**
-- Pass the `WatcherConfig` through to `SharedUpdateWatcher::new_with_config`.
+- Pass the `WatcherConfig` through to `SharedUpdateWatcher::new_with_config`
+  directly or through the extension ABI. No binding owns a separate
+  data-version poller for blocking waits.
 
 ### Tests per binding
 
@@ -170,6 +177,9 @@ For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
   topologies × each backend. Mirrors the existing
   `tests/test_watcher_backends_queue_e2e.py` and
   `packages/honker-node/test/watcher_backends_queue_e2e.js`.
+- Backend-isolation test: disable high-level fallback polling / idle
+  waits, or inspect backend wake telemetry, so the selected experimental
+  backend must carry the wake.
 
 ### Non-goals
 
@@ -177,9 +187,9 @@ For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
   backends live in `honker-core`; bindings only thread the param.
 - Don't auto-detect / silently substitute backends — the experimental
   contract is "opt in, fail loud, restart".
-- Don't backport to bindings without an `update_events()` equivalent
-  (some have polling-only consumer APIs); document those as
-  polling-only and skip.
+- Don't add per-language watcher backends. Extension consumers can have
+  language-specific fanout/iterator wrappers, but the blocking wake
+  primitive comes from `honker-core`.
 
 ### Verification
 
@@ -189,6 +199,54 @@ For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
   `tests/test_watcher_backends_e2e.py`, and
   `tests/test_watcher_backends_queue_e2e.py` continue to pass for
   Python; equivalents continue to pass for Node.
+
+### Proof-Parity Plan
+
+1. Treat Python and Node as the reference proof shape for watcher
+   backends: direct option contract, cross-process listener, and
+   cross-process queue worker tests for 1×1, 1×N, and N×1 topologies.
+2. Every binding keeps a native-language proof, but helpers must be
+   separate OS processes. Threads, tasks, futures, and BEAM processes
+   are useful local stress tests, not watcher-backend parity proof.
+3. Queue e2e tests must use a no-fallback wait path: workers block on
+   the selected core watcher until real queue writes or explicit stop
+   jobs wake them. A polling timeout may only bound failure, not make
+   success possible.
+4. CI must run every binding with an extension/build that can load
+   `libhonker_ext` and must fail when a binding's watcher e2e suite is
+   skipped unexpectedly. Local skips are allowed only for missing
+   optional toolchains or experimental backend features.
+5. The release gate for this phase is the binding matrix plus one CI
+   job per binding showing: polling aliases accepted exactly, unknown
+   names rejected exactly, unsupported experimental backends fail loud,
+   and supported `kernel` / `shm` modes pass the full cross-process
+   listener + queue topology suite.
+
+Hardening decisions made while converting the remaining bindings to
+process helpers:
+
+- The kernel watcher now wakes conservatively for every filesystem
+  event and retries direct watches when SQLite creates WAL-side files
+  after watcher startup. This removes the .NET many-writer missed-wake
+  failure without adding a high-level polling fallback.
+- The `shm` fast path now tolerates WAL shared-memory churn by reopening
+  the current `-shm` file and rebasing `iChange`. C++ and Elixir `shm`
+  process proofs also pin a long-lived SQLite connection during the
+  topology so the proof matches the backend's "WAL + live shm" contract.
+- Ruby now depends on `sqlite3 >= 2.0.4`, the modern line that exposes
+  loadable-extension APIs, and CI sets
+  `HONKER_REQUIRE_RUBY_EXTENSION_LOADING=1` so extension-loading skips
+  are hard failures.
+
+### Full API-Parity Follow-Up
+
+Watcher-backend parity does not imply full binding-surface parity.
+Transactional outbox helpers now exist in every core binding and have
+binding-local rollback/commit/deliver proofs. Python remains the
+richest binding for task decorators and worker shortcuts, so the next
+feature-parity phase should either port those task APIs to every core
+binding or define explicit API tiers so "core binding" has a precise
+meaning before 1.0.
 
 ## Phase Atlas — Map Experimental Backend Edge-Case Behavior
 

@@ -1,8 +1,13 @@
 //! Feature-parity surface tests: transactions, streams, listen,
 //! scheduler, locks, rate limits, results.
 
-use honker::{Database, EnqueueOpts, QueueOpts, ScheduledFire, ScheduledTask};
+use honker::{
+    Database, EnqueueOpts, OpenOptions, OutboxOpts, QueueOpts, ScheduledFire, ScheduledTask,
+};
 use serde_json::json;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
@@ -79,6 +84,42 @@ fn transaction_drop_rolls_back() {
             .unwrap()
     });
     assert_eq!(n, 0, "dropped tx must roll back");
+}
+
+#[test]
+fn outbox_enqueue_is_transactional_and_delivers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(tmp.path().join("t.db")).unwrap();
+    let outbox = db.outbox("webhook", OutboxOpts::default());
+
+    {
+        let tx = db.transaction().unwrap();
+        outbox
+            .enqueue_tx(&tx, &json!({"order_id": 1}), EnqueueOpts::default())
+            .unwrap();
+        tx.rollback().unwrap();
+    }
+    assert!(outbox.queue().claim_one("w").unwrap().is_none());
+
+    {
+        let tx = db.transaction().unwrap();
+        outbox
+            .enqueue_tx(&tx, &json!({"order_id": 2}), EnqueueOpts::default())
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let mut delivered = Vec::new();
+    assert!(
+        outbox
+            .run_once("w", |payload| {
+                delivered.push(payload["order_id"].as_i64().unwrap());
+                Ok::<(), String>(())
+            })
+            .unwrap()
+    );
+    assert_eq!(delivered, vec![2]);
+    assert!(outbox.queue().claim_one("w").unwrap().is_none());
 }
 
 #[test]
@@ -515,11 +556,10 @@ fn scheduler_accepts_every_second_expression() {
     let soonest = sched.soonest().unwrap();
     assert!(soonest > 0);
 
-    let rows_json: String = db
-        .with_conn(|c| {
-            c.query_row("SELECT honker_scheduler_tick(?1)", [soonest], |r| r.get(0))
-                .unwrap()
-        });
+    let rows_json: String = db.with_conn(|c| {
+        c.query_row("SELECT honker_scheduler_tick(?1)", [soonest], |r| r.get(0))
+            .unwrap()
+    });
     let fires: Vec<ScheduledFire> = serde_json::from_str(&rows_json).unwrap();
     assert_eq!(fires.len(), 1);
 }
@@ -539,4 +579,344 @@ fn update_events_wake_on_commit() {
 
     let got = events.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(got, Some(()), "should wake within 2s of the commit");
+}
+
+fn open_backend_or_skip(path: &Path, backend: Option<&str>) -> Option<Database> {
+    match backend {
+        Some(name) => match OpenOptions::default().watcher_backend(name) {
+            Ok(opts) => match Database::open_with_options(path, opts) {
+                Ok(db) => Some(db),
+                Err(err)
+                    if err.to_string().contains("requires the")
+                        || err.to_string().contains("-shm unavailable")
+                        || err.to_string().contains("unsupported SQLite layout") =>
+                {
+                    None
+                }
+                Err(err) => panic!("backend {name:?} open failed: {err}"),
+            },
+            Err(err)
+                if err.to_string().contains("requires the")
+                    || err.to_string().contains("-shm unavailable")
+                    || err.to_string().contains("unsupported SQLite layout") =>
+            {
+                None
+            }
+            Err(err) => panic!("backend {name:?} option failed: {err}"),
+        },
+        None => Some(Database::open(path).unwrap()),
+    }
+}
+
+fn queue_backend_modes() -> [Option<&'static str>; 3] {
+    [None, Some("kernel"), Some("shm")]
+}
+
+fn bootstrap_queue(path: &Path, backend: Option<&str>) -> bool {
+    let Some(db) = open_backend_or_skip(path, backend) else {
+        return false;
+    };
+    let q = db.queue("shared", QueueOpts::default());
+    let id = q
+        .enqueue(&json!({"bootstrap": true}), EnqueueOpts::default())
+        .unwrap();
+    let job = q.claim_one("bootstrap").unwrap().unwrap();
+    assert_eq!(job.id, id);
+    assert!(job.ack().unwrap());
+    true
+}
+
+fn maybe_pin_shm(path: &Path, backend: Option<&str>) -> Option<Database> {
+    if backend == Some("shm") {
+        Some(Database::open(path).unwrap())
+    } else {
+        None
+    }
+}
+
+fn queue_helper_env(backend: Option<&str>) -> String {
+    backend.unwrap_or("").to_string()
+}
+
+fn spawn_queue_worker_process(
+    path: &Path,
+    dir: &Path,
+    backend: Option<&str>,
+    worker_id: &str,
+) -> (Child, PathBuf, PathBuf) {
+    let ready_path = dir.join(format!("{worker_id}.ready"));
+    let result_path = dir.join(format!("{worker_id}.result"));
+    let child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("queue_watcher_backend_process_helper")
+        .arg("--nocapture")
+        .env("HONKER_RS_QUEUE_HELPER", "worker")
+        .env("HONKER_RS_QUEUE_DB", path)
+        .env("HONKER_RS_QUEUE_BACKEND", queue_helper_env(backend))
+        .env("HONKER_RS_QUEUE_WORKER", worker_id)
+        .env("HONKER_RS_QUEUE_READY", &ready_path)
+        .env("HONKER_RS_QUEUE_RESULT", &result_path)
+        .spawn()
+        .unwrap();
+    (child, ready_path, result_path)
+}
+
+fn spawn_queue_writer_process(path: &Path, first: i64, count: i64) -> Child {
+    Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("queue_watcher_backend_process_helper")
+        .arg("--nocapture")
+        .env("HONKER_RS_QUEUE_HELPER", "writer")
+        .env("HONKER_RS_QUEUE_DB", path)
+        .env("HONKER_RS_QUEUE_FIRST", first.to_string())
+        .env("HONKER_RS_QUEUE_COUNT", count.to_string())
+        .spawn()
+        .unwrap()
+}
+
+fn enqueue_range(path: &Path, first: i64, count: i64) {
+    let db = Database::open(path).unwrap();
+    let q = db.queue("shared", QueueOpts::default());
+    for i in first..first + count {
+        q.enqueue(&json!({"i": i}), EnqueueOpts::default()).unwrap();
+    }
+}
+
+fn enqueue_stops(path: &Path, count: usize) {
+    let db = Database::open(path).unwrap();
+    let q = db.queue("shared", QueueOpts::default());
+    for _ in 0..count {
+        q.enqueue(&json!({"stop": true}), EnqueueOpts::default())
+            .unwrap();
+    }
+}
+
+fn wait_ready(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("worker did not become ready: {}", path.display());
+}
+
+fn wait_child(mut child: Child) {
+    let status = child.wait().unwrap();
+    assert!(status.success(), "child process failed: {status}");
+}
+
+fn read_result(path: &Path) -> Vec<i64> {
+    let text = fs::read_to_string(path).unwrap();
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.parse::<i64>().unwrap())
+        .collect()
+}
+
+fn assert_int_set(mut values: Vec<i64>, count: i64) {
+    values.sort();
+    assert_eq!(values, (0..count).collect::<Vec<_>>());
+}
+
+#[test]
+fn queue_watcher_backend_process_helper() {
+    let Ok(mode) = std::env::var("HONKER_RS_QUEUE_HELPER") else {
+        return;
+    };
+    let path = PathBuf::from(std::env::var("HONKER_RS_QUEUE_DB").unwrap());
+    match mode.as_str() {
+        "worker" => {
+            let backend = std::env::var("HONKER_RS_QUEUE_BACKEND").unwrap();
+            let backend = if backend.is_empty() {
+                None
+            } else {
+                Some(backend.as_str())
+            };
+            let worker_id = std::env::var("HONKER_RS_QUEUE_WORKER").unwrap();
+            let ready_path = PathBuf::from(std::env::var("HONKER_RS_QUEUE_READY").unwrap());
+            let result_path = PathBuf::from(std::env::var("HONKER_RS_QUEUE_RESULT").unwrap());
+            let db = open_backend_or_skip(&path, backend)
+                .expect("worker backend unavailable after bootstrap");
+            let q = db.queue("shared", QueueOpts::default());
+            let events = db.update_events();
+            fs::write(&ready_path, b"ready").unwrap();
+            let mut processed = Vec::new();
+
+            loop {
+                if let Some(job) = q.claim_one(&worker_id).unwrap() {
+                    let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+                    assert!(job.ack().unwrap());
+                    if payload
+                        .get("stop")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    processed.push(payload["i"].as_i64().unwrap());
+                    continue;
+                }
+                assert_eq!(
+                    events.recv_timeout(Duration::from_secs(10)).unwrap(),
+                    Some(())
+                );
+            }
+
+            let mut out = String::new();
+            for value in processed {
+                out.push_str(&format!("{value}\n"));
+            }
+            fs::write(result_path, out).unwrap();
+        }
+        "writer" => {
+            let first = std::env::var("HONKER_RS_QUEUE_FIRST")
+                .unwrap()
+                .parse::<i64>()
+                .unwrap();
+            let count = std::env::var("HONKER_RS_QUEUE_COUNT")
+                .unwrap()
+                .parse::<i64>()
+                .unwrap();
+            enqueue_range(&path, first, count);
+        }
+        other => panic!("unknown helper mode: {other}"),
+    }
+}
+
+#[test]
+fn queue_watcher_backend_1writer_1worker_no_fallback() {
+    for backend in queue_backend_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("q.db");
+        if !bootstrap_queue(&path, backend) {
+            continue;
+        }
+        let _pin = maybe_pin_shm(&path, backend);
+
+        let (worker, ready, result) = spawn_queue_worker_process(&path, tmp.path(), backend, "w1");
+        wait_ready(&ready);
+        enqueue_range(&path, 0, 25);
+        enqueue_stops(&path, 1);
+        wait_child(worker);
+        assert_int_set(read_result(&result), 25);
+    }
+}
+
+#[test]
+fn queue_watcher_backend_1writer_many_workers_no_double_claims() {
+    for backend in queue_backend_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("q.db");
+        if !bootstrap_queue(&path, backend) {
+            continue;
+        }
+        let _pin = maybe_pin_shm(&path, backend);
+
+        let workers: Vec<_> = ["w0", "w1", "w2"]
+            .into_iter()
+            .map(|worker_id| spawn_queue_worker_process(&path, tmp.path(), backend, worker_id))
+            .collect();
+        for (_, ready, _) in &workers {
+            wait_ready(ready);
+        }
+        enqueue_range(&path, 0, 60);
+        enqueue_stops(&path, workers.len());
+        let combined = workers
+            .into_iter()
+            .flat_map(|(child, _, result)| {
+                wait_child(child);
+                read_result(&result)
+            })
+            .collect::<Vec<_>>();
+        assert_int_set(combined.clone(), 60);
+        assert_eq!(
+            combined
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            60
+        );
+    }
+}
+
+#[test]
+fn queue_watcher_backend_many_writers_1worker_no_fallback() {
+    for backend in queue_backend_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("q.db");
+        if !bootstrap_queue(&path, backend) {
+            continue;
+        }
+        let _pin = maybe_pin_shm(&path, backend);
+
+        let (worker, ready, result) =
+            spawn_queue_worker_process(&path, tmp.path(), backend, "solo");
+        wait_ready(&ready);
+        let writers = [0, 20, 40]
+            .into_iter()
+            .map(|offset| spawn_queue_writer_process(&path, offset, 20))
+            .collect::<Vec<_>>();
+        for writer in writers {
+            wait_child(writer);
+        }
+        enqueue_stops(&path, 1);
+        wait_child(worker);
+        assert_int_set(read_result(&result), 60);
+    }
+}
+
+#[test]
+fn open_with_options_accepts_polling_backend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = OpenOptions::default().watcher_backend("poll").unwrap();
+    let db = Database::open_with_options(tmp.path().join("t.db"), opts).unwrap();
+    db.notify("orders", &json!({"id": 1})).unwrap();
+}
+
+#[test]
+fn open_options_reject_unknown_watcher_backend() {
+    for backend in ["definitely-not-a-backend", "KERNEL", " polling "] {
+        let err = OpenOptions::default().watcher_backend(backend).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown watcher backend"),
+            "got: {err}"
+        );
+    }
+}
+
+#[test]
+#[cfg(not(feature = "kernel-watcher"))]
+fn open_options_reject_uncompiled_kernel_backend() {
+    let err = OpenOptions::default()
+        .watcher_backend("kernel")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requires the kernel-watcher Cargo feature"),
+        "got: {err}"
+    );
+}
+
+#[test]
+#[cfg(not(feature = "shm-fast-path"))]
+fn open_options_reject_uncompiled_shm_backend() {
+    let err = OpenOptions::default().watcher_backend("shm").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requires the shm-fast-path Cargo feature"),
+        "got: {err}"
+    );
+}
+
+#[test]
+#[cfg(feature = "kernel-watcher")]
+fn open_options_accept_compiled_kernel_backend() {
+    OpenOptions::default().watcher_backend("kernel").unwrap();
+}
+
+#[test]
+#[cfg(feature = "shm-fast-path")]
+fn open_options_accept_compiled_shm_backend() {
+    OpenOptions::default().watcher_backend("shm").unwrap();
 }

@@ -159,27 +159,17 @@ module Honker
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
-    def data_version
-      @db.db.get_first_row("PRAGMA data_version")[0].to_i
-    end
-
     def wait_for_update_or_timeout(total_s, stop_fn)
       return if total_s <= 0
 
       deadline = monotonic_now + total_s
-      last_version = data_version
-      last_local = @db.update_snapshot
 
       until stop_fn.call
         now = monotonic_now
         break if now >= deadline
 
-        slice = [UPDATE_POLL_S, deadline - now].min
-        sleep(slice)
-
-        version = data_version
-        local = @db.update_snapshot
-        return if version != last_version || local != last_local
+        slice = [0.1, deadline - now].min
+        return if @db.wait_for_update(slice)
       end
     end
 
