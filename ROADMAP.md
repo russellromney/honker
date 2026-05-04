@@ -283,6 +283,215 @@ the default either way; "available in wheels" is the only flip.
 - Don't ship a feature that fails any platform's CI. If one OS
   earns it and another doesn't, ship neither.
 
+## Phase Mantle — Schedule Lifecycle + Cancel
+
+> After: Phase Echo · Before: 1.0 release prep
+
+Mickey Mantle was a switch-hitter — pause / resume from one side to
+the other. This phase makes schedules and pending jobs *manageable* at
+runtime: pause, resume, modify, unschedule, list, cancel. Today an
+operator (or CLI tool, or MCP wrapper) has to UPDATE / DELETE
+`_honker_scheduler_tasks` and `_honker_live` directly. After Mantle
+they call methods.
+
+This is the answer to issue #25 / #26. `max_runs` is deliberately NOT
+in scope — see Non-goals — but the rest of sahuguet's wishlist
+(pause, resume, modify, list, unschedule, cancel) is. Closest prior
+art: pg-boss (`schedule`, `unschedule`, `getSchedules`, `cancel`).
+pg-boss also lacks `max_runs`; honker matches its shape.
+
+### Scope
+
+Schedule lifecycle:
+- [ ] Add `enabled BOOLEAN NOT NULL DEFAULT 1` to `_honker_scheduler_tasks`.
+- [ ] `db.unschedule(name)` — DELETE the row. Idempotent on missing.
+- [ ] `db.pause_schedule(name)` / `db.resume_schedule(name)` — toggle
+      `enabled`. Scheduler skips emitting from disabled rows.
+- [ ] `db.list_schedules()` — return all rows with current state +
+      `next_fire_at`. Useful for admin UIs and "what's scheduled?"
+      MCP tools.
+- [ ] `db.update_schedule(name, *, cron_expr=None, payload=None,
+      priority=None, expires_s=None)` — mutate in place. Recompute
+      `next_fire_at` if `cron_expr` changed.
+
+Job lifecycle:
+- [ ] `db.queue("emails").cancel(job_id)` — DELETE a pending or
+      processing row. Returns true if a row was removed. Idempotent.
+- [ ] `db.queue("emails").get_job(job_id)` — return the row (or
+      None). Pure read.
+
+Bindings:
+- [ ] Wire all methods through Python + Node + Rust. Other bindings
+      tracked under Phase Echo.
+
+### Acceptance
+
+- [ ] One round-trip test per method per binding (Python + Node + Rust).
+- [ ] Cross-process: `pause` from process A is observed by scheduler
+      in process B within ≤ 1 s; `resume` re-emits within ≤ 1 s.
+- [ ] `list_schedules` round-trips all fields including the new `enabled`.
+- [ ] `cancel()` of a pending job removes it before any worker claims.
+- [ ] `cancel()` of a claimed-but-not-ack'd job removes it; the
+      worker's subsequent `ack()` returns 0 (no-op, same as expired claim).
+- [ ] Documented "deterministic-wrapper for max_runs" pattern in
+      `docs/recipes/bounded-schedules.mdx` — uses `unschedule()` from
+      inside the worker after a counter check.
+
+### Non-goals
+
+- **No `max_runs` column.** It looks like a scheduler primitive but the
+  semantic ambiguity (fires vs claims vs successful completions) is
+  business logic. Apps that need bounded recurrences either insert N
+  concrete `run_at` jobs at registration time, or maintain their own
+  counter and call `unschedule()` when the bound is hit. pg-boss
+  reached the same conclusion. Issue #25 thread covers the reasoning.
+- No `end_at` (time-based bound) yet — different semantics from
+  `max_runs`, separate phase if demand surfaces. The clean version of
+  the same idea (measured at the emit boundary, no downstream-state
+  dependency).
+- No "cancel by predicate" / "cancel all in queue" — too easy to shoot
+  a foot. Write the SQL if you need it.
+- No "modify all running jobs spawned from this schedule" — schedules
+  emit jobs; jobs are independent rows. Mutating the schedule affects
+  future emits only.
+
+## Phase Mays — Pg-Boss Parity (Singleton, State Events, Queue Stats)
+
+> After: Phase Mantle · Before: 1.0 release prep
+
+Willie Mays was a five-tool player — hit, hit for power, run, field,
+throw. This phase is five-ish small features that together close most
+of honker's remaining gap with pg-boss for production users:
+
+- **Singleton / dedup keys** — "this enqueue can't fire twice while a
+  prior one is still pending."
+- **Job-state event channels** — every state transition (created,
+  claimed, completed, failed, retried, dead) emits a notify on a
+  reserved `_honker:job:*` channel. UI dashboards, downstream
+  triggers, and oncall scripts subscribe without running a worker.
+- **Queue stats / size** — `size()`, `stats()` for "what's in this
+  queue right now?" Surface the counts that already exist in queries.
+- **Convenience event handlers** — `db.on_completed(queue, handler)`
+  etc., a thin filter over `db.listen()` on the new channels.
+
+Each one is small (one-table-touch + one method per binding). They're
+bundled because they're all "the queue is now observable and
+controllable from outside the worker."
+
+### Scope
+
+Singleton:
+- [ ] Add `singleton_key TEXT NULL` to `_honker_live`.
+- [ ] Partial unique index: `(queue, singleton_key) WHERE singleton_key
+      IS NOT NULL AND state IN ('pending','processing')`.
+- [ ] `enqueue(payload, singleton_key=...)` accepts an optional key.
+      On constraint violation, return the existing job's id (or `None`
+      — decide ergonomic shape) rather than raising.
+- [ ] Same on `enqueue_tx`. Atomicity preserved with the tx.
+
+State events:
+- [ ] Define channel names: `_honker:job:{queue}:created`,
+      `:claimed`, `:completed`, `:failed`, `:retried`, `:dead`.
+- [ ] Worker code `tx.notify(channel, {job_id, ...})` on each
+      transition, atomic with the state change.
+- [ ] Reserve the `_honker:` prefix in user docs.
+- [ ] Convenience: `db.on_completed(queue, handler)` etc. Internally
+      a `db.listen()` filtered by channel.
+
+Queue stats:
+- [ ] `db.queue("emails").size()` — `{pending, processing, dead}` counts.
+- [ ] `db.queue("emails").stats()` — extends `size()` with
+      `oldest_pending_at`, `oldest_processing_at`, `next_run_at`.
+
+Bindings:
+- [ ] Wire through Python + Node + Rust.
+
+### Acceptance
+
+Singleton:
+- [ ] Two concurrent processes both call `enqueue(payload,
+      singleton_key="daily-stripe")`. Exactly one row lands. Second
+      call returns existing job's id (no raise).
+- [ ] Once ack'd, subsequent enqueue with same key succeeds.
+- [ ] Per-queue isolation: same key in different queues is allowed.
+
+State events:
+- [ ] Listener attached to `_honker:job:emails:completed` receives
+      notification within ~1 ms of `job.ack()`.
+- [ ] All six transitions fire and are tested.
+- [ ] Cross-process / cross-binding: Python writer → Node listener.
+- [ ] No measurable throughput regression on enqueue/claim/ack path.
+
+Queue stats:
+- [ ] `size()` returns correct counts after a known enqueue/claim/ack
+      sequence, in every binding.
+- [ ] `stats()` `oldest_pending_at` is correct after a 1 s delay.
+
+### Non-goals
+
+- No time-windowed dedup (`singletonMinutes`-style). Separate phase
+  if demand surfaces.
+- Dedup applies to enqueue, not to schedule emit — schedules with a
+  `singleton_key` in their payload would still emit one job per tick.
+- State events are ephemeral. No replay / catchup. If you need that,
+  query `_honker_live` / `_honker_dead` directly.
+- No real-time stats stream — `stats()` is a point-in-time read.
+- No purge / cancel-by-predicate (write the SQL).
+
+## Phase Gehrig — Per-Queue Config Defaults
+
+> After: Phase Mantle · Phase Mays · Before: 1.0 release prep
+
+Today every `enqueue()` accepts (and may require) `max_attempts`,
+`expires_s`, `priority`. For production deployments this is repetitive
+and error-prone — the same queue should have the same retry policy
+across every callsite.
+
+pg-boss attaches policy to the queue: `boss.createQueue(name, {
+retryLimit, retryDelay, expireInHours, deadLetter })`. Per-enqueue
+overrides win when present.
+
+This is the biggest schema change of the new phases — adds a
+`_honker_queues` table and merge-at-enqueue logic — so it's
+intentionally last in the sequence after the easier wins.
+
+### Scope
+
+- [ ] `_honker_queues` table: `name PRIMARY KEY`, `default_max_attempts`,
+      `default_retry_delay_s`, `default_expires_s`, `default_priority`,
+      `dead_letter_queue TEXT NULL`, `created_at`.
+- [ ] `db.queue("emails", config={...})` upserts a row when called
+      with a config dict; called without config it just returns the
+      handle (current behavior). Backwards-compatible.
+- [ ] `enqueue()` merges per-call args over per-queue defaults over
+      hard-coded defaults. Per-call wins.
+- [ ] `db.list_queues()` — return all configured queues with their
+      defaults + sizes (composes with Phase Ledger).
+- [ ] Migration: existing databases work unchanged; queues without a
+      `_honker_queues` row use hard-coded defaults exactly as today.
+
+### Acceptance
+
+- [ ] A queue configured with `default_max_attempts=5`, called with
+      `enqueue(payload)` (no per-call attempts), produces a job with
+      `max_attempts=5`.
+- [ ] Same queue, `enqueue(payload, max_attempts=2)` produces a job
+      with `max_attempts=2`. Per-call wins.
+- [ ] An older database (no `_honker_queues` table) opens, bootstrap
+      adds the table, existing queues without rows continue to use
+      hard-coded defaults. No data loss.
+- [ ] `dead_letter_queue` set to `"emails-dlq"`: a job that exhausts
+      retries lands in `_honker_dead` *and* an enqueue fires into
+      `emails-dlq`. Atomic with the dead transition.
+
+### Non-goals
+
+- No per-queue concurrency limit (worker-side concern; honker doesn't
+  own the worker pool).
+- No per-queue rate limit. `_honker_locks` already exists for
+  rate-limit-ish patterns; revisit if it's not enough.
+- No quota / capacity limits per queue. SQLite is the limit.
+
 ## Release Automation
 
 
