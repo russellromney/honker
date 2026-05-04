@@ -366,14 +366,14 @@ public sealed class BindingTests
 
     private static void WaitReady(string path)
     {
-        // The helper subprocess is `dotnet test --filter ...` which has
-        // 5-15 s of test-discovery boot overhead before the helper code
-        // runs. The original 15 s window left no margin for slow CI
-        // runners (issue #45). 60 s comfortably covers the boot path
-        // without making local runs slow — locally the helper boots
-        // in <5 s and this returns immediately on file-exists.
+        // The helper subprocess is `dotnet test --filter ...`. Typical
+        // wall time per test is ~2 s (helper boot + work + exit). The
+        // original 15 s ceiling occasionally tripped on heavily-loaded
+        // CI runners (issue #45). 30 s is ~15x the typical case —
+        // enough headroom for a slow runner without making a real hang
+        // take a full minute to surface.
         var watch = Stopwatch.StartNew();
-        while (watch.Elapsed < TimeSpan.FromSeconds(60))
+        while (watch.Elapsed < TimeSpan.FromSeconds(30))
         {
             if (File.Exists(path))
             {
