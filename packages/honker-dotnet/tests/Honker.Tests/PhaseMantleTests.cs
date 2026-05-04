@@ -1,9 +1,97 @@
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace Honker.Tests;
 
 public sealed class PhaseMantleTests
 {
+    private sealed class TestHarness : IDisposable
+    {
+        private readonly string _dir;
+
+        private TestHarness(string dir, string extensionPath)
+        {
+            _dir = dir;
+            ExtensionPath = extensionPath;
+            DatabasePath = Path.Combine(dir, "test.db");
+        }
+
+        public string ExtensionPath { get; }
+        public string DatabasePath { get; }
+
+        public static TestHarness Create()
+        {
+            var root = FindRepoRoot();
+            var extensionPath = FindExtension(root);
+            var dir = Path.Combine(Path.GetTempPath(), $"honker-dotnet-mantle-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            return new TestHarness(dir, extensionPath);
+        }
+
+        public Database Open()
+        {
+            return Database.Open(DatabasePath, new OpenOptions
+            {
+                ExtensionPath = ExtensionPath,
+                UpdatePollInterval = TimeSpan.FromMilliseconds(5),
+            });
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                Directory.Delete(_dir, recursive: true);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string FindRepoRoot()
+        {
+            var current = AppContext.BaseDirectory;
+            while (!string.IsNullOrEmpty(current))
+            {
+                if (Directory.Exists(Path.Combine(current, "honker-core")) &&
+                    File.Exists(Path.Combine(current, "Cargo.toml")))
+                {
+                    return current;
+                }
+                current = Path.GetDirectoryName(current) ?? "";
+            }
+            throw new DirectoryNotFoundException("could not locate honker repo root from test base directory");
+        }
+
+        private static string FindExtension(string root)
+        {
+            var candidates = new[]
+            {
+                Path.Combine(root, "target", "debug", ExtensionFileName()),
+                Path.Combine(root, "target", "release", ExtensionFileName()),
+            };
+            var found = candidates.FirstOrDefault(File.Exists);
+            if (found is null)
+            {
+                throw new FileNotFoundException($"expected built honker extension at one of: {string.Join(", ", candidates)}");
+            }
+            return found;
+        }
+
+        private static string ExtensionFileName()
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                return "honker_ext.dll";
+            }
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                return "libhonker_ext.dylib";
+            }
+            return "libhonker_ext.so";
+        }
+    }
+
     [Fact]
     public void ScheduleListRoundTripsFields()
     {
