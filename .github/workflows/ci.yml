@@ -243,10 +243,9 @@ jobs:
 
   node:
     name: node · honker-node
-    # 8 min instead of 5: Windows runners spend 4+ min on the build /
-    # Test (basic — node only) step and the additional cache-cleanup
-    # at the end was tipping over the 5 min limit.
-    timeout-minutes: 8
+    # Windows runners, especially Node 24, spend several minutes in the
+    # native build before the cross-language proofs can even start.
+    timeout-minutes: 12
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
