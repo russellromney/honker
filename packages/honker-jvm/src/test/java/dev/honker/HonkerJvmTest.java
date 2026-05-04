@@ -1079,9 +1079,17 @@ class HonkerJvmTest {
     }
 
     private static String python() {
-        Path venv = Path.of(".venv/bin/python").toAbsolutePath().normalize();
-        if (java.nio.file.Files.isExecutable(venv)) {
-            return venv.toString();
+        String env = System.getenv("HONKER_INTEROP_PYTHON");
+        if (env != null && !env.isBlank()) {
+            return env;
+        }
+        Path repoVenv = Path.of("..", "..", ".venv", "bin", "python").toAbsolutePath().normalize();
+        if (java.nio.file.Files.isExecutable(repoVenv)) {
+            return repoVenv.toString();
+        }
+        Path localVenv = Path.of(".venv/bin/python").toAbsolutePath().normalize();
+        if (java.nio.file.Files.isExecutable(localVenv)) {
+            return localVenv.toString();
         }
         return "python3";
     }

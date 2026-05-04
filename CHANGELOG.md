@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 2026-05-04 — binding parity release
+
+Release versions:
+
+- `honker-core` / `honker-extension`: 0.2.3
+- Python `honker`: 0.2.3
+- Rust `honker`: 0.3.3
+- Node `@russellthehippo/honker-node`: 0.3.3
+- Bun `@russellthehippo/honker-bun`: 0.2.2
+- Ruby `honker`: 0.1.2
+- Elixir `honker`: 0.1.2
+- .NET `Honker`: 0.2.3
+- JVM `dev.honker:honker` / Kotlin `dev.honker:honker-kotlin`: 0.1.0
+
 ## Unreleased — experimental watcher backends + polling reliability
 
 - New opt-in `watcher_backend` parameter on `honker.open()` (Python +

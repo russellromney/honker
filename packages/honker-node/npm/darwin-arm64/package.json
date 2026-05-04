@@ -1,0 +1,27 @@
+{
+  "name": "@russellthehippo/honker-node-darwin-arm64",
+  "version": "0.3.3",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "honker.darwin-arm64.node",
+  "files": [
+    "honker.darwin-arm64.node"
+  ],
+  "description": "Node binding for honker — durable queues, streams, pub/sub, and scheduler on SQLite.",
+  "homepage": "https://honker.dev",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">= 20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/russellromney/honker"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "darwin"
+  ]
+}

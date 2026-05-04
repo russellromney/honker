@@ -1,11 +1,13 @@
 {
   "name": "@russellthehippo/honker-node",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Node binding for honker — durable queues, streams, pub/sub, and scheduler on SQLite.",
   "main": "wrapper.js",
   "types": "wrapper.d.ts",
   "homepage": "https://honker.dev",
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "index.js",
     "wrapper.js",
@@ -14,8 +16,7 @@
     "index.d.ts",
     "README.md",
     "LICENSE",
-    "LICENSE-*",
-    "*.node"
+    "LICENSE-*"
   ],
   "napi": {
     "binaryName": "honker",
@@ -41,5 +42,11 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/russellromney/honker"
+  },
+  "optionalDependencies": {
+    "@russellthehippo/honker-node-darwin-arm64": "0.3.3",
+    "@russellthehippo/honker-node-darwin-x64": "0.3.3",
+    "@russellthehippo/honker-node-linux-x64-gnu": "0.3.3",
+    "@russellthehippo/honker-node-linux-arm64-gnu": "0.3.3"
   }
 }

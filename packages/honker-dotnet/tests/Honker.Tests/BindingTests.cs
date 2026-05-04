@@ -328,6 +328,8 @@ public sealed class BindingTests
         };
         psi.ArgumentList.Add("test");
         psi.ArgumentList.Add(FindTestProject());
+        psi.ArgumentList.Add("--configuration");
+        psi.ArgumentList.Add("Release");
         psi.ArgumentList.Add("--no-build");
         psi.ArgumentList.Add("--filter");
         psi.ArgumentList.Add("FullyQualifiedName~QueueWatcherBackendProcessHelper");
