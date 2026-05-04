@@ -608,6 +608,37 @@ impl Queue {
         })?)
     }
 
+    /// Cancel a job by id. Removes pending or processing rows. Returns
+    /// true iff a row was removed. Idempotent on missing.
+    ///
+    /// IMPORTANT: cancel does NOT interrupt a worker that's currently
+    /// running the handler for this job. It invalidates the worker's
+    /// claim — its next `ack()`/`heartbeat()` returns false (same
+    /// shape as expired claim). If you need the handler to actually
+    /// halt, build that signal in your app; honker doesn't propagate
+    /// cancellation to running handlers.
+    pub fn cancel(&self, job_id: i64) -> Result<bool> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_cancel(?1)",
+                params![job_id],
+                |r| r.get::<_, i64>(0),
+            )
+        })? > 0)
+    }
+
+    /// Read a single job row by id. Returns `Some(JobRow)` or `None`
+    /// on miss (ack'd, dead'd, or never existed). Pure read.
+    pub fn get_job(&self, job_id: i64) -> Result<Option<JobRow>> {
+        let json: String = self.inner.with_conn(|c| {
+            c.query_row("SELECT honker_get_job(?1)", params![job_id], |r| r.get(0))
+        })?;
+        if json.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&json)?))
+    }
+
     /// Sweep expired processing rows back to pending. Returns rows touched.
     pub fn sweep_expired(&self) -> Result<i64> {
         Ok(self.inner.with_conn(|c| {
@@ -665,6 +696,24 @@ struct RawJob {
     #[serde(rename = "claim_expires_at")]
     #[allow(dead_code)]
     claim_expires_at: i64,
+}
+
+/// One row from `Queue::get_job()`. Pure data, no claim semantics.
+#[derive(Debug, Deserialize, Clone)]
+pub struct JobRow {
+    pub id: i64,
+    pub queue: String,
+    /// JSON-serialized payload string.
+    pub payload: String,
+    pub state: String,
+    pub priority: i64,
+    pub run_at: i64,
+    pub worker_id: Option<String>,
+    pub claim_expires_at: Option<i64>,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
 }
 
 /// A claimed unit of work. `payload` is raw JSON bytes.
@@ -1275,6 +1324,33 @@ pub struct ScheduledFire {
     pub job_id: i64,
 }
 
+/// One row from `Scheduler::list()`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ScheduleRow {
+    pub name: String,
+    pub queue: String,
+    pub cron_expr: String,
+    /// JSON-serialized payload (caller can `serde_json::from_str` it).
+    pub payload: String,
+    pub priority: i64,
+    pub expires_s: Option<i64>,
+    pub next_fire_at: i64,
+    pub enabled: bool,
+}
+
+/// Optional fields for `Scheduler::update()`. `None` means "leave
+/// alone." For `expires_s`, the inner `Option` distinguishes
+/// `Some(None)` ("clear it") from `None` ("leave alone") — same
+/// shape as Python's `_UNSET` sentinel and Node's `hasOwnProperty`
+/// check.
+#[derive(Debug, Default, Clone)]
+pub struct ScheduleUpdate {
+    pub cron_expr: Option<String>,
+    pub payload: Option<serde_json::Value>,
+    pub priority: Option<i64>,
+    pub expires_s: Option<Option<i64>>,
+}
+
 pub struct Scheduler {
     inner: Arc<Inner>,
 }
@@ -1328,6 +1404,73 @@ impl Scheduler {
                 r.get::<_, i64>(0)
             })
         })?)
+    }
+
+    // ---- Phase Mantle: lifecycle methods ----
+
+    /// Pause a registered schedule. Returns true if a row was paused.
+    /// Idempotent on already-paused (returns false).
+    pub fn pause(&self, name: &str) -> Result<bool> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_pause(?1)",
+                params![name],
+                |r| r.get::<_, i64>(0),
+            )
+        })? > 0)
+    }
+
+    /// Resume a paused schedule. Returns true if a row was resumed.
+    pub fn resume(&self, name: &str) -> Result<bool> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_resume(?1)",
+                params![name],
+                |r| r.get::<_, i64>(0),
+            )
+        })? > 0)
+    }
+
+    /// List every registered schedule with current state.
+    pub fn list(&self) -> Result<Vec<ScheduleRow>> {
+        let json: String = self.inner.with_conn(|c| {
+            c.query_row("SELECT honker_scheduler_list()", [], |r| r.get(0))
+        })?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// Mutate fields in place. Pass `None` for fields you want left
+    /// alone. Cron change recomputes `next_fire_at` from now. Returns
+    /// true iff a row was updated.
+    pub fn update(&self, name: &str, opts: ScheduleUpdate) -> Result<bool> {
+        // Empty update is a no-op (matches Python/Node binding).
+        if opts.cron_expr.is_none()
+            && opts.payload.is_none()
+            && opts.priority.is_none()
+            && opts.expires_s.is_none()
+        {
+            return Ok(false);
+        }
+        let payload_json = match &opts.payload {
+            Some(v) => Some(serde_json::to_string(v)?),
+            None => None,
+        };
+        let touch_expires: i64 = if opts.expires_s.is_some() { 1 } else { 0 };
+        let expires_arg: Option<i64> = opts.expires_s.flatten();
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    name,
+                    opts.cron_expr,
+                    payload_json,
+                    opts.priority,
+                    expires_arg,
+                    touch_expires,
+                ],
+                |r| r.get::<_, i64>(0),
+            )
+        })? > 0)
     }
 
     /// Run the scheduler loop with leader election. Blocks until

@@ -511,6 +511,35 @@ class Queue:
             )
         return bool(rows[0]["r"])
 
+    def cancel(self, job_id: int) -> bool:
+        """Delete a pending or processing job by id. Returns True iff a
+        row was removed. Idempotent on missing.
+
+        IMPORTANT: cancel does NOT interrupt a worker that's currently
+        running the handler for this job. The worker keeps executing
+        until its handler returns (or it dies). What cancel does is
+        invalidate the worker's claim — its next `ack()`/`heartbeat()`
+        call returns False, same shape as an expired claim. If you need
+        the handler to actually stop, build that signal in your app
+        (check a flag periodically, etc.); honker doesn't propagate
+        cancellation to running handlers."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_cancel(?) AS r", [int(job_id)]
+            )
+        return bool(rows[0]["r"])
+
+    def get_job(self, job_id: int) -> Optional[dict]:
+        """Read a single job row by id. Returns a dict with the row
+        fields, or None if the job has been ack'd, dead'd, or never
+        existed. Pure read."""
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT honker_get_job(?) AS j", [int(job_id)])
+        raw = rows[0]["j"] if rows else ""
+        if not raw:
+            return None
+        return json.loads(raw)
+
     # --- Huey-style task decorators ----------------------------------
     #
     # `@queue.task()` wraps a function so calling it enqueues a job

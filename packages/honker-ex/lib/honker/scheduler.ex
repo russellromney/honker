@@ -110,6 +110,93 @@ defmodule Honker.Scheduler do
     end
   end
 
+  # ---- Phase Mantle: lifecycle methods ----
+
+  @doc "Pause a registered schedule. Returns `{:ok, true}` if a row was paused."
+  def pause(%Database{conn: conn}, name) do
+    case Honker.query_first(conn, "SELECT honker_scheduler_pause(?1)", [name]) do
+      {:ok, [n]} ->
+        if n > 0, do: Honker.mark_updated(conn)
+        {:ok, n > 0}
+
+      other ->
+        other
+    end
+  end
+
+  @doc "Resume a paused schedule. Returns `{:ok, true}` if a row was resumed."
+  def resume(%Database{conn: conn}, name) do
+    case Honker.query_first(conn, "SELECT honker_scheduler_resume(?1)", [name]) do
+      {:ok, [n]} ->
+        if n > 0, do: Honker.mark_updated(conn)
+        {:ok, n > 0}
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Return every registered schedule with current state. Each entry is a
+  map with: name, queue, cron_expr, payload, priority, expires_s,
+  next_fire_at, enabled.
+  """
+  def list(%Database{conn: conn}) do
+    case Honker.query_first(conn, "SELECT honker_scheduler_list()", []) do
+      {:ok, [raw]} when is_binary(raw) and byte_size(raw) > 0 ->
+        {:ok, Jason.decode!(raw)}
+
+      {:ok, _} ->
+        {:ok, []}
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Mutate fields in place. `opts` is a keyword list with any of:
+  `cron:` / `schedule:`, `payload:`, `priority:`, `expires_s:`. Omit a
+  key to leave its field alone. `payload: nil` writes JSON null.
+  Cron change recomputes `next_fire_at` from now. Returns
+  `{:ok, true}` iff a row was updated.
+  """
+  def update(%Database{conn: conn}, name, opts \\ []) do
+    cron_arg =
+      cond do
+        Keyword.has_key?(opts, :schedule) -> Keyword.get(opts, :schedule)
+        Keyword.has_key?(opts, :cron) -> Keyword.get(opts, :cron)
+        true -> nil
+      end
+
+    payload_arg =
+      if Keyword.has_key?(opts, :payload),
+        do: Jason.encode!(Keyword.get(opts, :payload)),
+        else: nil
+
+    priority_arg = if Keyword.has_key?(opts, :priority), do: Keyword.get(opts, :priority), else: nil
+    touch_expires = if Keyword.has_key?(opts, :expires_s), do: 1, else: 0
+    expires_arg = if Keyword.has_key?(opts, :expires_s), do: Keyword.get(opts, :expires_s), else: nil
+
+    if cron_arg == nil and payload_arg == nil and priority_arg == nil and touch_expires == 0 do
+      # Empty update is a no-op.
+      {:ok, false}
+    else
+      case Honker.query_first(
+             conn,
+             "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6)",
+             [name, cron_arg, payload_arg, priority_arg, expires_arg, touch_expires]
+           ) do
+        {:ok, [n]} ->
+          if n > 0, do: Honker.mark_updated(conn)
+          {:ok, n > 0}
+
+        other ->
+          other
+      end
+    end
+  end
+
   @doc """
   Run the scheduler loop with leader election. Blocks until `stop_fun`
   returns `true`. Only the process holding the `honker-scheduler` lock

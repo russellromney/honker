@@ -433,7 +433,12 @@ for (const backend of BACKENDS) {
       assert.ok(
         raised,
         `backend=${label}: expected updateEvents.next() to reject after ` +
-          `db file replacement, got ${result}`,
+          `db file replacement; deadline reached without watcher death`,
+      );
+      assert.match(
+        String((result && result.message) || ''),
+        /watcher|replaced|dead|disconnect|closed channel/i,
+        `backend=${label}: expected watcher-died-style error, got ${result && result.message}`,
       );
     } finally {
       cleanup();

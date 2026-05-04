@@ -62,7 +62,11 @@ Today:
 - Handler timeouts, declarative retries with exponential backoff
 - Delayed jobs, task expiration, named locks, rate-limiting
 - Time-trigger scheduling with a leader-elected scheduler:
-  5-field cron, 6-field cron, and `@every <n><unit>`
+  5-field cron, 6-field cron, and `@every <n><unit>`. Schedules are
+  addressable rows you can `pause`, `resume`, `update`, `list`, and
+  `unschedule` from any process or binding.
+- Cancel a pending or in-flight job by id (`queue.cancel(id)`); read
+  any job's row via `queue.get_job(id)`.
 - Opt-in task result storage (`enqueue` returns an id, worker persists the
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval

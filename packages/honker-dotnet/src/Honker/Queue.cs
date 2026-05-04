@@ -183,6 +183,34 @@ public sealed class Queue
         ) ?? 0L) == 1;
     }
 
+    /// <summary>
+    /// Delete a pending or processing job by id. Returns true iff a row
+    /// was removed. Idempotent on missing.
+    ///
+    /// IMPORTANT: cancel does NOT interrupt a worker currently running
+    /// the handler. It invalidates the worker's claim — its next
+    /// Ack/Heartbeat returns false. If you need the handler to actually
+    /// halt, build that signal in your app.
+    /// </summary>
+    public bool Cancel(long jobId)
+    {
+        var n = Convert.ToInt64(_database.ExecuteScalar(
+            "SELECT honker_cancel(@p0)", null, jobId) ?? 0L);
+        return n > 0;
+    }
+
+    /// <summary>
+    /// Read a single job row by id. Returns the row or null on miss
+    /// (ack'd, dead'd, or never existed). Pure read.
+    /// </summary>
+    public JobRow? GetJob(long jobId)
+    {
+        var raw = Convert.ToString(_database.ExecuteScalar(
+            "SELECT honker_get_job(@p0)", null, jobId)) ?? "";
+        if (string.IsNullOrEmpty(raw)) return null;
+        return JsonSerializer.Deserialize<JobRow>(raw);
+    }
+
     public void SaveResult(long jobId, object? value, int ttlSeconds = 0, HonkerTransaction? transaction = null)
     {
         _database.ExecuteScalar(

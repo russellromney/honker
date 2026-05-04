@@ -121,6 +121,41 @@ export interface ScheduledFire {
   job_id: number;
 }
 
+export interface ScheduleRow {
+  name: string;
+  queue: string;
+  cron_expr: string;
+  /** JSON-serialized payload string. */
+  payload: string;
+  priority: number;
+  expires_s: number | null;
+  next_fire_at: number;
+  enabled: boolean;
+}
+
+export interface ScheduleUpdate {
+  schedule?: string | null;
+  cron?: string | null;
+  payload?: unknown;
+  priority?: number | null;
+  expiresS?: number | null;
+}
+
+export interface JobRow {
+  id: number;
+  queue: string;
+  payload: string;
+  state: string;
+  priority: number;
+  run_at: number;
+  worker_id: string | null;
+  claim_expires_at: number | null;
+  attempts: number;
+  max_attempts: number;
+  created_at: number;
+  expires_at: number | null;
+}
+
 export interface StreamEvent {
   offset: number;
   topic: string;
@@ -558,6 +593,30 @@ export class Queue {
       )
       .get(json, workerId)!;
     return row.v;
+  }
+
+  /** Delete a pending or processing job by id. Returns true iff a row
+   *  was removed. Idempotent on missing.
+   *
+   *  IMPORTANT: cancel does NOT interrupt a worker currently running
+   *  the handler. It invalidates the worker's claim — its next ack()
+   *  / heartbeat() returns false. If you need the handler to actually
+   *  halt, build that signal in your app. */
+  cancel(jobId: number): boolean {
+    const row = this.db.raw
+      .query<{ v: number }, [number]>("SELECT honker_cancel(?) AS v")
+      .get(jobId)!;
+    if (row.v > 0) this.db._markUpdated();
+    return row.v > 0;
+  }
+
+  /** Read a single job row by id. Returns the row or null on miss. */
+  getJob(jobId: number): JobRow | null {
+    const row = this.db.raw
+      .query<{ v: string }, [number]>("SELECT honker_get_job(?) AS v")
+      .get(jobId)!;
+    if (!row.v) return null;
+    return JSON.parse(row.v) as JobRow;
   }
 
   /** Sweep expired claim rows back to pending. Returns rows touched. */
@@ -1065,6 +1124,56 @@ export class Scheduler {
       .query<{ v: number | null }, []>("SELECT honker_scheduler_soonest() AS v")
       .get()!;
     return row.v ?? 0;
+  }
+
+  // ---- Phase Mantle: lifecycle methods ----
+
+  /** Pause a registered schedule. Returns true if a row was paused. */
+  pause(name: string): boolean {
+    const row = this.db.raw
+      .query<{ v: number }, [string]>("SELECT honker_scheduler_pause(?) AS v")
+      .get(name)!;
+    if (row.v > 0) this.db._markUpdated();
+    return row.v > 0;
+  }
+
+  /** Resume a paused schedule. Returns true if a row was resumed. */
+  resume(name: string): boolean {
+    const row = this.db.raw
+      .query<{ v: number }, [string]>("SELECT honker_scheduler_resume(?) AS v")
+      .get(name)!;
+    if (row.v > 0) this.db._markUpdated();
+    return row.v > 0;
+  }
+
+  /** Every registered schedule with current state. */
+  list(): ScheduleRow[] {
+    const row = this.db.raw
+      .query<{ v: string }, []>("SELECT honker_scheduler_list() AS v")
+      .get()!;
+    return JSON.parse(row.v || "[]") as ScheduleRow[];
+  }
+
+  /** Mutate fields in place. Pass only what you want changed; omitted
+   *  keys are left alone. `payload: null` writes JSON null (use
+   *  hasOwnProperty detection — same shape as Node binding). Cron
+   *  change recomputes next_fire_at from now. Returns true iff a row
+   *  was updated. */
+  update(name: string, opts: ScheduleUpdate = {}): boolean {
+    const has = (k: string) => Object.prototype.hasOwnProperty.call(opts, k);
+    const expr = has("schedule") ? opts.schedule : has("cron") ? opts.cron : null;
+    const cronArg = expr === undefined ? null : (expr as string | null);
+    const payloadArg = has("payload") ? JSON.stringify(opts.payload) : null;
+    const priorityArg = has("priority") ? (opts.priority as number) : null;
+    const touchExpires = has("expiresS") ? 1 : 0;
+    const expiresArg = has("expiresS") ? (opts.expiresS as number | null) : null;
+    const row = this.db.raw
+      .query<{ v: number }, [string, string | null, string | null, number | null, number | null, number]>(
+        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?) AS v",
+      )
+      .get(name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires)!;
+    if (row.v > 0) this.db._markUpdated();
+    return row.v > 0;
   }
 
   /**

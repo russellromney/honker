@@ -53,6 +53,71 @@ public sealed class Scheduler
         ) ?? 0L);
     }
 
+    // ---- Phase Mantle: lifecycle methods ----
+
+    /// <summary>
+    /// Pause a registered schedule. Returns true if a row was paused;
+    /// false if missing or already paused. Idempotent.
+    /// </summary>
+    public bool Pause(string name)
+    {
+        var n = Convert.ToInt64(_database.ExecuteScalar(
+            "SELECT honker_scheduler_pause(@p0)", null, name) ?? 0L);
+        return n > 0;
+    }
+
+    /// <summary>Resume a paused schedule. Returns true if a row was resumed.</summary>
+    public bool Resume(string name)
+    {
+        var n = Convert.ToInt64(_database.ExecuteScalar(
+            "SELECT honker_scheduler_resume(@p0)", null, name) ?? 0L);
+        return n > 0;
+    }
+
+    /// <summary>
+    /// Return every registered schedule with current state. Each row
+    /// has Name, Queue, CronExpr, Payload (JSON string), Priority,
+    /// ExpiresSeconds, NextFireAt, Enabled.
+    /// </summary>
+    public IReadOnlyList<ScheduleRow> List()
+    {
+        var raw = Convert.ToString(_database.ExecuteScalar(
+            "SELECT honker_scheduler_list()", null)) ?? "[]";
+        return JsonSerializer.Deserialize<List<ScheduleRow>>(raw) ?? [];
+    }
+
+    /// <summary>
+    /// Mutate fields in place. Pass only the properties you want
+    /// changed on <see cref="ScheduleUpdate"/>. Cron change recomputes
+    /// next_fire_at from now. Returns true iff a row was updated.
+    /// </summary>
+    public bool Update(string name, ScheduleUpdate opts)
+    {
+        var anyField =
+            opts.HasCron || opts.HasPayload || opts.HasPriority || opts.HasExpires;
+        if (!anyField) return false;
+
+        object? cronArg = opts.HasCron ? opts.Cron : null;
+        object? payloadArg = opts.HasPayload ? JsonSerializer.Serialize(opts.Payload) : null;
+        object? priorityArg = opts.HasPriority ? opts.Priority : null;
+        object? expiresArg = opts.HasExpires && opts.ExpiresSeconds.HasValue
+            ? opts.ExpiresSeconds.Value
+            : null;
+        long touchExpires = opts.HasExpires ? 1L : 0L;
+
+        var n = Convert.ToInt64(_database.ExecuteScalar(
+            "SELECT honker_scheduler_update(@p0, @p1, @p2, @p3, @p4, @p5)",
+            null,
+            name,
+            cronArg ?? (object)DBNull.Value,
+            payloadArg ?? (object)DBNull.Value,
+            priorityArg ?? (object)DBNull.Value,
+            expiresArg ?? (object)DBNull.Value,
+            touchExpires
+        ) ?? 0L);
+        return n > 0;
+    }
+
     public IReadOnlyList<ScheduledFire> Tick(long? nowUnix = null)
     {
         var rowsJson = Convert.ToString(_database.ExecuteScalar(

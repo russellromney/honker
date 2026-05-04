@@ -79,6 +79,65 @@ module Honker
       @db.db.get_first_row("SELECT honker_scheduler_soonest()")[0]
     end
 
+    # ---- Phase Mantle: lifecycle methods ----
+
+    UNSET = Object.new.freeze
+    private_constant :UNSET
+
+    # Pause a registered schedule. Returns true if a row was paused;
+    # false if missing or already paused. Idempotent.
+    def pause(name)
+      n = @db.db.get_first_row(
+        "SELECT honker_scheduler_pause(?)", [name],
+      )[0]
+      @db.mark_updated if n.positive?
+      n.positive?
+    end
+
+    # Resume a paused schedule. Returns true if a row was resumed.
+    def resume(name)
+      n = @db.db.get_first_row(
+        "SELECT honker_scheduler_resume(?)", [name],
+      )[0]
+      @db.mark_updated if n.positive?
+      n.positive?
+    end
+
+    # Return every registered schedule with current state. Each entry
+    # is a Hash with: name, queue, cron_expr, payload (JSON string),
+    # priority, expires_s, next_fire_at, enabled.
+    def list
+      raw = @db.db.get_first_row("SELECT honker_scheduler_list()")[0]
+      return [] if raw.nil? || raw.empty?
+
+      JSON.parse(raw)
+    end
+
+    # Mutate fields in place. Pass only the kwargs you want changed
+    # (omitting a kwarg leaves the field alone). `payload: nil`
+    # writes JSON null. Cron change recomputes next_fire_at from now.
+    # Returns true iff a row was updated.
+    def update(name, schedule: UNSET, cron: UNSET, payload: UNSET, priority: UNSET, expires_s: UNSET)
+      expr = nil
+      expr = schedule if schedule != UNSET
+      expr = cron if expr.nil? && cron != UNSET
+
+      payload_arg = (payload == UNSET) ? nil : JSON.dump(payload)
+      priority_arg = (priority == UNSET) ? nil : priority
+      touch_expires = (expires_s == UNSET) ? 0 : 1
+      expires_arg = (expires_s == UNSET) ? nil : expires_s
+
+      any_field = !expr.nil? || payload != UNSET || priority != UNSET || expires_s != UNSET
+      return false unless any_field
+
+      n = @db.db.get_first_row(
+        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)",
+        [name, expr, payload_arg, priority_arg, expires_arg, touch_expires],
+      )[0]
+      @db.mark_updated if n.positive?
+      n.positive?
+    end
+
     # Run the scheduler loop with leader election. Blocks until `stop`
     # signals. `stop` is any object that responds to `call` (returning
     # truthy to stop) — a common choice is a lambda backed by a Mutex-
