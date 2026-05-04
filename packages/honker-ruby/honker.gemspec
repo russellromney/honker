@@ -15,14 +15,14 @@ Gem::Specification.new do |spec|
     extension; no Redis, no external broker.
   DESC
   spec.homepage      = "https://honker.dev"
-  spec.license       = "Apache-2.0"
+  spec.licenses      = ["MIT", "Apache-2.0"]
   spec.required_ruby_version = ">= 3.0.0"
 
   spec.metadata["homepage_uri"]    = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/russellromney/honker"
   spec.metadata["documentation_uri"] = "https://honker.dev/"
 
-  spec.files = Dir.glob("lib/**/*") + %w[honker.gemspec README.md]
+  spec.files = Dir.glob("lib/**/*") + %w[honker.gemspec README.md LICENSE LICENSE-MIT LICENSE-APACHE]
   spec.require_paths = ["lib"]
 
   # Honker loads the SQLite extension directly, so the Ruby sqlite3

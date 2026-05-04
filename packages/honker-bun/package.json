@@ -2,7 +2,7 @@
   "name": "@russellthehippo/honker-bun",
   "version": "0.2.1",
   "description": "Bun binding for Honker — durable queues, streams, pub/sub, and scheduler on SQLite.",
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "homepage": "https://honker.dev",
   "publishConfig": { "access": "public" },
   "repository": {

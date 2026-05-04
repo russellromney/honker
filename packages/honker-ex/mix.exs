@@ -29,7 +29,7 @@ defmodule Honker.MixProject do
 
   defp package do
     [
-      licenses: ["Apache-2.0"],
+      licenses: ["MIT", "Apache-2.0"],
       links: %{
         "GitHub" => "https://github.com/russellromney/honker",
         "Docs" => "https://honker.dev"

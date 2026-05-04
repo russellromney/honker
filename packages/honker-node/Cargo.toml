@@ -2,6 +2,7 @@
 name = "honker-node"
 version = "0.1.1"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 # Not part of the root workspace — lives on its own so it can be
 # split into a submodule repo without disturbing the core build.
