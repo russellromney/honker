@@ -97,7 +97,7 @@ public sealed class PhaseMantleTests
     {
         using var harness = TestHarness.Create();
         using var db = harness.Open();
-        var sched = db.Scheduler();
+        var sched = db.Scheduler;
 
         sched.Add(new ScheduledTask("recap", "emails",
             Payload: new { team = "premier-league" }, Cron: "0 9 * * 1", Priority: 3));
@@ -120,7 +120,7 @@ public sealed class PhaseMantleTests
     {
         using var harness = TestHarness.Create();
         using var db = harness.Open();
-        var sched = db.Scheduler();
+        var sched = db.Scheduler;
         sched.Add(new ScheduledTask("a", "q", Payload: null, Cron: "0 9 * * *"));
 
         Assert.True(sched.Pause("a"));
@@ -138,7 +138,7 @@ public sealed class PhaseMantleTests
     {
         using var harness = TestHarness.Create();
         using var db = harness.Open();
-        var sched = db.Scheduler();
+        var sched = db.Scheduler;
         sched.Add(new ScheduledTask("t", "q",
             Payload: new { v = 1 }, Cron: "0 9 * * *"));
 
@@ -201,7 +201,7 @@ public sealed class PhaseMantleTests
     {
         using var harness = TestHarness.Create();
         using var db = harness.Open();
-        var sched = db.Scheduler();
+        var sched = db.Scheduler;
         sched.Add(new ScheduledTask("due", "emails",
             Payload: new { x = 1 }, Cron: "@every 1s"));
 
@@ -234,7 +234,7 @@ public sealed class PhaseMantleTests
     {
         using var harness = TestHarness.Create();
         using var db = harness.Open();
-        var sched = db.Scheduler();
+        var sched = db.Scheduler;
         sched.Add(new ScheduledTask("t", "q",
             Payload: new { v = 1 }, Cron: "0 9 * * *"));
 
