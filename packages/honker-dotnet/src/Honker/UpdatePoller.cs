@@ -56,24 +56,35 @@ internal sealed class UpdatePoller : IDisposable
             return;
         }
 
+        // The native `_wait` blocks the calling thread for up to its
+        // timeout. Wrapping in Task.Run pushes the block onto the
+        // thread pool so the caller's runtime thread stays free to
+        // service other awaits.
+        //
+        // Cancellation can't preempt the native wait (no API to do so),
+        // so we still chunk into smaller blocks (default 500 ms) to
+        // re-check the cancellation token periodically. 500 ms is
+        // generous enough that overhead is negligible but tight enough
+        // that a cancel surfaces quickly.
         var deadline = timeout is null ? (DateTime?)null : DateTime.UtcNow + timeout.Value;
+        var watcher = _watcher;
+        var wait = _wait;
         while (deadline is null || DateTime.UtcNow < deadline.Value)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var remaining = deadline is null ? TimeSpan.FromMilliseconds(100) : deadline.Value - DateTime.UtcNow;
+            var remaining = deadline is null ? TimeSpan.FromMilliseconds(500) : deadline.Value - DateTime.UtcNow;
             if (deadline is not null && remaining <= TimeSpan.Zero)
             {
                 return;
             }
 
-            var chunk = Math.Min(100, Math.Max(1, (int)Math.Ceiling(remaining.TotalMilliseconds)));
-            var code = _wait(_watcher, (ulong)chunk);
+            var chunk = (ulong)Math.Min(500, Math.Max(1, (int)Math.Ceiling(remaining.TotalMilliseconds)));
+            var code = await Task.Run(() => wait(watcher, chunk), cancellationToken).ConfigureAwait(false);
             switch (code)
             {
                 case 1:
                     return;
                 case 0:
-                    await Task.Yield();
                     continue;
                 default:
                     throw new InvalidOperationException("honker update watcher closed or died");

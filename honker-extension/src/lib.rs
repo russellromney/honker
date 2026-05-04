@@ -66,16 +66,46 @@ static SQL_WATCHERS: LazyLock<StdMutex<HashMap<u64, HonkerWatcherHandle>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 static NEXT_SQL_WATCHER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Cache of SharedUpdateWatcher by (canonical-db-path, backend-name).
+/// Keyed by Weak so a watcher whose last subscriber has gone away gets
+/// dropped (and its background thread stopped). Subsequent opens on the
+/// same path get a fresh watcher.
+///
+/// Without this cache every binding-side `honker_watcher_open` spawned a
+/// fresh background poll thread + Arc + Mutex (~50-500 ms of setup).
+/// Bindings that re-open the watcher per consumer (e.g. .NET creating a
+/// new UpdatePoller per Queue.ClaimAsync) hit this cost on every async
+/// call. With caching, the first open is normal-cost; subsequent opens
+/// for the same (path, backend) attach a new subscriber to the existing
+/// watcher in microseconds.
+static SHARED_WATCHERS: LazyLock<StdMutex<HashMap<(String, String), std::sync::Weak<honker_core::SharedUpdateWatcher>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
 fn open_watcher_handle(
     db_path: &str,
     backend: Option<&str>,
 ) -> std::result::Result<HonkerWatcherHandle, String> {
-    let backend = honker_core::WatcherBackend::parse(backend.filter(|s| !s.is_empty()))?;
-    backend.probe(PathBuf::from(db_path).as_path())?;
-    let shared = Arc::new(honker_core::SharedUpdateWatcher::new_with_config(
-        PathBuf::from(db_path),
-        honker_core::WatcherConfig { backend },
-    ));
+    let backend_enum = honker_core::WatcherBackend::parse(backend.filter(|s| !s.is_empty()))?;
+    backend_enum.probe(PathBuf::from(db_path).as_path())?;
+    let backend_key = backend.unwrap_or("").to_string();
+    let path_key = PathBuf::from(db_path)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| db_path.to_string());
+    let key = (path_key, backend_key);
+    let shared = {
+        let mut guard = SHARED_WATCHERS.lock().expect("SHARED_WATCHERS poisoned");
+        if let Some(existing) = guard.get(&key).and_then(|w| w.upgrade()) {
+            existing
+        } else {
+            let new_shared = Arc::new(honker_core::SharedUpdateWatcher::new_with_config(
+                PathBuf::from(db_path),
+                honker_core::WatcherConfig { backend: backend_enum },
+            ));
+            guard.insert(key, Arc::downgrade(&new_shared));
+            new_shared
+        }
+    };
     let (sub_id, rx) = shared.subscribe();
     Ok(HonkerWatcherHandle { shared, sub_id, rx })
 }
