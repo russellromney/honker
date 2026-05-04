@@ -110,7 +110,9 @@ impl WatcherBackend {
             None | Some("polling" | "poll") => Ok(WatcherBackend::Polling),
             Some("kernel" | "kernel-watcher") => {
                 #[cfg(feature = "kernel-watcher")]
-                { Ok(WatcherBackend::KernelWatch) }
+                {
+                    Ok(WatcherBackend::KernelWatch)
+                }
                 #[cfg(not(feature = "kernel-watcher"))]
                 {
                     eprintln!("honker: kernel-watcher feature not compiled; using polling");
@@ -119,7 +121,9 @@ impl WatcherBackend {
             }
             Some("shm" | "shm-fast-path") => {
                 #[cfg(feature = "shm-fast-path")]
-                { Ok(WatcherBackend::ShmFastPath) }
+                {
+                    Ok(WatcherBackend::ShmFastPath)
+                }
                 #[cfg(not(feature = "shm-fast-path"))]
                 {
                     eprintln!("honker: shm-fast-path feature not compiled; using polling");
@@ -134,13 +138,13 @@ impl WatcherBackend {
     /// call this at `honker.open()` time so a backend that can't run
     /// errors loudly instead of silently producing no wakes. Returns a
     /// human-readable reason on failure.
-    pub fn probe(&self, db_path: &Path) -> Result<(), String> {
+    pub fn probe(&self, _db_path: &Path) -> Result<(), String> {
         match self {
             WatcherBackend::Polling => Ok(()),
             #[cfg(feature = "kernel-watcher")]
-            WatcherBackend::KernelWatch => kernel_watcher::probe(db_path),
+            WatcherBackend::KernelWatch => kernel_watcher::probe(_db_path),
             #[cfg(feature = "shm-fast-path")]
-            WatcherBackend::ShmFastPath => shm_watcher::probe(db_path),
+            WatcherBackend::ShmFastPath => shm_watcher::probe(_db_path),
         }
     }
 }
@@ -740,11 +744,7 @@ pub(crate) fn run_poll_loop<F>(
                              found (dev={}, ino={}) at {:?}. \
                              The watcher cannot recover; \
                              close the Database and reopen with honker.open().",
-                            initial_identity.0,
-                            initial_identity.1,
-                            current.0,
-                            current.1,
-                            db_path
+                            initial_identity.0, initial_identity.1, current.0, current.1, db_path
                         );
                     }
                 }
@@ -800,21 +800,15 @@ impl UpdateWatcher {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let handle = std::thread::Builder::new()
             .name("honker-update-poll".into())
-            .spawn(move || {
-                match config.backend {
-                    WatcherBackend::Polling => run_poll_loop(db_path, on_change, stop_t, ready_tx),
-                    #[cfg(feature = "kernel-watcher")]
-                    WatcherBackend::KernelWatch => {
-                        kernel_watcher::run_kernel_watch_loop(
-                            db_path, on_change, stop_t, ready_tx,
-                        );
-                    }
-                    #[cfg(feature = "shm-fast-path")]
-                    WatcherBackend::ShmFastPath => {
-                        shm_watcher::run_shm_fast_path_loop(
-                            db_path, on_change, stop_t, ready_tx,
-                        );
-                    }
+            .spawn(move || match config.backend {
+                WatcherBackend::Polling => run_poll_loop(db_path, on_change, stop_t, ready_tx),
+                #[cfg(feature = "kernel-watcher")]
+                WatcherBackend::KernelWatch => {
+                    kernel_watcher::run_kernel_watch_loop(db_path, on_change, stop_t, ready_tx);
+                }
+                #[cfg(feature = "shm-fast-path")]
+                WatcherBackend::ShmFastPath => {
+                    shm_watcher::run_shm_fast_path_loop(db_path, on_change, stop_t, ready_tx);
                 }
             })
             .expect("spawn update-poll thread");
@@ -917,7 +911,9 @@ impl SharedUpdateWatcher {
         // every subscriber's sender is cleared. Their next `recv()`
         // returns Err instead of blocking forever. Subscribers learn
         // the watcher died programmatically, not via stderr.
-        let death_guard = WatcherDeathGuard { senders: senders.clone() };
+        let death_guard = WatcherDeathGuard {
+            senders: senders.clone(),
+        };
         let watcher = UpdateWatcher::spawn_with_config(
             db_path,
             move || {
@@ -2241,7 +2237,9 @@ while True:
             move || {
                 count_t.fetch_add(1, AO::Relaxed);
             },
-            WatcherConfig { backend: WatcherBackend::KernelWatch },
+            WatcherConfig {
+                backend: WatcherBackend::KernelWatch,
+            },
         );
 
         // Drain any initialization wakes.
@@ -2314,8 +2312,12 @@ while True:
         let shm_t = shm_count.clone();
         let shm = UpdateWatcher::spawn_with_config(
             tmp.clone(),
-            move || { shm_t.fetch_add(1, AO::Relaxed); },
-            WatcherConfig { backend: WatcherBackend::ShmFastPath },
+            move || {
+                shm_t.fetch_add(1, AO::Relaxed);
+            },
+            WatcherConfig {
+                backend: WatcherBackend::ShmFastPath,
+            },
         );
 
         // Drain initialization wakes.
@@ -2537,21 +2539,30 @@ while True:
     // WAL-mode kernel coverage stays mandatory (kernel_watcher_works_in_wal).
     #[test]
     #[cfg(feature = "kernel-watcher")]
-    #[cfg_attr(target_os = "macos", ignore = "kqueue: in-place writes don't fire dir events")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "kqueue: in-place writes don't fire dir events"
+    )]
     fn kernel_watcher_works_in_delete() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "DELETE");
     }
 
     #[test]
     #[cfg(feature = "kernel-watcher")]
-    #[cfg_attr(target_os = "macos", ignore = "kqueue: in-place writes don't fire dir events")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "kqueue: in-place writes don't fire dir events"
+    )]
     fn kernel_watcher_works_in_truncate() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "TRUNCATE");
     }
 
     #[test]
     #[cfg(feature = "kernel-watcher")]
-    #[cfg_attr(target_os = "macos", ignore = "kqueue: in-place writes don't fire dir events")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "kqueue: in-place writes don't fire dir events"
+    )]
     fn kernel_watcher_works_in_persist() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "PERSIST");
     }
@@ -2674,12 +2685,7 @@ while True:
         ));
         let _ = std::fs::remove_file(&tmp);
 
-        let lats = measure_wake_latencies_ms(
-            WatcherBackend::KernelWatch,
-            tmp.clone(),
-            10,
-            50,
-        );
+        let lats = measure_wake_latencies_ms(WatcherBackend::KernelWatch, tmp.clone(), 10, 50);
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
@@ -2721,12 +2727,7 @@ while True:
         ));
         let _ = std::fs::remove_file(&tmp);
 
-        let lats = measure_wake_latencies_ms(
-            WatcherBackend::ShmFastPath,
-            tmp.clone(),
-            10,
-            50,
-        );
+        let lats = measure_wake_latencies_ms(WatcherBackend::ShmFastPath, tmp.clone(), 10, 50);
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
@@ -2770,7 +2771,9 @@ while True:
         let watcher = UpdateWatcher::spawn_with_config(
             tmp.clone(),
             || {},
-            WatcherConfig { backend: WatcherBackend::KernelWatch },
+            WatcherConfig {
+                backend: WatcherBackend::KernelWatch,
+            },
         );
 
         // Let the watcher reach steady state (in its recv_timeout block).
@@ -2886,11 +2889,8 @@ while True:
             f.write_all(&buf).unwrap();
         }
 
-        let watcher = UpdateWatcher::spawn_with_config(
-            tmp.clone(),
-            || {},
-            WatcherConfig { backend },
-        );
+        let watcher =
+            UpdateWatcher::spawn_with_config(tmp.clone(), || {}, WatcherConfig { backend });
         // Generous initial wait so the watcher has snapshotted the
         // initial inode under CI scheduling pressure.
         std::thread::sleep(Duration::from_millis(300));
@@ -2926,9 +2926,7 @@ while True:
     #[cfg(feature = "kernel-watcher")]
     fn watcher_backend_kernel_probe_fails_for_inaccessible_dir() {
         // Path under a non-existent parent — notify can't watch it.
-        let nope = std::path::PathBuf::from(
-            "/this/parent/does/not/exist/honker-kernel-probe.db",
-        );
+        let nope = std::path::PathBuf::from("/this/parent/does/not/exist/honker-kernel-probe.db");
         let result = WatcherBackend::KernelWatch.probe(&nope);
         assert!(
             result.is_err(),
@@ -2936,4 +2934,3 @@ while True:
         );
     }
 }
-

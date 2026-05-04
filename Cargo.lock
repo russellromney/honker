@@ -171,6 +171,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "file-id",
+ "libc",
  "memmap2",
  "notify",
  "parking_lot",

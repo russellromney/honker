@@ -68,7 +68,9 @@ pub(crate) fn run_shm_fast_path_loop<F>(
     let f = match File::open(&shm_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("honker: shm-fast-path disabled: -shm unavailable ({e}). Needs WAL + open conn.");
+            eprintln!(
+                "honker: shm-fast-path disabled: -shm unavailable ({e}). Needs WAL + open conn."
+            );
             return;
         }
     };
@@ -89,7 +91,8 @@ pub(crate) fn run_shm_fast_path_loop<F>(
         return;
     }
 
-    let read_ichange = || u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().unwrap());
+    let read_ichange =
+        || u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().unwrap());
     let mut last = read_ichange();
 
     // Dead-man's switch: snapshot db + -shm inodes; panic on change.
@@ -165,9 +168,8 @@ pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
         return Err("shm-fast-path requires little-endian platform".into());
     }
     let shm = format!("{}-shm", db_path.display());
-    let f = File::open(&shm).map_err(|e| {
-        format!("-shm unavailable ({e}). WAL mode + open connection required.")
-    })?;
+    let f = File::open(&shm)
+        .map_err(|e| format!("-shm unavailable ({e}). WAL mode + open connection required."))?;
     let m = unsafe { Mmap::map(&f) }.map_err(|e| format!("mmap failed: {e}"))?;
     if m.len() < 12 {
         return Err("-shm too small".into());
