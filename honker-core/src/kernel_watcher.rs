@@ -5,10 +5,10 @@
 //!
 //! # Contract
 //!
-//! `on_change()` fires on every non-`Access` filesystem event in the
-//! database's parent directory. **There is no `PRAGMA data_version`
-//! verification, no safety-net poll, and no per-file watch.** This
-//! means:
+//! `on_change()` fires on every relevant filesystem event observed on
+//! the database file, its parent directory, or SQLite sidecar files
+//! (`-wal`, `-shm`, `-journal`). **There is no `PRAGMA data_version`
+//! verification and no safety-net poll.** This means:
 //!
 //! - **Spurious wakes are possible.** Any file change in the directory
 //!   (other apps writing nearby files, the OS touching metadata, etc.)
@@ -29,14 +29,21 @@
 //! that platform — not "fall back to polling and pretend it worked".
 
 use crate::stat_identity;
-use notify::{RecursiveMode, Watcher};
-use std::collections::HashSet;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+use macos::{probe_kqueue, run_kqueue_loop};
+#[cfg(not(target_os = "macos"))]
+use notify::{RecursiveMode, Watcher};
+#[cfg(not(target_os = "macos"))]
+use std::collections::HashSet;
+#[cfg(not(target_os = "macos"))]
+use std::path::Path;
+#[cfg(not(target_os = "macos"))]
+use std::sync::mpsc;
 
 /// How long `recv_timeout` blocks before sampling the stop flag.
 /// Bounds graceful shutdown latency at this value.
@@ -54,87 +61,93 @@ pub(crate) fn run_kernel_watch_loop<F>(
 ) where
     F: Fn() + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = match notify::recommended_watcher(tx) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("honker: kernel-watcher init failed: {e}. Backend disabled.");
-            return;
-        }
-    };
-
-    // Attach watches: db file (catches in-place writes, the only signal
-    // for non-WAL on macOS kqueue), parent dir (catches journal/wal/shm
-    // create+delete in DELETE mode), and -wal/-shm/-journal directly
-    // when present. SQLite can create the WAL after watcher startup, so
-    // we also retry per-file attaches whenever the parent directory
-    // reports activity and on the dead-man cadence.
-    let watch_dir = db_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
-    let wal = PathBuf::from(format!("{}-wal", db_path.display()));
-    let shm = PathBuf::from(format!("{}-shm", db_path.display()));
-    let journal = PathBuf::from(format!("{}-journal", db_path.display()));
-
-    let mut watched = HashSet::new();
-    let mut attached = 0;
-    for path in [&watch_dir, &db_path, &wal, &shm, &journal] {
-        if attach_watch(&mut watcher, &mut watched, path) {
-            attached += 1;
-        }
-    }
-    if attached == 0 {
-        eprintln!(
-            "honker: kernel-watcher couldn't attach to db dir or -wal/-shm. Backend disabled."
-        );
+    #[cfg(target_os = "macos")]
+    {
+        run_kqueue_loop(db_path, on_change, stop, ready);
         return;
     }
 
-    // Dead-man's switch: snapshot db inode; panic if it changes
-    // (atomic rename, litestream restore, NFS remount). Per-file
-    // watches would silently sit on the dead inode otherwise.
-    let initial_id = match stat_identity(&db_path) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("honker: failed to stat database for identity check: {e}");
-            (0, 0)
-        }
-    };
-    let mut last_id_check = Instant::now();
-    // Baseline captured; signal the spawner that it's safe to return.
-    let _ = ready.send(());
-    drop(ready);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = match notify::recommended_watcher(tx) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("honker: kernel-watcher init failed: {e}. Backend disabled.");
+                return;
+            }
+        };
 
-    while !stop.load(Ordering::Acquire) {
-        match rx.recv_timeout(Duration::from_millis(RX_POLL_MS)) {
-            Ok(Ok(_event)) => {
+        // Attach watches: db file (catches in-place writes), parent dir
+        // (catches journal/wal/shm create+delete), and sidecars directly
+        // when present. SQLite can create the WAL after watcher startup,
+        // so retry per-file attaches on parent-dir activity and on the
+        // dead-man cadence.
+        let watch_dir = db_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let wal = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm = PathBuf::from(format!("{}-shm", db_path.display()));
+        let journal = PathBuf::from(format!("{}-journal", db_path.display()));
+
+        let mut watched = HashSet::new();
+        let mut attached = 0;
+        for path in [&watch_dir, &db_path, &wal, &shm, &journal] {
+            if attach_watch(&mut watcher, &mut watched, path) {
+                attached += 1;
+            }
+        }
+        if attached == 0 {
+            eprintln!(
+                "honker: kernel-watcher couldn't attach to db dir or -wal/-shm. Backend disabled."
+            );
+            return;
+        }
+
+        // Dead-man's switch: snapshot db inode; panic if it changes
+        // (atomic rename, litestream restore, NFS remount). Per-file
+        // watches would silently sit on the dead inode otherwise.
+        let initial_id = match stat_identity(&db_path) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("honker: failed to stat database for identity check: {e}");
+                (0, 0)
+            }
+        };
+        let mut last_id_check = Instant::now();
+        let _ = ready.send(());
+        drop(ready);
+
+        while !stop.load(Ordering::Acquire) {
+            match rx.recv_timeout(Duration::from_millis(RX_POLL_MS)) {
+                Ok(Ok(_event)) => {
+                    for path in [&db_path, &wal, &shm, &journal] {
+                        let _ = attach_watch(&mut watcher, &mut watched, path);
+                    }
+                    on_change();
+                }
+                Ok(Err(e)) => {
+                    eprintln!("honker: kernel-watcher event error: {e}");
+                    on_change();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                _ => {}
+            }
+            if last_id_check.elapsed() >= Duration::from_millis(IDENTITY_CHECK_MS) {
                 for path in [&db_path, &wal, &shm, &journal] {
                     let _ = attach_watch(&mut watcher, &mut watched, path);
                 }
-                on_change();
+                if check_db_identity(&db_path, initial_id) {
+                    on_change();
+                }
+                last_id_check = Instant::now();
             }
-            Ok(Err(e)) => {
-                // Notify error — fire conservatively so the consumer
-                // doesn't sit idle on a transient backend hiccup.
-                eprintln!("honker: kernel-watcher event error: {e}");
-                on_change();
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            _ => {} // timeout, or Access event — ignore
-        }
-        if last_id_check.elapsed() >= Duration::from_millis(IDENTITY_CHECK_MS) {
-            for path in [&db_path, &wal, &shm, &journal] {
-                let _ = attach_watch(&mut watcher, &mut watched, path);
-            }
-            if check_db_identity(&db_path, initial_id) {
-                on_change();
-            }
-            last_id_check = Instant::now();
         }
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn attach_watch<W: Watcher>(watcher: &mut W, watched: &mut HashSet<PathBuf>, path: &Path) -> bool {
     if watched.contains(path) {
         return false;
@@ -172,11 +185,250 @@ fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) -> bool {
 /// Probe at `honker.open()` so a misconfigured backend errors
 /// immediately instead of silently producing no wakes.
 pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
-    let (tx, _rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut w = notify::recommended_watcher(tx).map_err(|e| format!("notify init failed: {e}"))?;
-    let dir = db_path.parent().unwrap_or(std::path::Path::new("."));
-    w.watch(dir, RecursiveMode::NonRecursive)
-        .map_err(|e| format!("can't watch {dir:?}: {e}"))?;
-    // Drop the watcher; it's recreated when actually needed.
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        return probe_kqueue(db_path);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (tx, _rx) = mpsc::channel::<notify::Result<notify::Event>>();
+        let mut w =
+            notify::recommended_watcher(tx).map_err(|e| format!("notify init failed: {e}"))?;
+        let dir = db_path.parent().unwrap_or(std::path::Path::new("."));
+        w.watch(dir, RecursiveMode::NonRecursive)
+            .map_err(|e| format!("can't watch {dir:?}: {e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::ptr;
+
+    struct Kqueue {
+        fd: libc::c_int,
+    }
+
+    impl Kqueue {
+        fn new() -> Result<Self, String> {
+            let fd = unsafe { libc::kqueue() };
+            if fd < 0 {
+                return Err(format!(
+                    "kqueue failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self { fd })
+        }
+
+        fn add_vnode(&self, fd: libc::c_int) -> Result<(), String> {
+            let mut event = libc::kevent {
+                ident: fd as libc::uintptr_t,
+                filter: libc::EVFILT_VNODE,
+                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+                fflags: libc::NOTE_WRITE
+                    | libc::NOTE_EXTEND
+                    | libc::NOTE_ATTRIB
+                    | libc::NOTE_DELETE
+                    | libc::NOTE_RENAME
+                    | libc::NOTE_REVOKE,
+                data: 0,
+                udata: ptr::null_mut(),
+            };
+            let n =
+                unsafe { libc::kevent(self.fd, &mut event, 1, ptr::null_mut(), 0, ptr::null()) };
+            if n < 0 {
+                Err(format!(
+                    "kevent add failed: {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_one(&self, timeout: Duration) -> Result<Option<libc::kevent>, String> {
+            let mut event = libc::kevent {
+                ident: 0,
+                filter: 0,
+                flags: 0,
+                fflags: 0,
+                data: 0,
+                udata: ptr::null_mut(),
+            };
+            let ts = libc::timespec {
+                tv_sec: timeout.as_secs() as libc::time_t,
+                tv_nsec: i64::from(timeout.subsec_nanos()) as libc::c_long,
+            };
+            let n = unsafe { libc::kevent(self.fd, ptr::null(), 0, &mut event, 1, &ts) };
+            if n < 0 {
+                Err(format!(
+                    "kevent wait failed: {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else if n == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(event))
+            }
+        }
+    }
+
+    impl Drop for Kqueue {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    struct WatchedPath {
+        path: PathBuf,
+        fd: libc::c_int,
+    }
+
+    impl Drop for WatchedPath {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    fn open_event_fd(path: &Path) -> Result<libc::c_int, String> {
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("path contains NUL byte: {path:?}"))?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_EVTONLY) };
+        if fd < 0 {
+            Err(format!(
+                "open {path:?} failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(fd)
+        }
+    }
+
+    fn candidate_paths(db_path: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(5);
+        if let Some(parent) = db_path.parent() {
+            paths.push(parent.to_path_buf());
+        }
+        paths.push(db_path.to_path_buf());
+        paths.push(PathBuf::from(format!("{}-wal", db_path.display())));
+        paths.push(PathBuf::from(format!("{}-shm", db_path.display())));
+        paths.push(PathBuf::from(format!("{}-journal", db_path.display())));
+        paths
+    }
+
+    fn attach_path(kq: &Kqueue, path: PathBuf, watched: &mut Vec<WatchedPath>) -> bool {
+        if watched.iter().any(|w| w.path == path) {
+            return false;
+        }
+        let fd = match open_event_fd(&path) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        if let Err(e) = kq.add_vnode(fd) {
+            eprintln!("honker: kqueue couldn't watch {path:?}: {e}");
+            unsafe {
+                libc::close(fd);
+            }
+            return false;
+        }
+        watched.push(WatchedPath { path, fd });
+        true
+    }
+
+    fn attach_existing(kq: &Kqueue, db_path: &Path, watched: &mut Vec<WatchedPath>) -> usize {
+        candidate_paths(db_path)
+            .into_iter()
+            .filter(|path| path.exists())
+            .filter(|path| attach_path(kq, path.clone(), watched))
+            .count()
+    }
+
+    fn prune_deleted(event: &libc::kevent, watched: &mut Vec<WatchedPath>) {
+        if event.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE) == 0 {
+            return;
+        }
+        let ident = event.ident as libc::c_int;
+        watched.retain(|w| w.fd != ident);
+    }
+
+    pub(super) fn run_kqueue_loop<F>(
+        db_path: PathBuf,
+        on_change: F,
+        stop: Arc<AtomicBool>,
+        ready: std::sync::mpsc::SyncSender<()>,
+    ) where
+        F: Fn() + Send + 'static,
+    {
+        let kq = match Kqueue::new() {
+            Ok(kq) => kq,
+            Err(e) => {
+                eprintln!("honker: kernel-watcher init failed: {e}. Backend disabled.");
+                return;
+            }
+        };
+        let mut watched = Vec::new();
+        let attached = attach_existing(&kq, &db_path, &mut watched);
+        if attached == 0 {
+            eprintln!(
+                "honker: kqueue couldn't attach to db dir or database files. Backend disabled."
+            );
+            return;
+        }
+
+        let initial_id = match stat_identity(&db_path) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("honker: failed to stat database for identity check: {e}");
+                (0, 0)
+            }
+        };
+        let mut last_id_check = Instant::now();
+        let _ = ready.send(());
+        drop(ready);
+
+        while !stop.load(Ordering::Acquire) {
+            match kq.wait_one(Duration::from_millis(RX_POLL_MS)) {
+                Ok(Some(event)) => {
+                    prune_deleted(&event, &mut watched);
+                    let _ = attach_existing(&kq, &db_path, &mut watched);
+                    on_change();
+                }
+                Ok(None) => {
+                    let _ = attach_existing(&kq, &db_path, &mut watched);
+                }
+                Err(e) => {
+                    eprintln!("honker: kqueue event error: {e}");
+                    on_change();
+                }
+            }
+
+            if last_id_check.elapsed() >= Duration::from_millis(IDENTITY_CHECK_MS) {
+                if check_db_identity(&db_path, initial_id) {
+                    on_change();
+                }
+                last_id_check = Instant::now();
+            }
+        }
+    }
+
+    pub(super) fn probe_kqueue(db_path: &Path) -> Result<(), String> {
+        let kq = Kqueue::new()?;
+        let dir = db_path.parent().unwrap_or(Path::new("."));
+        let dir_fd = open_event_fd(dir)?;
+        let result = kq.add_vnode(dir_fd);
+        unsafe {
+            libc::close(dir_fd);
+        }
+        result.map_err(|e| format!("can't watch {dir:?}: {e}"))
+    }
 }

@@ -1,4 +1,4 @@
-.PHONY: help test test-rust test-python test-python-slow test-node test-all \
+.PHONY: help test test-rust test-python test-python-slow test-node test-jvm test-kotlin test-jvm-consumer test-all \
         build build-pyo3 build-ext \
         coverage coverage-rust coverage-python coverage-python-all \
         install-coverage-deps clean \
@@ -13,6 +13,9 @@ help:
 	@echo "  make test-python    - pytest tests/ (excludes slow/linux_only)"
 	@echo "  make test-python-slow - pytest -m slow (soak, real-time cron)"
 	@echo "  make test-node      - npm test in packages/honker-node"
+	@echo "  make test-jvm       - Maven test in packages/honker-jvm"
+	@echo "  make test-kotlin    - Maven test in packages/honker-kotlin"
+	@echo "  make test-jvm-consumer - clean Maven consumer proof for JVM/Kotlin"
 	@echo "  make test-all       - everything, including slow marks"
 	@echo ""
 	@echo "Builds:"
@@ -45,6 +48,18 @@ test-python-slow:
 
 test-node:
 	cd packages/honker-node && npm test
+
+test-jvm:
+	cargo build -p honker-extension
+	cd packages/honker-jvm && mvn test
+
+test-kotlin:
+	cargo build -p honker-extension
+	cd packages/honker-jvm && mvn install
+	cd packages/honker-kotlin && mvn test
+
+test-jvm-consumer:
+	scripts/test-jvm-consumer.sh
 
 test-all: test test-python-slow
 	@echo "all tests passed (including slow marks)"

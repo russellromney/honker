@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
 const WALINDEX_MAX_VERSION: u32 = 3_007_000;
 const ICHANGE_OFFSET: usize = 8;
 /// Same cadence as the polling backend. Shm reads are nearly free; the
-/// win over polling is "PRAGMA → memory load" (~3.5 µs → ns), not
-/// "1 ms → 100 µs". Going faster would just burn extra sleep syscalls
+/// win over polling is "PRAGMA -> memory load" (~3.5 us -> ns), not
+/// "1 ms -> 100 us". Going faster would just burn extra sleep syscalls
 /// for latency nobody can perceive.
 const POLL_INTERVAL_MS: u64 = 1;
 /// Cadence for the dead-man's switch (db / -shm replacement detection).
