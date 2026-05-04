@@ -11,7 +11,7 @@ defmodule HonkerParityTest do
   """
   use ExUnit.Case, async: false
 
-  alias Honker.{Job, Lock, Queue, Scheduler, Stream, StreamEvent, Transaction}
+  alias Honker.{Job, Lock, Outbox, Queue, Scheduler, Stream, StreamEvent, Transaction}
 
   @candidates [
     "target/release/libhonker_ext.dylib",
@@ -48,7 +48,11 @@ defmodule HonkerParityTest do
   # ---------------------------------------------------------------
 
   test "Transaction.transaction commits on success", %{db: db} do
-    :ok = Exqlite.Sqlite3.execute(db.conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
+    :ok =
+      Exqlite.Sqlite3.execute(
+        db.conn,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)"
+      )
 
     result =
       Transaction.transaction(db, fn tx ->
@@ -66,7 +70,11 @@ defmodule HonkerParityTest do
   end
 
   test "Transaction.transaction rolls back on raised exception", %{db: db} do
-    :ok = Exqlite.Sqlite3.execute(db.conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
+    :ok =
+      Exqlite.Sqlite3.execute(
+        db.conn,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)"
+      )
 
     assert_raise RuntimeError, "boom", fn ->
       Transaction.transaction(db, fn tx ->
@@ -83,7 +91,11 @@ defmodule HonkerParityTest do
   end
 
   test "Transaction.begin + explicit rollback drops both sides", %{db: db} do
-    :ok = Exqlite.Sqlite3.execute(db.conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
+    :ok =
+      Exqlite.Sqlite3.execute(
+        db.conn,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)"
+      )
 
     {:ok, tx} = Transaction.begin(db)
     :ok = Transaction.execute(tx, "INSERT INTO orders (id, total) VALUES (?1, ?2)", [3, 30])
@@ -97,7 +109,11 @@ defmodule HonkerParityTest do
   end
 
   test "Transaction.transaction propagates {:error, _} by rolling back", %{db: db} do
-    :ok = Exqlite.Sqlite3.execute(db.conn, "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
+    :ok =
+      Exqlite.Sqlite3.execute(
+        db.conn,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)"
+      )
 
     result =
       Transaction.transaction(db, fn tx ->
@@ -108,6 +124,33 @@ defmodule HonkerParityTest do
     assert result == {:error, :nope}
     {:ok, [n]} = Honker.query_first(db.conn, "SELECT COUNT(*) FROM orders", [])
     assert n == 0
+  end
+
+  test "Outbox enqueue_tx is transactional and delivers", %{db: db} do
+    parent = self()
+
+    outbox =
+      Honker.outbox(
+        db,
+        "webhook",
+        fn payload ->
+          send(parent, {:delivered, payload["order"]})
+          :ok
+        end, base_backoff_s: 0)
+
+    {:ok, tx} = Transaction.begin(db)
+    {:ok, _} = Outbox.enqueue_tx(outbox, tx, %{"order" => 1})
+    :ok = Transaction.rollback(tx)
+
+    assert {:ok, nil} = Queue.claim_one(outbox.db, outbox.queue, "w")
+
+    {:ok, tx2} = Transaction.begin(db)
+    {:ok, _} = Outbox.enqueue_tx(outbox, tx2, %{"order" => 2})
+    :ok = Transaction.commit(tx2)
+
+    assert {:ok, true} = Outbox.run_once(outbox, "w")
+    assert_receive {:delivered, 2}
+    assert {:ok, nil} = Queue.claim_one(outbox.db, outbox.queue, "w")
   end
 
   # ---------------------------------------------------------------

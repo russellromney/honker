@@ -368,7 +368,11 @@ Idle cost is a single `PRAGMA data_version` query per millisecond per database. 
 
 ### Wake backend (advanced)
 
-Polling is the default. It's the only backend shipped in published wheels. Two opt-in alternatives exist behind Cargo features for source builds: kernel filesystem events, and an mmap read of SQLite's WAL index. Both can give lower idle CPU or faster wakes, but they can also miss wakes or fire wakes you didn't ask for. All three watch for the database file being swapped under them; if that happens they shut down loudly — every subscriber sees an error from `update_events()` instead of hanging.
+Polling is the default. It's the only backend shipped in published wheels. Two opt-in alternatives exist behind Cargo features for source builds: kernel filesystem events, and an mmap read of SQLite's WAL index. Builds without the requested feature reject `kernel` / `shm` explicitly instead of silently substituting polling. Both experimental backends can give lower idle CPU or faster wakes, but they can also miss wakes or fire wakes you didn't ask for. All three watch for the database file being swapped under them; if that happens they shut down loudly — every subscriber sees an error from `update_events()` instead of hanging.
+
+Binding support is tracked in [BINDINGS.md](BINDINGS.md). All maintained
+bindings route blocking wake waits through the same `honker-core`
+watcher, either in-process or through the shared extension ABI.
 
 One thing changed for everyone, no opt-in needed: the polling backend now keeps its connection through transient `SQLITE_BUSY` / `SQLITE_LOCKED` errors during commits. Before, it would drop and reconnect, which could miss wakes on non-WAL journal modes (DELETE / TRUNCATE / PERSIST). Now it just retries the next tick.
 

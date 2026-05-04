@@ -101,6 +101,34 @@ test('queue: claimBatch with multiple jobs', () => {
   }
 });
 
+test('outbox: enqueueTx is transactional and runWorker delivers', async () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const delivered = [];
+    const ac = new AbortController();
+    const outbox = db.outbox('webhook', async (payload) => {
+      delivered.push(payload.order);
+      ac.abort();
+    }, { baseBackoffS: 0 });
+
+    let tx = db.transaction();
+    outbox.enqueueTx(tx, { order: 1 });
+    tx.rollback();
+    assert.equal(outbox.queue.claimOne('w'), null);
+
+    tx = db.transaction();
+    outbox.enqueueTx(tx, { order: 2 });
+    tx.commit();
+
+    await outbox.runWorker('w', { signal: ac.signal, idlePollS: null });
+    assert.deepEqual(delivered, [2]);
+    assert.equal(outbox.queue.claimOne('w'), null);
+  } finally {
+    cleanup();
+  }
+});
+
 test('queue: retry + fail semantics', () => {
   const { path: p, cleanup } = tmpdb();
   try {

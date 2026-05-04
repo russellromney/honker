@@ -41,3 +41,17 @@ Supported schedule forms:
 - `@every 1s`
 
 For full API details, async wake behavior, streams, and SQL functions, see the main repo and docs site.
+
+## Experimental watcher backends
+
+Polling is the default. Source builds can opt into the experimental
+core backends with Cargo features:
+
+```rust
+let opts = honker::OpenOptions::default().watcher_backend("kernel")?;
+let db = honker::Database::open_with_options("app.db", opts)?;
+```
+
+`kernel` requires the `kernel-watcher` feature. `shm` requires
+`shm-fast-path` and WAL mode. Explicit requests fail loudly when the
+feature is not compiled or the backend cannot probe the database path.

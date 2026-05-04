@@ -7,6 +7,413 @@ namespace Honker.Tests;
 
 public sealed class BindingTests
 {
+    [Theory]
+    [InlineData("kernel")]
+    [InlineData("kernel-watcher")]
+    [InlineData("shm")]
+    [InlineData("shm-fast-path")]
+    public async Task OpenWatcherBackendsDetectCommits(string? backend)
+    {
+        using var harness = TestHarness.Create();
+        using var db = OpenOrSkip(harness, backend);
+        if (db is null)
+        {
+            return;
+        }
+        var listener = db.Listen($"backend-{backend ?? "default"}");
+        await using var enumerator = listener.GetAsyncEnumerator();
+        using var writer = harness.Open();
+        writer.Notify($"backend-{backend ?? "default"}", new { ok = true });
+
+        var move = enumerator.MoveNextAsync().AsTask();
+        var completed = await Task.WhenAny(move, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.Same(move, completed);
+        Assert.True(await move);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("poll")]
+    [InlineData("polling")]
+    public void OpenAcceptsPollingWatcherBackendAliases(string? backend)
+    {
+        var ex = Record.Exception(() =>
+            Database.Open(
+                System.IO.Path.Combine(System.IO.Path.GetTempPath(), "honker-dotnet-missing.db"),
+                new OpenOptions
+                {
+                    ExtensionPath = "/missing/libhonker_ext.so",
+                    WatcherBackend = backend,
+                }
+            )
+        );
+
+        Assert.NotNull(ex);
+        Assert.DoesNotContain("watcher backend", ex.Message);
+    }
+
+    [Fact]
+    public void OpenRejectsUnknownWatcherBackend()
+    {
+        using var harness = TestHarness.Create();
+        var ex = Assert.Throws<InvalidOperationException>(() => harness.Open("bogus"));
+
+        Assert.Contains("unknown watcher backend", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("KERNEL")]
+    [InlineData(" polling ")]
+    public void OpenRejectsBackendNamesOutsideExactContract(string backend)
+    {
+        using var harness = TestHarness.Create();
+        var ex = Assert.Throws<InvalidOperationException>(() => harness.Open(backend));
+
+        Assert.Contains("unknown watcher backend", ex.Message);
+    }
+
+    private static Database? OpenOrSkip(TestHarness harness, string? backend)
+    {
+        try
+        {
+            return harness.Open(backend);
+        }
+        catch (InvalidOperationException ex) when (
+            ex.Message.Contains("requires the", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("-shm unavailable", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("unsupported SQLite layout", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("kernel")]
+    [InlineData("shm")]
+    public async Task QueueWatcherBackendOneWriterOneWorkerNoFallback(string? backend)
+    {
+        using var harness = TestHarness.Create();
+        using (var probe = OpenOrSkip(harness, backend))
+        {
+            if (probe is null)
+            {
+                return;
+            }
+            probe.Queue("shared");
+        }
+
+        var worker = StartQueueWorkerProcess(harness, backend, "w1");
+        WaitReady(worker.ReadyPath);
+
+        using (var writer = harness.Open())
+        {
+            var queue = writer.Queue("shared");
+            for (var i = 0; i < 25; i += 1)
+            {
+                queue.Enqueue(new { i });
+            }
+        }
+
+        await WaitProcessAsync(worker.Process);
+        AssertIntSet(ReadProcessResult(worker.ResultPath), 25);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("kernel")]
+    [InlineData("shm")]
+    public async Task QueueWatcherBackendOneWriterManyWorkersNoFallback(string? backend)
+    {
+        using var harness = TestHarness.Create();
+        using (var probe = OpenOrSkip(harness, backend))
+        {
+            if (probe is null)
+            {
+                return;
+            }
+            probe.Queue("shared");
+        }
+
+        var workers = Enumerable.Range(0, 3)
+            .Select(i => StartQueueWorkerProcess(harness, backend, $"w{i}"))
+            .ToArray();
+        foreach (var worker in workers)
+        {
+            WaitReady(worker.ReadyPath);
+        }
+
+        using (var writer = harness.Open())
+        {
+            var queue = writer.Queue("shared");
+            for (var i = 0; i < 60; i += 1)
+            {
+                queue.Enqueue(new { i });
+            }
+        }
+
+        foreach (var worker in workers)
+        {
+            await WaitProcessAsync(worker.Process);
+        }
+        var processed = workers.SelectMany(worker => ReadProcessResult(worker.ResultPath)).ToArray();
+        AssertIntSet(processed, 60);
+        Assert.Equal(60, processed.Distinct().Count());
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("kernel")]
+    [InlineData("shm")]
+    public async Task QueueWatcherBackendManyWritersOneWorkerNoFallback(string? backend)
+    {
+        using var harness = TestHarness.Create();
+        using (var probe = OpenOrSkip(harness, backend))
+        {
+            if (probe is null)
+            {
+                return;
+            }
+            probe.Queue("shared");
+        }
+
+        var writers = Enumerable.Range(0, 3)
+            .Select(offset =>
+            {
+                var goPath = Path.Combine(harness.DirectoryPath, $"writer-{offset}.go");
+                return (Process: StartQueueWriterProcess(harness, offset * 20, 20, goPath), GoPath: goPath);
+            })
+            .ToArray();
+        foreach (var (writer, _) in writers)
+        {
+            WaitReady(writer.ReadyPath);
+        }
+
+        var worker = StartQueueWorkerProcess(harness, backend, "solo");
+        WaitReady(worker.ReadyPath);
+
+        foreach (var (_, goPath) in writers)
+        {
+            await File.WriteAllTextAsync(goPath, "go");
+        }
+        foreach (var (writer, _) in writers)
+        {
+            await WaitProcessAsync(writer.Process);
+        }
+
+        await WaitProcessAsync(worker.Process);
+        AssertIntSet(ReadProcessResult(worker.ResultPath), 60);
+    }
+
+    [Fact]
+    public async Task QueueWatcherBackendProcessHelper()
+    {
+        var mode = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_HELPER");
+        if (string.IsNullOrEmpty(mode))
+        {
+            return;
+        }
+
+        var path = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_DB")!;
+        var ext = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_EXT")!;
+        if (mode == "worker")
+        {
+            var backend = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_BACKEND");
+            if (backend == "")
+            {
+                backend = null;
+            }
+
+            var workerId = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_WORKER")!;
+            var readyPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_READY")!;
+            var resultPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_RESULT")!;
+            using var db = Database.Open(path, new OpenOptions
+            {
+                ExtensionPath = ext,
+                WatcherBackend = backend,
+            });
+            var queue = db.Queue("shared");
+            await File.WriteAllTextAsync(readyPath, "ready");
+            var processed = new List<int>();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+
+            try
+            {
+                await foreach (var job in queue.ClaimAsync(workerId, Timeout.InfiniteTimeSpan, cts.Token))
+                {
+                    var stop = job.Payload.TryGetProperty("stop", out var stopValue) && stopValue.GetBoolean();
+                    Assert.True(job.Ack());
+                    if (stop)
+                    {
+                        break;
+                    }
+
+                    processed.Add(job.Payload.GetProperty("i").GetInt32());
+                    cts.CancelAfter(TimeSpan.FromSeconds(2));
+                }
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                // Idle timeout bounds the helper lifetime. It must not make
+                // success possible: parent tests still assert the complete
+                // expected job set.
+            }
+
+            await File.WriteAllTextAsync(resultPath, string.Join(Environment.NewLine, processed));
+            return;
+        }
+
+        if (mode == "writer")
+        {
+            var first = int.Parse(Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_FIRST")!);
+            var count = int.Parse(Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_COUNT")!);
+            var readyPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_READY");
+            var goPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_GO");
+            using var db = Database.Open(path, new OpenOptions { ExtensionPath = ext });
+            var queue = db.Queue("shared");
+            if (!string.IsNullOrEmpty(readyPath) && !string.IsNullOrEmpty(goPath))
+            {
+                await File.WriteAllTextAsync(readyPath, "ready");
+                WaitReady(goPath);
+            }
+            for (var i = first; i < first + count; i += 1)
+            {
+                queue.Enqueue(new { i });
+            }
+            return;
+        }
+
+        throw new InvalidOperationException($"unknown queue helper mode '{mode}'");
+    }
+
+    private sealed record QueueWorkerProcess(Process Process, string ReadyPath, string ResultPath);
+    private sealed record QueueWriterProcess(Process Process, string ReadyPath);
+
+    private static QueueWorkerProcess StartQueueWorkerProcess(TestHarness harness, string? backend, string workerId)
+    {
+        var readyPath = Path.Combine(harness.DirectoryPath, $"{workerId}.ready");
+        var resultPath = Path.Combine(harness.DirectoryPath, $"{workerId}.result");
+        var process = StartHelperProcess(harness, "worker", new Dictionary<string, string?>
+        {
+            ["HONKER_DOTNET_QUEUE_BACKEND"] = backend ?? "",
+            ["HONKER_DOTNET_QUEUE_WORKER"] = workerId,
+            ["HONKER_DOTNET_QUEUE_READY"] = readyPath,
+            ["HONKER_DOTNET_QUEUE_RESULT"] = resultPath,
+        });
+        return new QueueWorkerProcess(process, readyPath, resultPath);
+    }
+
+    private static QueueWriterProcess StartQueueWriterProcess(TestHarness harness, int first, int count, string goPath)
+    {
+        var readyPath = Path.Combine(harness.DirectoryPath, $"writer-{first}.ready");
+        var process = StartHelperProcess(harness, "writer", new Dictionary<string, string?>
+        {
+            ["HONKER_DOTNET_QUEUE_FIRST"] = first.ToString(),
+            ["HONKER_DOTNET_QUEUE_COUNT"] = count.ToString(),
+            ["HONKER_DOTNET_QUEUE_READY"] = readyPath,
+            ["HONKER_DOTNET_QUEUE_GO"] = goPath,
+        });
+        return new QueueWriterProcess(process, readyPath);
+    }
+
+    private static Process StartHelperProcess(TestHarness harness, string mode, IReadOnlyDictionary<string, string?> extraEnv)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("test");
+        psi.ArgumentList.Add(FindTestProject());
+        psi.ArgumentList.Add("--no-build");
+        psi.ArgumentList.Add("--filter");
+        psi.ArgumentList.Add("FullyQualifiedName~QueueWatcherBackendProcessHelper");
+        psi.ArgumentList.Add("--logger");
+        psi.ArgumentList.Add("console;verbosity=detailed");
+        psi.Environment["HONKER_DOTNET_QUEUE_HELPER"] = mode;
+        psi.Environment["HONKER_DOTNET_QUEUE_DB"] = harness.DatabasePath;
+        psi.Environment["HONKER_DOTNET_QUEUE_EXT"] = harness.ExtensionPath;
+        foreach (var (key, value) in extraEnv)
+        {
+            psi.Environment[key] = value ?? "";
+        }
+
+        return Process.Start(psi) ?? throw new InvalidOperationException("failed to start dotnet helper");
+    }
+
+    private static string FindTestProject()
+    {
+        foreach (var start in new[] { Environment.CurrentDirectory, AppContext.BaseDirectory })
+        {
+            var dir = new DirectoryInfo(start);
+            while (dir is not null)
+            {
+                var project = Path.Combine(dir.FullName, "Honker.Tests.csproj");
+                if (File.Exists(project))
+                {
+                    return project;
+                }
+                dir = dir.Parent;
+            }
+        }
+        throw new InvalidOperationException("could not locate Honker.Tests.csproj");
+    }
+
+    private static void WaitReady(string path)
+    {
+        var watch = Stopwatch.StartNew();
+        while (watch.Elapsed < TimeSpan.FromSeconds(15))
+        {
+            if (File.Exists(path))
+            {
+                return;
+            }
+            Thread.Sleep(25);
+        }
+        Assert.Fail($"worker did not become ready: {path}");
+    }
+
+    private static async Task WaitProcessAsync(Process process)
+    {
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(40));
+        var output = await stdout;
+        var error = await stderr;
+        Assert.True(process.ExitCode == 0, $"helper exited {process.ExitCode}\nstdout:\n{output}\nstderr:\n{error}");
+    }
+
+    private static IReadOnlyList<int> ReadProcessResult(string path)
+    {
+        var text = File.Exists(path) ? File.ReadAllText(path) : "";
+        return text
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(int.Parse)
+            .ToArray();
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var watch = Stopwatch.StartNew();
+        while (watch.Elapsed < timeout)
+        {
+            if (predicate())
+            {
+                return;
+            }
+            await Task.Delay(20);
+        }
+        Assert.True(predicate(), $"condition was not met within {timeout}");
+    }
+
+    private static void AssertIntSet(IEnumerable<int> values, int count)
+    {
+        Assert.Equal(Enumerable.Range(0, count), values.OrderBy(v => v));
+    }
+
     [Fact]
     public void EnqueueAndClaimRoundTrip()
     {
@@ -693,6 +1100,7 @@ public sealed class BindingTests
 
         public string ExtensionPath { get; }
         public string DatabasePath { get; }
+        public string DirectoryPath => _dir;
 
         public static TestHarness Create()
         {
@@ -703,12 +1111,13 @@ public sealed class BindingTests
             return new TestHarness(dir, extensionPath);
         }
 
-        public Database Open()
+        public Database Open(string? watcherBackend = null)
         {
             return Database.Open(DatabasePath, new OpenOptions
             {
                 ExtensionPath = ExtensionPath,
                 UpdatePollInterval = TimeSpan.FromMilliseconds(5),
+                WatcherBackend = watcherBackend,
             });
         }
 

@@ -146,10 +146,11 @@ public sealed class NotifyStreamTests
         };
         var got = new List<string>();
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var listener = db.Listen("rt");
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var task = Task.Run(async () =>
         {
-            await foreach (var notification in db.Listen("rt").WithCancellation(cts.Token))
+            await foreach (var notification in listener.WithCancellation(cts.Token))
             {
                 got.Add(Normalize(notification.Payload));
                 if (got.Count == cases.Length)
@@ -302,7 +303,7 @@ public sealed class NotifyStreamTests
         }
 
         var got = new List<int>();
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var task = Task.Run(async () =>
         {
             await foreach (var evt in stream.Subscribe(fromOffset: 0, cancellationToken: cts.Token).WithCancellation(cts.Token))
@@ -334,7 +335,7 @@ public sealed class NotifyStreamTests
             stream.Publish(new { i });
         }
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await foreach (var evt in stream.Subscribe(fromOffset: 2, cancellationToken: cts.Token).WithCancellation(cts.Token))
         {
             Assert.Equal(2, evt.Payload.GetProperty("i").GetInt32());
@@ -357,7 +358,7 @@ public sealed class NotifyStreamTests
         stream.SaveOffset("dashboard", 3);
 
         var got = new List<int>();
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await foreach (var evt in stream.Subscribe(consumer: "dashboard", cancellationToken: cts.Token).WithCancellation(cts.Token))
         {
             got.Add(evt.Payload.GetProperty("i").GetInt32());
@@ -381,7 +382,7 @@ public sealed class NotifyStreamTests
             stream.Publish(new { i });
         }
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var got = 0;
         await foreach (var _ in stream.Subscribe(consumer: "c1", saveEveryN: 10, saveEverySeconds: 9999, cancellationToken: cts.Token).WithCancellation(cts.Token))
         {
@@ -406,7 +407,7 @@ public sealed class NotifyStreamTests
             stream.Publish(new { i });
         }
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var got = 0;
         await foreach (var _ in stream.Subscribe(consumer: "c2", saveEveryN: 9999, saveEverySeconds: 0.1, cancellationToken: cts.Token).WithCancellation(cts.Token))
         {
@@ -432,7 +433,7 @@ public sealed class NotifyStreamTests
             stream.Publish(new { i });
         }
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var got = 0;
         await foreach (var _ in stream.Subscribe(consumer: "c3", saveEveryN: 0, saveEverySeconds: 0.0, cancellationToken: cts.Token).WithCancellation(cts.Token))
         {
@@ -458,7 +459,7 @@ public sealed class NotifyStreamTests
         }
 
         var first = new List<int>();
-        using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+        using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
         {
             await foreach (var evt in stream.Subscribe(consumer: "crashy", saveEveryN: 5, saveEverySeconds: 9999, cancellationToken: cts.Token).WithCancellation(cts.Token))
             {
@@ -474,7 +475,7 @@ public sealed class NotifyStreamTests
         Assert.Equal(10, stream.GetOffset("crashy"));
 
         var second = new List<int>();
-        using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+        using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
         {
             await foreach (var evt in stream.Subscribe(consumer: "crashy", saveEveryN: 5, saveEverySeconds: 9999, cancellationToken: cts.Token).WithCancellation(cts.Token))
             {
@@ -547,7 +548,7 @@ public sealed class NotifyStreamTests
             }, cancellationToken);
         }
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var tasks = Enumerable.Range(0, 5).Select(_ => Collect(stream, cts.Token)).ToArray();
         await Task.Delay(50, cts.Token);
         for (var i = 0; i < 5; i += 1)

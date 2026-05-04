@@ -82,7 +82,7 @@ export class Job {
 }
 
 export class ClaimWaker {
-  next(workerId: string): Promise<Job | null>
+  next(workerId: string, opts?: { signal?: AbortSignal }): Promise<Job | null>
   close(): void
 }
 
@@ -129,10 +129,26 @@ export class Queue {
   enqueueTx(tx: Transaction | any, payload: JsonValue, opts?: EnqueueOptions): number
   claimBatch(workerId: string, n: number): Job[]
   claimOne(workerId: string): Job | null
-  claim(workerId: string, opts?: { idlePollS?: number }): AsyncIterableIterator<Job>
+  claim(workerId: string, opts?: { idlePollS?: number | null, signal?: AbortSignal }): AsyncIterableIterator<Job>
   ackBatch(ids: number[], workerId: string): number
   sweepExpired(): number
-  claimWaker(opts?: { idlePollS?: number }): ClaimWaker
+  claimWaker(opts?: { idlePollS?: number | null }): ClaimWaker
+}
+
+export interface OutboxOptions {
+  visibilityTimeoutS?: number
+  maxAttempts?: number
+  baseBackoffS?: number
+}
+
+export class Outbox {
+  readonly name: string
+  readonly queue: Queue
+  readonly maxAttempts: number
+  readonly baseBackoffS: number
+  enqueue(payload: JsonValue, opts?: EnqueueOptions): number
+  enqueueTx(tx: Transaction | any, payload: JsonValue, opts?: EnqueueOptions): number
+  runWorker(workerId: string, opts?: { idlePollS?: number | null, signal?: AbortSignal }): Promise<void>
 }
 
 export class Database {
@@ -145,8 +161,9 @@ export class Database {
   notify(channel: string, payload: JsonValue): number
   notifyTx(tx: Transaction | any, channel: string, payload: JsonValue): number
   queue(name: string, opts?: QueueOptions): Queue
+  outbox(name: string, delivery: (payload: JsonValue, job: Job) => any | Promise<any>, opts?: OutboxOptions): Outbox
   stream(name: string): Stream
-  listen(channel: string): Listener
+  listen(channel: string, opts?: { fallbackPollS?: number | null }): Listener
   scheduler(): Scheduler
   tryLock(name: string, owner: string, ttlS: number): Lock | null
   tryRateLimit(name: string, limit: number, per: number): boolean
@@ -156,7 +173,7 @@ export class Database {
   sweepResults(): number
 }
 
-export function open(path: string, maxReaders?: number | null): Database
+export function open(path: string, maxReaders?: number | null, watcherBackend?: string | null): Database
 
 export const native: any
 export const NativeDatabase: any

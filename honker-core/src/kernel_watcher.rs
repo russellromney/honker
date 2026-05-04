@@ -37,7 +37,11 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use macos::{probe_kqueue, run_kqueue_loop};
 #[cfg(not(target_os = "macos"))]
-use notify::{EventKind, RecursiveMode, Watcher};
+use notify::{RecursiveMode, Watcher};
+#[cfg(not(target_os = "macos"))]
+use std::collections::HashSet;
+#[cfg(not(target_os = "macos"))]
+use std::path::Path;
 #[cfg(not(target_os = "macos"))]
 use std::sync::mpsc;
 
@@ -74,12 +78,11 @@ pub(crate) fn run_kernel_watch_loop<F>(
             }
         };
 
-        // Attach watches: db file (catches in-place writes, the only signal
-        // for non-WAL on macOS kqueue), parent dir (catches journal/wal/shm
-        // create+delete in DELETE mode), and -wal/-shm/-journal directly
-        // when present. No re-attach if files churn mid-flight — the
-        // per-file watch goes stale and the consumer's `idle_poll_s`
-        // backstop covers it. Experimental: restart to recover.
+        // Attach watches: db file (catches in-place writes), parent dir
+        // (catches journal/wal/shm create+delete), and sidecars directly
+        // when present. SQLite can create the WAL after watcher startup,
+        // so retry per-file attaches on parent-dir activity and on the
+        // dead-man cadence.
         let watch_dir = db_path
             .parent()
             .unwrap_or(std::path::Path::new("."))
@@ -88,12 +91,13 @@ pub(crate) fn run_kernel_watch_loop<F>(
         let shm = PathBuf::from(format!("{}-shm", db_path.display()));
         let journal = PathBuf::from(format!("{}-journal", db_path.display()));
 
-        // Try each path; missing files / inaccessible dirs error here and
-        // we just skip them. As long as at least one watch attached, we go.
-        let attached = [&watch_dir, &db_path, &wal, &shm, &journal]
-            .into_iter()
-            .filter(|p| watcher.watch(p, RecursiveMode::NonRecursive).is_ok())
-            .count();
+        let mut watched = HashSet::new();
+        let mut attached = 0;
+        for path in [&watch_dir, &db_path, &wal, &shm, &journal] {
+            if attach_watch(&mut watcher, &mut watched, path) {
+                attached += 1;
+            }
+        }
         if attached == 0 {
             eprintln!(
                 "honker: kernel-watcher couldn't attach to db dir or -wal/-shm. Backend disabled."
@@ -112,23 +116,28 @@ pub(crate) fn run_kernel_watch_loop<F>(
             }
         };
         let mut last_id_check = Instant::now();
-        // Baseline captured; signal the spawner that it's safe to return.
         let _ = ready.send(());
         drop(ready);
 
         while !stop.load(Ordering::Acquire) {
             match rx.recv_timeout(Duration::from_millis(RX_POLL_MS)) {
-                Ok(Ok(event)) if !matches!(event.kind, EventKind::Access(_)) => on_change(),
+                Ok(Ok(_event)) => {
+                    for path in [&db_path, &wal, &shm, &journal] {
+                        let _ = attach_watch(&mut watcher, &mut watched, path);
+                    }
+                    on_change();
+                }
                 Ok(Err(e)) => {
-                    // Notify error — fire conservatively so the consumer
-                    // doesn't sit idle on a transient backend hiccup.
                     eprintln!("honker: kernel-watcher event error: {e}");
                     on_change();
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                _ => {} // timeout, or Access event — ignore
+                _ => {}
             }
             if last_id_check.elapsed() >= Duration::from_millis(IDENTITY_CHECK_MS) {
+                for path in [&db_path, &wal, &shm, &journal] {
+                    let _ = attach_watch(&mut watcher, &mut watched, path);
+                }
                 if check_db_identity(&db_path, initial_id) {
                     on_change();
                 }
@@ -136,6 +145,18 @@ pub(crate) fn run_kernel_watch_loop<F>(
             }
         }
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn attach_watch<W: Watcher>(watcher: &mut W, watched: &mut HashSet<PathBuf>, path: &Path) -> bool {
+    if watched.contains(path) {
+        return false;
+    }
+    if watcher.watch(path, RecursiveMode::NonRecursive).is_ok() {
+        watched.insert(path.to_path_buf());
+        return true;
+    }
+    false
 }
 
 /// Panics if the db file at `db_path` has been replaced since startup.
@@ -177,7 +198,6 @@ pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
         let dir = db_path.parent().unwrap_or(std::path::Path::new("."));
         w.watch(dir, RecursiveMode::NonRecursive)
             .map_err(|e| format!("can't watch {dir:?}: {e}"))?;
-        // Drop the watcher; it's recreated when actually needed.
         Ok(())
     }
 }

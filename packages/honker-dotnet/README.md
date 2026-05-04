@@ -20,7 +20,15 @@ Current shape:
 - typed `Queue`, `Stream`, `Outbox`, `Scheduler`, `Job`, and lock wrappers
 - async claim / listen / subscribe / outbox worker loops with
   `CancellationToken`
-- local `PRAGMA data_version` polling for update wakes
+- core-backed update wakes through the loaded Honker extension
+
+Watcher backend option:
+
+- `OpenOptions.WatcherBackend = "polling"` (or `"poll"`) selects the
+  default polling backend
+- experimental `"kernel"` / `"shm"` requests route through
+  `honker-core` via the loaded Honker extension and fail loudly if that
+  extension was not built with the matching feature
 
 Current status:
 

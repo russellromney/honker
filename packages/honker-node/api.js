@@ -45,6 +45,13 @@ function abortPromise(signal) {
 
 async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
   if (aborted(signal)) return;
+  if (timeoutMs == null) {
+    await Promise.race([
+      updateEvents.next().catch(() => undefined),
+      abortPromise(signal),
+    ]);
+    return;
+  }
   const ms = Math.max(0, timeoutMs);
   await Promise.race([
     updateEvents.next().catch(() => undefined),
@@ -167,25 +174,26 @@ class Job {
 class ClaimWaker {
   constructor(queue, { idlePollS = 5 } = {}) {
     this._queue = queue;
-    this._idlePollMs = Math.max(0, idlePollS * 1000);
+    this._idlePollMs = idlePollS == null ? null : Math.max(0, idlePollS * 1000);
     this._updates = queue._db.updateEvents();
     this._closed = false;
   }
 
-  async next(workerId) {
-    if (this._closed) return null;
+  async next(workerId, opts = {}) {
+    if (this._closed || aborted(opts.signal)) return null;
 
     let job = this._queue.claimOne(workerId);
     if (job) return job;
 
-    while (!this._closed) {
+    while (!this._closed && !aborted(opts.signal)) {
       const nextClaimAt = this._queue._nextClaimAt();
       let waitMs = this._idlePollMs;
       if (nextClaimAt && nextClaimAt > 0) {
-        waitMs = Math.min(waitMs, Math.max(0, nextClaimAt * 1000 - Date.now()));
+        const untilDeadline = Math.max(0, nextClaimAt * 1000 - Date.now());
+        waitMs = waitMs == null ? untilDeadline : Math.min(waitMs, untilDeadline);
       }
-      await waitForUpdateOrTimeout(this._updates, null, waitMs);
-      if (this._closed) return null;
+      await waitForUpdateOrTimeout(this._updates, opts.signal, waitMs);
+      if (this._closed || aborted(opts.signal)) return null;
       job = this._queue.claimOne(workerId);
       if (job) return job;
     }
@@ -253,7 +261,7 @@ class Queue {
     const waker = this.claimWaker(opts);
     try {
       while (true) {
-        const job = await waker.next(workerId);
+        const job = await waker.next(workerId, opts);
         if (!job) return;
         yield job;
       }
@@ -308,6 +316,61 @@ class Queue {
         extendS,
       ]) === 1
     );
+  }
+}
+
+class Outbox {
+  constructor(db, name, delivery, opts = {}) {
+    if (typeof delivery !== 'function') {
+      throw new TypeError('delivery must be a function');
+    }
+    this._db = db;
+    this.name = name;
+    this.delivery = delivery;
+    this.maxAttempts = opts.maxAttempts ?? 5;
+    this.baseBackoffS = opts.baseBackoffS ?? 5;
+    this.queue = db.queue(`_outbox:${name}`, {
+      visibilityTimeoutS: opts.visibilityTimeoutS ?? 60,
+      maxAttempts: this.maxAttempts,
+    });
+  }
+
+  enqueue(payload, opts = {}) {
+    return this.queue.enqueue(payload, opts);
+  }
+
+  enqueueTx(tx, payload, opts = {}) {
+    return this.queue.enqueueTx(tx, payload, opts);
+  }
+
+  async runWorker(workerId, opts = {}) {
+    const waker = this.queue.claimWaker(opts);
+    try {
+      while (!aborted(opts.signal)) {
+        const job = await waker.next(workerId, opts);
+        if (!job) return;
+        try {
+          await this.delivery(job.payload, job);
+          if (!job.ack()) {
+            throw new Error(`outbox ack failed for job ${job.id}`);
+          }
+        } catch (err) {
+          if (aborted(opts.signal)) throw err;
+          const delayS = this._retryDelay(job.attempts);
+          const message = err && err.stack ? err.stack : String(err);
+          if (!job.retry(delayS, message)) {
+            throw new Error(`outbox retry failed for job ${job.id}: ${message}`);
+          }
+        }
+      }
+    } finally {
+      waker.close();
+    }
+  }
+
+  _retryDelay(attempts) {
+    if (this.baseBackoffS <= 0) return 0;
+    return Math.ceil(this.baseBackoffS * (2 ** Math.max(0, attempts - 1)));
   }
 }
 
@@ -462,9 +525,11 @@ class Stream {
 }
 
 class Listener {
-  constructor(db, channel) {
+  constructor(db, channel, { fallbackPollS = 15 } = {}) {
     this._db = db;
     this.channel = channel;
+    this._fallbackPollMs =
+      fallbackPollS == null ? null : Math.max(0, fallbackPollS * 1000);
     this._updates = db.updateEvents();
     this._closed = false;
     this._pending = [];
@@ -499,7 +564,7 @@ class Listener {
       if (this._pending.length > 0) {
         return { done: false, value: this._pending.shift() };
       }
-      await this._updates.next().catch(() => undefined);
+      await waitForUpdateOrTimeout(this._updates, null, this._fallbackPollMs);
     }
     return { done: true, value: undefined };
   }
@@ -653,12 +718,16 @@ class Database {
     return new Queue(this, name, opts);
   }
 
+  outbox(name, delivery, opts = {}) {
+    return new Outbox(this, name, delivery, opts);
+  }
+
   stream(name) {
     return new Stream(this, name);
   }
 
-  listen(channel) {
-    return new Listener(this, channel);
+  listen(channel, opts = {}) {
+    return new Listener(this, channel, opts);
   }
 
   scheduler() {
@@ -710,6 +779,7 @@ module.exports = function buildApi(nativeBinding) {
     Transaction,
     UpdateEvents,
     Queue,
+    Outbox,
     Job,
     ClaimWaker,
     Stream,

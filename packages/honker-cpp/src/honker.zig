@@ -102,6 +102,7 @@ export fn honker_cpp_open(
         if (db) |d| _ = c.sqlite3_close(d);
         return HONKER_ERR_OPEN;
     }
+    _ = c.sqlite3_busy_timeout(db, 5000);
 
     _ = c.sqlite3_db_config(
         db,
@@ -126,6 +127,7 @@ export fn honker_cpp_open(
         "PRAGMA journal_mode = WAL;" ++
         "PRAGMA synchronous = NORMAL;" ++
         "PRAGMA busy_timeout = 5000;" ++
+        "PRAGMA mmap_size = 0;" ++
         "PRAGMA foreign_keys = ON;" ++
         "PRAGMA cache_size = -32000;" ++
         "PRAGMA temp_store = MEMORY;" ++

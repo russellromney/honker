@@ -124,6 +124,37 @@ maybe("honker-bun parity — Transaction", () => {
   );
 });
 
+maybe("honker-bun parity — Outbox", () => {
+  test(
+    "enqueueTx is transactional and runWorker delivers",
+    withDb(async (db) => {
+      const delivered: number[] = [];
+      const ac = new AbortController();
+      const outbox = db.outbox(
+        "webhook",
+        (payload) => {
+          delivered.push((payload as { order: number }).order);
+          ac.abort();
+        },
+        { baseBackoffS: 0 },
+      );
+
+      let tx = db.transaction();
+      outbox.enqueueTx(tx, { order: 1 });
+      tx.rollback();
+      expect(outbox.queue.claimOne("w")).toBeNull();
+
+      tx = db.transaction();
+      outbox.enqueueTx(tx, { order: 2 });
+      tx.commit();
+
+      await outbox.runWorker("w", { signal: ac.signal, idlePollS: null });
+      expect(delivered).toEqual([2]);
+      expect(outbox.queue.claimOne("w")).toBeNull();
+    }),
+  );
+});
+
 maybe("honker-bun parity — Stream", () => {
   test(
     "publish / readSince round-trip",
