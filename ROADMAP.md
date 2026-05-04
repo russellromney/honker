@@ -550,6 +550,95 @@ intentionally last in the sequence after the easier wins.
   rate-limit-ish patterns; revisit if it's not enough.
 - No quota / capacity limits per queue. SQLite is the limit.
 
+## Phase DiMaggio — Adaptive Polling Backoff
+
+> After: Phase Echo · Before: 1.0 release prep
+
+DiMaggio's hitting streak was 56 games of consistent contact — pace
+matching context. The default polling backend currently runs at a
+fixed 1 ms cadence regardless of activity: idle databases burn the
+same CPU as busy ones. Recurring HN ask: "wind back the polling to
+once a second when nothing is happening."
+
+This is a change to the **default** backend (not the experimental
+ones). Affects everyone, no opt-in. Addresses both the polling-
+overhead critique and the mobile / battery concern in one move.
+
+### Scope
+
+- [ ] Track `time_since_last_wake` in `run_poll_loop`.
+- [ ] If > `IDLE_THRESHOLD_S` (default 5 s), scale poll interval up
+      geometrically (1 ms → 2 → 4 → ... cap at `MAX_POLL_INTERVAL_MS`,
+      default 1000 ms).
+- [ ] Reset to 1 ms on any wake (commit observed via PRAGMA, or any
+      conservative-wake path).
+- [ ] Configurable via `WatcherConfig::idle_threshold_s` and
+      `max_poll_interval_ms` (defaults sensible; users don't need
+      to think about it).
+- [ ] Wire through Python + Node bindings (other bindings track
+      under Phase Echo).
+
+### Acceptance
+
+- [ ] Idle database: after `IDLE_THRESHOLD_S` of no commits, poll
+      interval has scaled up to MAX. Verified via test that times
+      tick cadence.
+- [ ] First commit after idle: wake latency stays bounded by
+      MAX_POLL_INTERVAL_MS (worst case 1 s on default config).
+      Tested for both polling and shm backends (kernel doesn't poll).
+- [ ] CPU benchmark: idle 1-database process drops from ~3.5 ms/sec
+      busy work to ~3.5 µs/sec at the cap.
+- [ ] No effect on a sustained-load workload — the fast path stays
+      at 1 ms while wakes are arriving.
+
+### Non-goals
+
+- No per-database tuning of the curve. One geometric backoff serves
+  every workload; users who need different latency reach for the
+  experimental kernel/shm backends.
+- No "predictive" wake (e.g. learn the workload's commit cadence and
+  pre-empt). Linear backoff is enough.
+- Doesn't replace the experimental backends. Polling-with-backoff
+  still has a worst-case latency; users who can't tolerate that opt
+  in to kernel/shm.
+
+## Phase Berra — HN-Feedback Docs Sweep
+
+> After: Phase Mantle · Before: 1.0 release prep
+
+Yogi Berra called pitches; this phase calls out the docs that need
+fixing now that the second HN front-page hit + 970 stars + the JVM
+binding shipped. Pure docs work, but high-leverage at this stage of
+adoption.
+
+### Scope
+
+- [ ] **README prior-art line**: Oban supports SQLite directly now
+      (raised by @arlobish on HN). Update to acknowledge it as a
+      real comparison, not a pure Postgres-only system. Add Graphile
+      Worker (raised by @odie5533).
+- [ ] **README benchmark table**: publish the numbers from
+      `bench/wal_index_methods` and any cross-process latency we've
+      measured. The "no benchmarks" criticism (raised by
+      @andrewstuart on HN) is fair — we have data, we just haven't
+      surfaced it.
+- [ ] **"When NOT to use" section** in README and docs index. At
+      minimum: mobile / battery context (raised by @ncruces on HN),
+      and a clear statement of the multi-process WAL story to
+      defang the "SQLite isn't concurrent" critique.
+- [ ] **JVM binding mention** in README + docs site nav. Currently
+      shipped but not visible. Update the "Bindings:" line and add
+      to honker.dev nav.
+- [ ] **Cross-link to docs.honker.dev/reference/watcher-backends**
+      from any README mention of polling, so the polling-overhead
+      thread on HN has a concrete answer in our README.
+
+### Non-goals
+
+- No README rewrite. The existing pitch is working (970 stars).
+- No marketing/positioning change. Just close the specific gaps the
+  HN audience pointed at.
+
 ## Release Automation
 
 

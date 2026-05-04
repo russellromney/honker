@@ -366,8 +366,14 @@ public sealed class BindingTests
 
     private static void WaitReady(string path)
     {
+        // The helper subprocess is `dotnet test --filter ...` which has
+        // 5-15 s of test-discovery boot overhead before the helper code
+        // runs. The original 15 s window left no margin for slow CI
+        // runners (issue #45). 60 s comfortably covers the boot path
+        // without making local runs slow — locally the helper boots
+        // in <5 s and this returns immediately on file-exists.
         var watch = Stopwatch.StartNew();
-        while (watch.Elapsed < TimeSpan.FromSeconds(15))
+        while (watch.Elapsed < TimeSpan.FromSeconds(60))
         {
             if (File.Exists(path))
             {
@@ -921,7 +927,12 @@ public sealed class BindingTests
 
         Assert.NotNull(value);
         Assert.True(value!.Value.GetProperty("ok").GetBoolean());
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1), $"wait_result resolved too slowly: {watch.Elapsed}");
+        // The point of this assertion is "wake came via the watcher,
+        // not via the 5 s fallback poll." 1 s was too tight for slow
+        // CI runners — Thread.Sleep(50) on Windows can be 60-90 ms,
+        // SaveResult adds a few ms, plus inter-thread coord. 1.5 s
+        // still rules out the fallback by ~3x. (Issue #44.)
+        Assert.True(watch.Elapsed < TimeSpan.FromMilliseconds(1500), $"wait_result resolved too slowly: {watch.Elapsed}");
     }
 
     [Fact]

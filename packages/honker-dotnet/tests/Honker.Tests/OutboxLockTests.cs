@@ -106,11 +106,14 @@ public sealed class OutboxLockTests
         );
         outbox.Enqueue(new { n = 1 });
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        // 3 retries × backoff + worker scheduling — 3 s was too tight
+        // on slow CI runners (issue #44). 10 s gives ~3x headroom while
+        // still being a real "did the retry path actually fire" check.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         var worker = Task.Run(() => outbox.RunWorker("w1", cts.Token), cts.Token);
         try
         {
-            await WaitUntilAsync(() => calls.Count >= 3, TimeSpan.FromSeconds(3), cts.Token, async () =>
+            await WaitUntilAsync(() => calls.Count >= 3, TimeSpan.FromSeconds(10), cts.Token, async () =>
             {
                 using var tx = db.BeginTransaction();
                 tx.Execute("UPDATE _honker_live SET run_at=unixepoch() - 1 WHERE queue=@p0", "_outbox:retry");
