@@ -67,8 +67,8 @@ public sealed class PhaseMantleTests
         {
             var candidates = new[]
             {
-                Path.Combine(root, "target", "debug", ExtensionFileName()),
                 Path.Combine(root, "target", "release", ExtensionFileName()),
+                Path.Combine(root, "target", "debug", ExtensionFileName()),
             };
             var found = candidates.FirstOrDefault(File.Exists);
             if (found is null)

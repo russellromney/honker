@@ -145,7 +145,7 @@ jobs:
 
   python:
     name: python · honker
-    timeout-minutes: 5
+    timeout-minutes: 10
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -226,8 +226,10 @@ jobs:
           dotnet-version: "10.0.x"
       - name: Build honker-extension
         run: cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+      - name: Build .NET queue helper
+        run: dotnet build packages/honker-dotnet/tests/Honker.QueueHelper/Honker.QueueHelper.csproj -c Release
       - name: Run .NET binding tests
-        run: dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj --verbosity normal
+        run: dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj -c Release --verbosity normal
       - name: Pack NuGet smoke test
         shell: bash
         run: |

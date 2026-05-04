@@ -105,7 +105,7 @@ public sealed class BindingTests
         }
 
         var worker = StartQueueWorkerProcess(harness, backend, "w1");
-        WaitReady(worker.ReadyPath);
+        WaitReady(worker.ReadyPath, worker.Process);
 
         using (var writer = harness.Open())
         {
@@ -141,7 +141,7 @@ public sealed class BindingTests
             .ToArray();
         foreach (var worker in workers)
         {
-            WaitReady(worker.ReadyPath);
+            WaitReady(worker.ReadyPath, worker.Process);
         }
 
         using (var writer = harness.Open())
@@ -187,11 +187,11 @@ public sealed class BindingTests
             .ToArray();
         foreach (var (writer, _) in writers)
         {
-            WaitReady(writer.ReadyPath);
+            WaitReady(writer.ReadyPath, writer.Process);
         }
 
         var worker = StartQueueWorkerProcess(harness, backend, "solo");
-        WaitReady(worker.ReadyPath);
+        WaitReady(worker.ReadyPath, worker.Process);
 
         foreach (var (_, goPath) in writers)
         {
@@ -204,87 +204,6 @@ public sealed class BindingTests
 
         await WaitProcessAsync(worker.Process);
         AssertIntSet(ReadProcessResult(worker.ResultPath), 60);
-    }
-
-    [Fact]
-    public async Task QueueWatcherBackendProcessHelper()
-    {
-        var mode = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_HELPER");
-        if (string.IsNullOrEmpty(mode))
-        {
-            return;
-        }
-
-        var path = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_DB")!;
-        var ext = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_EXT")!;
-        if (mode == "worker")
-        {
-            var backend = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_BACKEND");
-            if (backend == "")
-            {
-                backend = null;
-            }
-
-            var workerId = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_WORKER")!;
-            var readyPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_READY")!;
-            var resultPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_RESULT")!;
-            using var db = Database.Open(path, new OpenOptions
-            {
-                ExtensionPath = ext,
-                WatcherBackend = backend,
-            });
-            var queue = db.Queue("shared");
-            await File.WriteAllTextAsync(readyPath, "ready");
-            var processed = new List<int>();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-
-            try
-            {
-                await foreach (var job in queue.ClaimAsync(workerId, Timeout.InfiniteTimeSpan, cts.Token))
-                {
-                    var stop = job.Payload.TryGetProperty("stop", out var stopValue) && stopValue.GetBoolean();
-                    Assert.True(job.Ack());
-                    if (stop)
-                    {
-                        break;
-                    }
-
-                    processed.Add(job.Payload.GetProperty("i").GetInt32());
-                    cts.CancelAfter(TimeSpan.FromSeconds(2));
-                }
-            }
-            catch (OperationCanceledException) when (cts.IsCancellationRequested)
-            {
-                // Idle timeout bounds the helper lifetime. It must not make
-                // success possible: parent tests still assert the complete
-                // expected job set.
-            }
-
-            await File.WriteAllTextAsync(resultPath, string.Join(Environment.NewLine, processed));
-            return;
-        }
-
-        if (mode == "writer")
-        {
-            var first = int.Parse(Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_FIRST")!);
-            var count = int.Parse(Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_COUNT")!);
-            var readyPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_READY");
-            var goPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_GO");
-            using var db = Database.Open(path, new OpenOptions { ExtensionPath = ext });
-            var queue = db.Queue("shared");
-            if (!string.IsNullOrEmpty(readyPath) && !string.IsNullOrEmpty(goPath))
-            {
-                await File.WriteAllTextAsync(readyPath, "ready");
-                WaitReady(goPath);
-            }
-            for (var i = first; i < first + count; i += 1)
-            {
-                queue.Enqueue(new { i });
-            }
-            return;
-        }
-
-        throw new InvalidOperationException($"unknown queue helper mode '{mode}'");
     }
 
     private sealed record QueueWorkerProcess(Process Process, string ReadyPath, string ResultPath);
@@ -326,15 +245,7 @@ public sealed class BindingTests
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        psi.ArgumentList.Add("test");
-        psi.ArgumentList.Add(FindTestProject());
-        psi.ArgumentList.Add("--configuration");
-        psi.ArgumentList.Add("Release");
-        psi.ArgumentList.Add("--no-build");
-        psi.ArgumentList.Add("--filter");
-        psi.ArgumentList.Add("FullyQualifiedName~QueueWatcherBackendProcessHelper");
-        psi.ArgumentList.Add("--logger");
-        psi.ArgumentList.Add("console;verbosity=detailed");
+        psi.ArgumentList.Add(FindHelperAssembly());
         psi.Environment["HONKER_DOTNET_QUEUE_HELPER"] = mode;
         psi.Environment["HONKER_DOTNET_QUEUE_DB"] = harness.DatabasePath;
         psi.Environment["HONKER_DOTNET_QUEUE_EXT"] = harness.ExtensionPath;
@@ -346,7 +257,7 @@ public sealed class BindingTests
         return Process.Start(psi) ?? throw new InvalidOperationException("failed to start dotnet helper");
     }
 
-    private static string FindTestProject()
+    private static string FindHelperAssembly()
     {
         foreach (var start in new[] { Environment.CurrentDirectory, AppContext.BaseDirectory })
         {
@@ -356,15 +267,26 @@ public sealed class BindingTests
                 var project = Path.Combine(dir.FullName, "Honker.Tests.csproj");
                 if (File.Exists(project))
                 {
-                    return project;
+                    var helper = Path.Combine(
+                        dir.Parent!.FullName,
+                        "Honker.QueueHelper",
+                        "bin",
+                        "Release",
+                        "net10.0",
+                        "Honker.QueueHelper.dll");
+                    if (File.Exists(helper))
+                    {
+                        return helper;
+                    }
+                    throw new InvalidOperationException($"could not locate built .NET queue helper: {helper}");
                 }
                 dir = dir.Parent;
             }
         }
-        throw new InvalidOperationException("could not locate Honker.Tests.csproj");
+        throw new InvalidOperationException("could not locate Honker.Tests.csproj for .NET queue helper");
     }
 
-    private static void WaitReady(string path)
+    private static void WaitReady(string path, Process? process = null)
     {
         var watch = Stopwatch.StartNew();
         while (watch.Elapsed < TimeSpan.FromSeconds(15))
@@ -372,6 +294,10 @@ public sealed class BindingTests
             if (File.Exists(path))
             {
                 return;
+            }
+            if (process is { HasExited: true })
+            {
+                Assert.Fail($"helper exited before ready file appeared: {path}\nstdout:\n{process.StandardOutput.ReadToEnd()}\nstderr:\n{process.StandardError.ReadToEnd()}");
             }
             Thread.Sleep(25);
         }
@@ -1187,8 +1113,8 @@ public sealed class BindingTests
         {
             var candidates = new[]
             {
-                Path.Combine(root, "target", "debug", ExtensionFileName()),
                 Path.Combine(root, "target", "release", ExtensionFileName()),
+                Path.Combine(root, "target", "debug", ExtensionFileName()),
             };
 
             var found = candidates.FirstOrDefault(File.Exists);
