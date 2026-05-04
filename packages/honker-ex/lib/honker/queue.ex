@@ -106,6 +106,43 @@ defmodule Honker.Queue do
     end
   end
 
+  @doc """
+  Delete a pending or processing job by id. Returns `{:ok, true}` iff
+  a row was removed. Idempotent on missing.
+
+  IMPORTANT: cancel does NOT interrupt a worker currently running the
+  handler. It invalidates the worker's claim — its next ack/heartbeat
+  returns false. If you need the handler to actually halt, build that
+  signal in your app.
+  """
+  def cancel(%Honker.Database{conn: conn}, job_id) do
+    case Honker.query_first(conn, "SELECT honker_cancel(?1)", [job_id]) do
+      {:ok, [n]} ->
+        if n > 0, do: Honker.mark_updated(conn)
+        {:ok, n > 0}
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Read a single job row by id. Returns `{:ok, map}` with the row
+  fields, or `{:ok, nil}` on miss.
+  """
+  def get_job(%Honker.Database{conn: conn}, job_id) do
+    case Honker.query_first(conn, "SELECT honker_get_job(?1)", [job_id]) do
+      {:ok, [raw]} when is_binary(raw) and byte_size(raw) > 0 ->
+        {:ok, Jason.decode!(raw)}
+
+      {:ok, _} ->
+        {:ok, nil}
+
+      other ->
+        other
+    end
+  end
+
   defp row_to_job(row) do
     %Job{
       id: row["id"],

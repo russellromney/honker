@@ -281,6 +281,28 @@ module Honker
         [job_id, worker_id, extend_s],
       )[0] == 1
     end
+
+    # Delete a pending or processing job by id. Returns true iff a row
+    # was removed. Idempotent on missing.
+    #
+    # IMPORTANT: cancel does NOT interrupt a worker currently running
+    # the handler. It invalidates the worker's claim — its next
+    # ack/heartbeat returns false. If you need the handler to actually
+    # halt, build that signal in your app.
+    def cancel(job_id)
+      n = @db.db.get_first_row("SELECT honker_cancel(?)", [job_id])[0]
+      @db.mark_updated if n.positive?
+      n.positive?
+    end
+
+    # Read a single job row by id. Returns a Hash with the row fields,
+    # or nil if the job has been ack'd, dead'd, or never existed.
+    def get_job(job_id)
+      raw = @db.db.get_first_row("SELECT honker_get_job(?)", [job_id])[0]
+      return nil if raw.nil? || raw.empty?
+
+      JSON.parse(raw)
+    end
   end
 
   # A claimed unit of work. `payload` is the decoded JSON value (Hash,

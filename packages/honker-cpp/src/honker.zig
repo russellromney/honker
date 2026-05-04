@@ -481,6 +481,108 @@ export fn honker_cpp_scheduler_soonest(
     return step_scalar_int64(stmt);
 }
 
+// ---- Phase Mantle: scheduler lifecycle + queue cancel/get_job ----
+
+export fn honker_cpp_scheduler_pause(
+    db: ?*c.sqlite3,
+    name_z: [*:0]const u8,
+) callconv(.c) i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT honker_scheduler_pause(?1)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
+    defer _ = c.sqlite3_finalize(stmt);
+    bind_text(stmt, 1, name_z);
+    return step_scalar_int64(stmt);
+}
+
+export fn honker_cpp_scheduler_resume(
+    db: ?*c.sqlite3,
+    name_z: [*:0]const u8,
+) callconv(.c) i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT honker_scheduler_resume(?1)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
+    defer _ = c.sqlite3_finalize(stmt);
+    bind_text(stmt, 1, name_z);
+    return step_scalar_int64(stmt);
+}
+
+export fn honker_cpp_scheduler_list(db: ?*c.sqlite3) callconv(.c) ?[*:0]u8 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT honker_scheduler_list()";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
+    defer _ = c.sqlite3_finalize(stmt);
+    return step_scalar_text_duped(stmt);
+}
+
+/// Update one or more fields of a registered schedule. Pass null for
+/// any of cron_z / payload_z when not changing that field. priority
+/// is changed iff `touch_priority` is non-zero. expires is changed iff
+/// `touch_expires` is non-zero (use a negative `expires_sec` for NULL).
+/// Returns 1 iff a row was updated.
+export fn honker_cpp_scheduler_update(
+    db: ?*c.sqlite3,
+    name_z: [*:0]const u8,
+    cron_z: ?[*:0]const u8,
+    payload_z: ?[*:0]const u8,
+    priority: i64,
+    touch_priority: i64,
+    expires_sec: i64,
+    touch_expires: i64,
+) callconv(.c) i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
+    defer _ = c.sqlite3_finalize(stmt);
+    bind_text(stmt, 1, name_z);
+    if (cron_z) |z| {
+        bind_text(stmt, 2, z);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 2);
+    }
+    if (payload_z) |z| {
+        bind_text(stmt, 3, z);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 3);
+    }
+    if (touch_priority != 0) {
+        _ = c.sqlite3_bind_int64(stmt, 4, priority);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 4);
+    }
+    if (touch_expires != 0 and expires_sec >= 0) {
+        _ = c.sqlite3_bind_int64(stmt, 5, expires_sec);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 5);
+    }
+    _ = c.sqlite3_bind_int64(stmt, 6, touch_expires);
+    return step_scalar_int64(stmt);
+}
+
+export fn honker_cpp_cancel(
+    db: ?*c.sqlite3,
+    job_id: i64,
+) callconv(.c) i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT honker_cancel(?1)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, job_id);
+    return step_scalar_int64(stmt);
+}
+
+export fn honker_cpp_get_job(
+    db: ?*c.sqlite3,
+    job_id: i64,
+) callconv(.c) ?[*:0]u8 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    const sql = "SELECT honker_get_job(?1)";
+    if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return null;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, job_id);
+    return step_scalar_text_duped(stmt);
+}
+
 // ---------------------------------------------------------------------
 // Lock
 // ---------------------------------------------------------------------

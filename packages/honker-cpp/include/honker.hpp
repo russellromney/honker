@@ -74,6 +74,17 @@ extern "C" {
     char*   honker_cpp_scheduler_tick(sqlite3* db, int64_t now_unix);
     int64_t honker_cpp_scheduler_soonest(sqlite3* db);
 
+    // Phase Mantle
+    int64_t honker_cpp_scheduler_pause(sqlite3* db, const char* name);
+    int64_t honker_cpp_scheduler_resume(sqlite3* db, const char* name);
+    char*   honker_cpp_scheduler_list(sqlite3* db);
+    int64_t honker_cpp_scheduler_update(
+        sqlite3* db, const char* name, const char* cron, const char* payload_json,
+        int64_t priority, int64_t touch_priority,
+        int64_t expires_sec, int64_t touch_expires);
+    int64_t honker_cpp_cancel(sqlite3* db, int64_t job_id);
+    char*   honker_cpp_get_job(sqlite3* db, int64_t job_id);
+
     int64_t honker_cpp_lock_acquire(
         sqlite3* db, const char* name, const char* owner, int64_t ttl_sec);
     int64_t honker_cpp_lock_release(
@@ -389,6 +400,30 @@ public:
         return n;
     }
 
+    /// Delete a pending or processing job by id. Returns true iff a row
+    /// was removed. Idempotent on missing.
+    ///
+    /// IMPORTANT: cancel does NOT interrupt a worker currently running
+    /// the handler. It invalidates the worker's claim — its next
+    /// ack/heartbeat returns false. If you need the handler to actually
+    /// halt, build that signal in your app.
+    bool cancel(int64_t job_id) {
+        const auto rc = honker_cpp_cancel(db_, job_id);
+        if (rc < 0) throw Error{"cancel failed: SQL error"};
+        return rc > 0;
+    }
+
+    /// Read a single job row by id. Returns the JSON-string blob or
+    /// an empty string on miss. Caller parses with their preferred
+    /// JSON library — keeping this header dependency-free.
+    std::string get_job_json(int64_t job_id) {
+        char* raw = honker_cpp_get_job(db_, job_id);
+        if (!raw) return {};
+        std::string out{raw};
+        std::free(raw);
+        return out;
+    }
+
     Queue(sqlite3* db, std::string name, int64_t vis, int64_t max)
         : db_(db), name_(std::move(name)),
           visibility_timeout_s_(vis), max_attempts_(max) {}
@@ -676,6 +711,75 @@ public:
 
     int64_t soonest() {
         return honker_cpp_scheduler_soonest(db_->raw());
+    }
+
+    // ---- Phase Mantle: lifecycle methods ----
+
+    /// Pause a registered schedule. Returns true iff a row was paused.
+    bool pause(std::string_view name) {
+        const std::string n{name};
+        const auto rc = honker_cpp_scheduler_pause(db_->raw(), n.c_str());
+        if (rc < 0) throw Error{"scheduler_pause failed: SQL error"};
+        if (rc > 0) db_->mark_updated();
+        return rc > 0;
+    }
+
+    /// Resume a paused schedule. Returns true iff a row was resumed.
+    bool resume(std::string_view name) {
+        const std::string n{name};
+        const auto rc = honker_cpp_scheduler_resume(db_->raw(), n.c_str());
+        if (rc < 0) throw Error{"scheduler_resume failed: SQL error"};
+        if (rc > 0) db_->mark_updated();
+        return rc > 0;
+    }
+
+    /// Return every registered schedule as a JSON-string blob. Caller
+    /// parses with their preferred JSON library — keeping this
+    /// dependency-free in the header.
+    std::string list_json() {
+        char* raw = honker_cpp_scheduler_list(db_->raw());
+        if (!raw) return "[]";
+        std::string out{raw};
+        std::free(raw);
+        return out;
+    }
+
+    /// Mutate one or more fields of an existing schedule. Pass nullopt
+    /// for any field you want left alone; pass a value (or nullopt
+    /// inside the inner option for expires) to clear vs set. Returns
+    /// true iff a row was updated.
+    ///
+    /// IMPORTANT: cancel does NOT interrupt a worker mid-handler — see
+    /// Queue::cancel.
+    bool update(
+        std::string_view name,
+        std::optional<std::string_view> cron = std::nullopt,
+        std::optional<std::string_view> payload_json = std::nullopt,
+        std::optional<int64_t> priority = std::nullopt,
+        std::optional<std::optional<int64_t>> expires_sec = std::nullopt
+    ) {
+        // Empty update is a no-op.
+        if (!cron && !payload_json && !priority && !expires_sec) return false;
+
+        const std::string n{name};
+        std::string c, p;
+        const char* cron_z = nullptr;
+        const char* payload_z = nullptr;
+        if (cron) { c = std::string{*cron}; cron_z = c.c_str(); }
+        if (payload_json) { p = std::string{*payload_json}; payload_z = p.c_str(); }
+        const int64_t touch_priority = priority.has_value() ? 1 : 0;
+        const int64_t touch_expires = expires_sec.has_value() ? 1 : 0;
+        const int64_t expires_arg =
+            (expires_sec.has_value() && expires_sec->has_value()) ? **expires_sec : -1;
+
+        const auto rc = honker_cpp_scheduler_update(
+            db_->raw(), n.c_str(), cron_z, payload_z,
+            priority.value_or(0), touch_priority,
+            expires_arg, touch_expires
+        );
+        if (rc < 0) throw Error{"scheduler_update failed: SQL error"};
+        if (rc > 0) db_->mark_updated();
+        return rc > 0;
     }
 
     void run(std::atomic<bool>& stop_token, std::string_view owner) {

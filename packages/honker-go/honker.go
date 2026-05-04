@@ -519,6 +519,56 @@ func (q *Queue) AckBatch(ids []int64, workerID string) (int64, error) {
 	return n, err
 }
 
+// JobRow is one job row read by Queue.GetJob. Pure data, no claim
+// semantics.
+type JobRow struct {
+	ID              int64   `json:"id"`
+	Queue           string  `json:"queue"`
+	Payload         string  `json:"payload"`
+	State           string  `json:"state"`
+	Priority        int64   `json:"priority"`
+	RunAt           int64   `json:"run_at"`
+	WorkerID        *string `json:"worker_id"`
+	ClaimExpiresAt  *int64  `json:"claim_expires_at"`
+	Attempts        int64   `json:"attempts"`
+	MaxAttempts     int64   `json:"max_attempts"`
+	CreatedAt       int64   `json:"created_at"`
+	ExpiresAt       *int64  `json:"expires_at"`
+}
+
+// Cancel removes a pending or processing row by id. Returns true iff
+// a row was removed. Idempotent on missing.
+//
+// IMPORTANT: cancel does NOT interrupt a worker currently running the
+// handler. It invalidates the worker's claim — its next ack/heartbeat
+// returns false. If you need the handler to actually halt, build that
+// signal in your app.
+func (q *Queue) Cancel(jobID int64) (bool, error) {
+	var n int64
+	err := q.db.db.QueryRow(
+		"SELECT honker_cancel(?)", jobID,
+	).Scan(&n)
+	return n > 0, err
+}
+
+// GetJob reads a single job row by id. Returns (*JobRow, nil) on hit
+// or (nil, nil) on miss (ack'd, dead'd, or never existed).
+func (q *Queue) GetJob(jobID int64) (*JobRow, error) {
+	var raw string
+	err := q.db.db.QueryRow("SELECT honker_get_job(?)", jobID).Scan(&raw)
+	if err != nil {
+		return nil, err
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	var row JobRow
+	if err := json.Unmarshal([]byte(raw), &row); err != nil {
+		return nil, fmt.Errorf("unmarshal job row: %w", err)
+	}
+	return &row, nil
+}
+
 // SweepExpired moves expired pending rows to dead. Returns count moved.
 func (q *Queue) SweepExpired() (int64, error) {
 	var n int64
@@ -870,6 +920,111 @@ func (s *Scheduler) Soonest() (int64, error) {
 		"SELECT honker_scheduler_soonest()",
 	).Scan(&ts)
 	return ts, err
+}
+
+// ---- Phase Mantle: lifecycle methods ----
+
+// Pause a registered schedule. Returns true if a row was paused.
+// Idempotent on already-paused (returns false).
+func (s *Scheduler) Pause(name string) (bool, error) {
+	var n int64
+	err := s.db.db.QueryRow(
+		"SELECT honker_scheduler_pause(?)", name,
+	).Scan(&n)
+	return n > 0, err
+}
+
+// Resume a paused schedule. Returns true if a row was resumed.
+func (s *Scheduler) Resume(name string) (bool, error) {
+	var n int64
+	err := s.db.db.QueryRow(
+		"SELECT honker_scheduler_resume(?)", name,
+	).Scan(&n)
+	return n > 0, err
+}
+
+// ScheduleRow is one entry returned by Scheduler.List().
+type ScheduleRow struct {
+	Name        string `json:"name"`
+	Queue       string `json:"queue"`
+	CronExpr    string `json:"cron_expr"`
+	Payload     string `json:"payload"`
+	Priority    int64  `json:"priority"`
+	ExpiresS    *int64 `json:"expires_s"`
+	NextFireAt  int64  `json:"next_fire_at"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// List returns every registered schedule with current state.
+func (s *Scheduler) List() ([]ScheduleRow, error) {
+	var rowsJSON string
+	err := s.db.db.QueryRow("SELECT honker_scheduler_list()").Scan(&rowsJSON)
+	if err != nil {
+		return nil, err
+	}
+	if rowsJSON == "" {
+		return nil, nil
+	}
+	var rows []ScheduleRow
+	if err := json.Unmarshal([]byte(rowsJSON), &rows); err != nil {
+		return nil, fmt.Errorf("unmarshal schedules: %w", err)
+	}
+	return rows, nil
+}
+
+// ScheduleUpdate carries optional field changes for Scheduler.Update.
+// Pointer fields distinguish "unset" (nil) from "set to zero/null"
+// (non-nil pointer with zero value).
+type ScheduleUpdate struct {
+	CronExpr *string
+	Payload  *any
+	Priority *int64
+	// ExpiresS uses a double pointer so callers can express:
+	//   nil           -> leave alone
+	//   &(*int64)(nil) -> clear (set to NULL)
+	//   &(&v)         -> set to v
+	// In practice most callers use the helpers below.
+	ExpiresS *(*int64)
+}
+
+// Update mutates the named schedule's fields in place. Pass only the
+// fields you want to change. Cron change recomputes next_fire_at from
+// now. Returns true iff a row was updated.
+func (s *Scheduler) Update(name string, opts ScheduleUpdate) (bool, error) {
+	if opts.CronExpr == nil && opts.Payload == nil && opts.Priority == nil && opts.ExpiresS == nil {
+		// Empty update is a no-op (matches Python/Node binding).
+		return false, nil
+	}
+	var cronArg interface{}
+	if opts.CronExpr != nil {
+		cronArg = *opts.CronExpr
+	}
+	var payloadArg interface{}
+	if opts.Payload != nil {
+		b, err := json.Marshal(*opts.Payload)
+		if err != nil {
+			return false, fmt.Errorf("marshal payload: %w", err)
+		}
+		payloadArg = string(b)
+	}
+	var priorityArg interface{}
+	if opts.Priority != nil {
+		priorityArg = *opts.Priority
+	}
+	touchExpires := int64(0)
+	var expiresArg interface{}
+	if opts.ExpiresS != nil {
+		touchExpires = 1
+		if *opts.ExpiresS != nil {
+			expiresArg = **opts.ExpiresS
+		}
+	}
+	var n int64
+	err := s.db.db.QueryRow(
+		"SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)",
+		name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires,
+	).Scan(&n)
+	return n > 0, err
 }
 
 // Run is a blocking leader-elected loop. Only the lock holder fires
