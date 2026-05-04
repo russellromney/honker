@@ -2745,6 +2745,7 @@ while True:
     /// have p90 ≈ 250 ms (mean half of 500) and fail this assertion.
     #[test]
     #[cfg(feature = "kernel-watcher")]
+    #[cfg_attr(target_os = "macos", ignore = "kqueue under CI load may deliver zero wakes")]
     fn kernel_watcher_wake_latency_is_event_driven() {
         let tmp = std::env::temp_dir().join(format!(
             "honker-kw-lat-{}-{}",
