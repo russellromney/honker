@@ -355,6 +355,11 @@ pub unsafe extern "C" fn honker_watcher_close(handle: *mut HonkerWatcherHandle) 
         return;
     }
     let handle = unsafe { Box::from_raw(handle) };
+    // Only unsubscribe this handle's sub_id. Do NOT call shared.close()
+    // — close() is destructive (clears every subscriber's sender) and
+    // we now share SharedUpdateWatcher across opens for the same path.
+    // The Arc refcount handles real teardown: when the last Arc to a
+    // shared watcher is dropped, its Drop impl signals the background
+    // thread to stop.
     handle.shared.unsubscribe(handle.sub_id);
-    let _ = handle.shared.close();
 }
