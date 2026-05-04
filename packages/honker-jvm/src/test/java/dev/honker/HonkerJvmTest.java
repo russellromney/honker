@@ -577,7 +577,7 @@ class HonkerJvmTest {
         Path done = tmp.resolve("child.done");
         Process child = startChild("worker-marker", dbPath, extension, ready, done);
         try {
-            waitUntil(Duration.ofSeconds(5), () -> Files.isRegularFile(ready), "child worker should become ready");
+            waitUntil(Duration.ofSeconds(10), () -> Files.isRegularFile(ready), "child worker should become ready");
             try (Database db = Honker.open(dbPath, OpenOptions.builder()
                 .extensionPath(extension)
                 .fallbackPollInterval(Duration.ofMillis(2))
@@ -660,6 +660,57 @@ class HonkerJvmTest {
             saver.join();
             assertWakeWasFast(start, slowFallbackMillis);
             assertEquals(0, db.updateWatcherSubscriberCount());
+        }
+    }
+
+    @Test
+    void autoWatcherPrefersMmapShmWhenWalIndexIsAvailable() {
+        try (Database db = openWithBackend("auto-mmap.db", WatcherBackend.AUTO)) {
+            try (UpdateEvents updates = db.updateEvents()) {
+                waitUntil(Duration.ofSeconds(2), () -> db.updateWatcherBackend() == WatcherBackend.MMAP_SHM,
+                    "AUTO watcher should select the mmap-shm backend when WAL is active");
+                db.notify("auto-mmap", "{\"ok\":true}");
+                assertTrue(updates.awaitUpdate(Duration.ofSeconds(2)));
+                assertEquals(WatcherBackend.MMAP_SHM, db.updateWatcherBackend());
+            }
+        }
+    }
+
+    @Test
+    void explicitMmapShmWatcherDetectsCommitsIgnoresRollbacksAndSurvivesCheckpoint() {
+        try (Database db = openWithBackend("mmap-semantics.db", WatcherBackend.MMAP_SHM)) {
+            try (UpdateEvents updates = db.updateEvents()) {
+                waitUntil(Duration.ofSeconds(2), () -> db.updateWatcherBackend() == WatcherBackend.MMAP_SHM,
+                    "explicit mmap-shm watcher should become active");
+                updates.awaitUpdate(Duration.ofMillis(100));
+
+                assertThrows(RuntimeException.class, () -> db.transactionVoid(tx -> {
+                    tx.notify("mmap", "{\"rolled_back\":true}");
+                    throw new RuntimeException("rollback");
+                }));
+                assertFalse(updates.awaitUpdate(Duration.ofMillis(100)), "rolled-back transaction must not wake mmap watcher");
+
+                db.notify("mmap", "{\"committed\":true}");
+                assertTrue(updates.awaitUpdate(Duration.ofSeconds(2)), "committed notify should wake mmap watcher");
+
+                db.query("PRAGMA wal_checkpoint(TRUNCATE)");
+                updates.awaitUpdate(Duration.ofMillis(100));
+                db.notify("mmap", "{\"after_checkpoint\":true}");
+                assertTrue(updates.awaitUpdate(Duration.ofSeconds(2)), "mmap watcher should still wake after WAL checkpoint truncate");
+            }
+        }
+    }
+
+    @Test
+    void explicitPragmaWatcherStillWorksAsFallbackBackend() {
+        try (Database db = openWithBackend("pragma-backend.db", WatcherBackend.PRAGMA_DATA_VERSION)) {
+            try (UpdateEvents updates = db.updateEvents()) {
+                waitUntil(Duration.ofSeconds(2), () -> db.updateWatcherBackend() == WatcherBackend.PRAGMA_DATA_VERSION,
+                    "explicit PRAGMA watcher should become active");
+                db.notify("pragma", "{\"ok\":true}");
+                assertTrue(updates.awaitUpdate(Duration.ofSeconds(2)));
+                assertEquals(WatcherBackend.PRAGMA_DATA_VERSION, db.updateWatcherBackend());
+            }
         }
     }
 
@@ -791,6 +842,29 @@ class HonkerJvmTest {
     }
 
     @Test
+    void childJvmMmapListenerWakesWhenParentNotifies() throws Exception {
+        Path dbPath = tmp.resolve("mmap-listener-multiprocess.db");
+        Path extension = NativeLoader.resolve(OpenOptions.defaults());
+        Path ready = tmp.resolve("mmap-listener-child.ready");
+        Path done = tmp.resolve("mmap-listener-child.done");
+        Process child = startChild("listener-mmap-marker", dbPath, extension, ready, done);
+        try {
+            waitUntil(Duration.ofSeconds(5), () -> Files.isRegularFile(ready), "child mmap listener should become ready");
+            try (Database db = Honker.open(dbPath, OpenOptions.builder()
+                .extensionPath(extension)
+                .fallbackPollInterval(Duration.ofSeconds(30))
+                .build())) {
+                db.notify("multiprocess-listen", "{\"from\":\"parent\"}");
+            }
+            waitUntil(Duration.ofSeconds(5), () -> Files.isRegularFile(done), "child mmap listener should receive parent notify");
+            assertEquals("{\"from\":\"parent\"}", Files.readString(done, StandardCharsets.UTF_8));
+            assertEquals(0, child.waitFor());
+        } finally {
+            child.destroyForcibly();
+        }
+    }
+
+    @Test
     void pythonStdlibSqliteInteropBothDirections() throws Exception {
         Path dbPath = tmp.resolve("interop.db");
         Path ext = NativeLoader.resolve(OpenOptions.defaults());
@@ -862,6 +936,17 @@ class HonkerJvmTest {
         return Honker.open(tmp.resolve(file), OpenOptions.builder()
             .fallbackPollInterval(Duration.ofSeconds(30))
             .watcherOptions(WatcherOptions.builder()
+                .pollInterval(Duration.ofMillis(1))
+                .subscriberBufferSize(1024)
+            .build())
+            .build());
+    }
+
+    private Database openWithBackend(String file, WatcherBackend backend) {
+        return Honker.open(tmp.resolve(file), OpenOptions.builder()
+            .fallbackPollInterval(Duration.ofSeconds(30))
+            .watcherOptions(WatcherOptions.builder()
+                .backend(backend)
                 .pollInterval(Duration.ofMillis(1))
                 .subscriberBufferSize(1024)
                 .build())

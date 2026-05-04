@@ -12,6 +12,12 @@ packaged-install proof, and what CI actually proves.
 
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
 
+Some bindings expose an experimental mmap-of-`<db>-shm` watcher in WAL
+mode. It reads SQLite's wal-index `iChange` counter directly; AUTO
+backend modes can fall back to `PRAGMA data_version` where unavailable.
+The stable semantics stay the same: wake on committed updates, ignore
+rolled-back work, and re-read SQLite state after every wake.
+
 > Experimental. API may change.
 
 SQLite is increasingly the database for shipped projects. Those inevitably require pubsub and a task queue. The usual answer is "add Redis + Celery." That works, but it introduces a second datastore with its own backup story, a dual-write problem between your business table and the queue, and the operational overhead of running a broker.

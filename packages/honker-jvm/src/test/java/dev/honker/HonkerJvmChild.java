@@ -23,7 +23,9 @@ public final class HonkerJvmChild {
         if ("worker-marker".equals(mode)) {
             workerMarker(dbPath, extensionPath, readyPath, donePath);
         } else if ("listener-marker".equals(mode)) {
-            listenerMarker(dbPath, extensionPath, readyPath, donePath);
+            listenerMarker(dbPath, extensionPath, readyPath, donePath, WatcherBackend.PRAGMA_DATA_VERSION);
+        } else if ("listener-mmap-marker".equals(mode)) {
+            listenerMarker(dbPath, extensionPath, readyPath, donePath, WatcherBackend.MMAP_SHM);
         } else if ("stream-marker".equals(mode)) {
             streamMarker(dbPath, extensionPath, readyPath, donePath);
         } else {
@@ -53,10 +55,11 @@ public final class HonkerJvmChild {
         }
     }
 
-    private static void listenerMarker(Path dbPath, Path extensionPath, Path readyPath, Path donePath) throws Exception {
+    private static void listenerMarker(Path dbPath, Path extensionPath, Path readyPath, Path donePath, WatcherBackend backend) throws Exception {
         try (Database db = Honker.open(dbPath, OpenOptions.builder()
             .extensionPath(extensionPath)
             .fallbackPollInterval(Duration.ofSeconds(30))
+            .watcherOptions(WatcherOptions.builder().backend(backend).build())
             .build());
              Listener listener = db.listen("multiprocess-listen")) {
             Files.writeString(readyPath, "ready", StandardCharsets.UTF_8);

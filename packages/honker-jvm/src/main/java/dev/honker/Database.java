@@ -254,6 +254,14 @@ public final class Database implements AutoCloseable {
         return watcher == null ? 0 : watcher.subscriberCount();
     }
 
+    WatcherBackend updateWatcherBackend() {
+        SharedUpdateWatcher watcher;
+        synchronized (lock) {
+            watcher = updateWatcher;
+        }
+        return watcher == null ? null : watcher.activeBackend();
+    }
+
     void ensureOpen() {
         if (closed.get()) {
             throw new HonkerClosedException("Database is closed");

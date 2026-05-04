@@ -3,8 +3,12 @@ package dev.honker;
 import org.sqlite.SQLiteConfig;
 
 import java.io.IOException;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -24,6 +28,10 @@ import java.util.concurrent.atomic.AtomicReference;
 final class SharedUpdateWatcher implements AutoCloseable {
     private static final Boolean TICK = Boolean.TRUE;
     private static final Boolean CLOSED = Boolean.FALSE;
+    private static final int WAL_INDEX_VERSION = 3_007_000;
+    private static final int WAL_INDEX_HEADER_SIZE = 48;
+    private static final int WAL_INDEX_I_CHANGE_OFFSET = 8;
+    private static final int WAL_INDEX_MIN_SIZE = WAL_INDEX_HEADER_SIZE * 2;
 
     private final Path path;
     private final WatcherOptions options;
@@ -31,14 +39,12 @@ final class SharedUpdateWatcher implements AutoCloseable {
     private final AtomicLong nextSubscriberId = new AtomicLong();
     private final Map<Long, Subscriber> subscribers = new ConcurrentHashMap<>();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final AtomicReference<WatcherBackend> activeBackend = new AtomicReference<>();
     private final Thread thread;
 
     SharedUpdateWatcher(Path path, WatcherOptions options) {
         this.path = path.toAbsolutePath().normalize();
         this.options = Objects.requireNonNull(options, "options");
-        if (options.backend() != WatcherBackend.PRAGMA_DATA_VERSION) {
-            throw new HonkerInvalidOptionException("unsupported watcher backend: " + options.backend());
-        }
         this.thread = new Thread(this::run, "honker-update-poll");
         this.thread.setDaemon(true);
         this.thread.start();
@@ -58,6 +64,10 @@ final class SharedUpdateWatcher implements AutoCloseable {
 
     boolean failed() {
         return failure.get() != null;
+    }
+
+    WatcherBackend activeBackend() {
+        return activeBackend.get();
     }
 
     void throwIfFailed() {
@@ -101,26 +111,30 @@ final class SharedUpdateWatcher implements AutoCloseable {
     private void run() {
         Object initialIdentity = fileIdentity();
         long nextIdentityCheck = System.nanoTime() + options.identityCheckInterval().toNanos();
-        Connection conn = null;
+        VersionSource source = null;
         long version = 0L;
         try {
             while (!closed.get()) {
                 try {
-                    if (conn == null) {
-                        conn = openWatcherConnection();
-                        version = dataVersion(conn);
+                    if (source == null) {
+                        source = openVersionSource();
+                        activeBackend.set(source.backend());
+                        version = source.version();
                         wakeSubscribers();
                     } else {
-                        long current = dataVersion(conn);
+                        long current = source.version();
                         if (current != version) {
                             version = current;
                             wakeSubscribers();
                         }
                     }
-                } catch (SQLException e) {
-                    closeQuietly(conn);
-                    conn = null;
+                } catch (IOException | SQLException | RuntimeException e) {
+                    closeQuietly(source);
+                    source = null;
                     wakeSubscribers();
+                    if (options.backend() == WatcherBackend.MMAP_SHM && e instanceof HonkerException) {
+                        throw e;
+                    }
                 }
 
                 long now = System.nanoTime();
@@ -140,14 +154,28 @@ final class SharedUpdateWatcher implements AutoCloseable {
                 wakeSubscribers();
             }
         } finally {
-            closeQuietly(conn);
+            closeQuietly(source);
             for (Subscriber subscriber : subscribers.values()) {
                 subscriber.close();
             }
         }
     }
 
-    private Connection openWatcherConnection() throws SQLException {
+    private VersionSource openVersionSource() throws SQLException, IOException {
+        if (options.backend() == WatcherBackend.PRAGMA_DATA_VERSION) {
+            return new PragmaVersionSource(path);
+        }
+        if (options.backend() == WatcherBackend.MMAP_SHM) {
+            return new ShmVersionSource(path);
+        }
+        try {
+            return new ShmVersionSource(path);
+        } catch (IOException | RuntimeException e) {
+            return new PragmaVersionSource(path);
+        }
+    }
+
+    private static Connection openWatcherConnection(Path path) throws SQLException {
         SQLiteConfig config = new SQLiteConfig();
         config.setReadOnly(true);
         return DriverManager.getConnection("jdbc:sqlite:" + path, config.toProperties());
@@ -187,13 +215,114 @@ final class SharedUpdateWatcher implements AutoCloseable {
         }
     }
 
-    private static void closeQuietly(Connection conn) {
-        if (conn == null) {
+    private static void closeQuietly(VersionSource source) {
+        if (source == null) {
             return;
         }
         try {
+            source.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private interface VersionSource extends AutoCloseable {
+        long version() throws SQLException, IOException;
+
+        WatcherBackend backend();
+
+        @Override
+        void close() throws Exception;
+    }
+
+    private static final class PragmaVersionSource implements VersionSource {
+        private final Connection conn;
+
+        PragmaVersionSource(Path path) throws SQLException {
+            this.conn = openWatcherConnection(path);
+        }
+
+        @Override
+        public long version() throws SQLException {
+            return dataVersion(conn);
+        }
+
+        @Override
+        public WatcherBackend backend() {
+            return WatcherBackend.PRAGMA_DATA_VERSION;
+        }
+
+        @Override
+        public void close() throws SQLException {
             conn.close();
-        } catch (SQLException ignored) {
+        }
+    }
+
+    private static final class ShmVersionSource implements VersionSource {
+        private final FileChannel channel;
+        private final MappedByteBuffer mmap;
+
+        ShmVersionSource(Path dbPath) throws IOException {
+            this.channel = FileChannel.open(shmPath(dbPath), StandardOpenOption.READ);
+            if (channel.size() < WAL_INDEX_MIN_SIZE) {
+                channel.close();
+                throw new HonkerException("SQLite WAL index is too small for mmap watcher: " + shmPath(dbPath));
+            }
+            this.mmap = channel.map(FileChannel.MapMode.READ_ONLY, 0, WAL_INDEX_MIN_SIZE);
+            this.mmap.order(ByteOrder.LITTLE_ENDIAN);
+            int version = readInt(0);
+            int version2 = readInt(WAL_INDEX_HEADER_SIZE);
+            if (version != WAL_INDEX_VERSION || version2 != WAL_INDEX_VERSION) {
+                try {
+                    channel.close();
+                } catch (IOException ignored) {
+                }
+                throw new HonkerException("unsupported SQLite WAL index version for mmap watcher: " + version + "/" + version2);
+            }
+        }
+
+        @Override
+        public long version() {
+            return Integer.toUnsignedLong(readStableInt(WAL_INDEX_I_CHANGE_OFFSET));
+        }
+
+        @Override
+        public WatcherBackend backend() {
+            return WatcherBackend.MMAP_SHM;
+        }
+
+        @Override
+        public void close() throws IOException {
+            channel.close();
+        }
+
+        private int readStableInt(int offset) {
+            for (int i = 0; i < 10_000; i++) {
+                int first = readInt(offset);
+                VarHandleFence.acquireFence();
+                int second = readInt(WAL_INDEX_HEADER_SIZE + offset);
+                if (first == second) {
+                    return first;
+                }
+                Thread.onSpinWait();
+            }
+            return readInt(offset);
+        }
+
+        private int readInt(int offset) {
+            return mmap.getInt(offset);
+        }
+
+        private static Path shmPath(Path dbPath) {
+            return Path.of(dbPath.toString() + "-shm");
+        }
+    }
+
+    private static final class VarHandleFence {
+        private VarHandleFence() {
+        }
+
+        static void acquireFence() {
+            java.lang.invoke.VarHandle.acquireFence();
         }
     }
 

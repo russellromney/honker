@@ -12,8 +12,10 @@ Current shape:
 - blocking queue, stream, notify/listen, scheduler, lock, outbox, and
   rate-limit APIs
 - closeable queue worker, listener, stream subscriber, scheduler, outbox,
-  and task-worker loops backed by one shared `PRAGMA data_version`
-  watcher per `Database`, plus deadline wakes
+  and task-worker loops backed by one shared watcher per `Database`,
+  plus deadline wakes
+- watcher backends: `PRAGMA_DATA_VERSION` (default), `AUTO`, and
+  experimental `MMAP_SHM`
 - explicit task registry helpers
 - Python-parity wake tests: subscribe-before-snapshot races,
   cross-process listener/worker/stream wake, delayed deadlines, concurrent
@@ -69,6 +71,14 @@ try (Database db = Honker.open("app.db", OpenOptions.builder()
     // ...
 }
 ```
+
+`PRAGMA_DATA_VERSION` is the stable default. `AUTO` prefers the
+experimental mmap-of-`<db>-shm` WAL-index backend
+when SQLite is in WAL mode and the wal-index version is supported, then
+falls back to `PRAGMA data_version`. `MMAP_SHM` can be selected
+explicitly for tests/benchmarks. `SQLITE_FCNTL_DATA_VERSION` is
+intentionally not exposed as a backend; Honker's proof scripts show it
+is not a correct idle cross-connection watcher.
 
 ## Local test
 

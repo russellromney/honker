@@ -1,5 +1,7 @@
 package dev.honker;
 
 public enum WatcherBackend {
-    PRAGMA_DATA_VERSION
+    AUTO,
+    PRAGMA_DATA_VERSION,
+    MMAP_SHM
 }
