@@ -361,5 +361,34 @@ pub unsafe extern "C" fn honker_watcher_close(handle: *mut HonkerWatcherHandle) 
     // The Arc refcount handles real teardown: when the last Arc to a
     // shared watcher is dropped, its Drop impl signals the background
     // thread to stop.
+    //
+    // CALLER CONTRACT: must NOT have any thread inside `honker_watcher_
+    // _wait(handle, ...)` when this is called. Box::from_raw drops the
+    // Receiver inside the handle on function return; a concurrent
+    // recv_timeout would use-after-free. Bindings should call
+    // `honker_watcher_signal_close` first to wake any waiting thread,
+    // join it, then call this to free.
+    handle.shared.unsubscribe(handle.sub_id);
+}
+
+/// Signal a watcher handle's blocked `_wait` to return without freeing
+/// the handle. Drops the subscriber's sender on the shared watcher,
+/// causing any in-flight `recv_timeout` on this handle's receiver to
+/// return `RecvTimeoutError::Disconnected` (`-1` from `_wait`). The
+/// handle remains valid for one final `honker_watcher_close` call.
+///
+/// Use this from bindings that hold a long-lived dispatcher thread
+/// blocked in `_wait`: call `signal_close` to wake it, join the
+/// thread, then `close` to free the handle.
+///
+/// # Safety
+/// `handle` must be a non-null pointer returned by `honker_watcher_open`
+/// and not yet passed to `honker_watcher_close`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn honker_watcher_signal_close(handle: *mut HonkerWatcherHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let handle = unsafe { &*handle };
     handle.shared.unsubscribe(handle.sub_id);
 }
