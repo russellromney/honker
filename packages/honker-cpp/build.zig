@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
     const test_files = .{
         "test/test_basic.cpp",
         "test/test_parity.cpp",
+        "test/test_phase_mantle.cpp",
     };
 
     inline for (test_files) |tf| {
