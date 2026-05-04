@@ -664,14 +664,14 @@ class HonkerJvmTest {
     }
 
     @Test
-    void autoWatcherPrefersMmapShmWhenWalIndexIsAvailable() {
-        try (Database db = openWithBackend("auto-mmap.db", WatcherBackend.AUTO)) {
+    void autoWatcherUsesStablePragmaBackend() {
+        try (Database db = openWithBackend("auto-pragma.db", WatcherBackend.AUTO)) {
             try (UpdateEvents updates = db.updateEvents()) {
-                waitUntil(Duration.ofSeconds(2), () -> db.updateWatcherBackend() == WatcherBackend.MMAP_SHM,
-                    "AUTO watcher should select the mmap-shm backend when WAL is active");
-                db.notify("auto-mmap", "{\"ok\":true}");
+                waitUntil(Duration.ofSeconds(2), () -> db.updateWatcherBackend() == WatcherBackend.PRAGMA_DATA_VERSION,
+                    "AUTO watcher should select the stable PRAGMA backend");
+                db.notify("auto-pragma", "{\"ok\":true}");
                 assertTrue(updates.awaitUpdate(Duration.ofSeconds(2)));
-                assertEquals(WatcherBackend.MMAP_SHM, db.updateWatcherBackend());
+                assertEquals(WatcherBackend.PRAGMA_DATA_VERSION, db.updateWatcherBackend());
             }
         }
     }

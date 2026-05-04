@@ -18,7 +18,7 @@ not expose the nice API yet.
 | Go | CI | yes | yes | yes | yes | Go `PRAGMA data_version` poller |
 | Bun `@russellthehippo/honker-bun` | CI | yes | yes | yes | yes | Bun `PRAGMA data_version` poller |
 | C++ | CI | yes | yes | yes | yes | C++ `PRAGMA data_version` poller |
-| JVM `dev.honker:honker` | local + clean consumer | yes | yes | yes | yes | shared JVM watcher (PRAGMA, opt-in AUTO/mmap-shm) |
+| JVM `dev.honker:honker` | local + clean consumer | yes | yes | yes | yes | shared JVM watcher (AUTO/PRAGMA stable, mmap-shm explicit experimental) |
 | Kotlin `dev.honker:honker-kotlin` | local + clean consumer | wrapper | Flow wrapper | wrapper | wrapper | wraps shared JVM watcher |
 | Ruby `honker` | yes | yes | yes | notify yes, listen no | yes | no async listener API yet |
 | Elixir `honker` | CI | yes | yes | notify yes, listen no | yes | local update snapshots + PRAGMA polling |
@@ -40,8 +40,8 @@ not expose the nice API yet.
   listener/worker/stream/result waits, cross-process worker/listener/stream
   wake, concurrent claim uniqueness, delayed deadlines, and listener
   churn/resource cleanup.
-- JVM watcher proof includes explicit `PRAGMA_DATA_VERSION`,
-  experimental `MMAP_SHM`, and default `AUTO` selection tests. fcntl is
+- JVM watcher proof includes stable `AUTO`/`PRAGMA_DATA_VERSION`,
+  explicit experimental `MMAP_SHM`, and backend selection tests. fcntl is
   intentionally not a backend because the repo proof shows it misses
   idle cross-connection updates without an intervening read transaction.
 

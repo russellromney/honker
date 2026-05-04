@@ -162,17 +162,13 @@ final class SharedUpdateWatcher implements AutoCloseable {
     }
 
     private VersionSource openVersionSource() throws SQLException, IOException {
-        if (options.backend() == WatcherBackend.PRAGMA_DATA_VERSION) {
+        if (options.backend() == WatcherBackend.AUTO || options.backend() == WatcherBackend.PRAGMA_DATA_VERSION) {
             return new PragmaVersionSource(path);
         }
         if (options.backend() == WatcherBackend.MMAP_SHM) {
             return new ShmVersionSource(path);
         }
-        try {
-            return new ShmVersionSource(path);
-        } catch (IOException | RuntimeException e) {
-            return new PragmaVersionSource(path);
-        }
+        return new PragmaVersionSource(path);
     }
 
     private static Connection openWatcherConnection(Path path) throws SQLException {
