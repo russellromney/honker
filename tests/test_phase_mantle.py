@@ -26,8 +26,8 @@ from honker import Scheduler, crontab, every_s
 def test_schedule_list_round_trips_all_fields(tmp_path):
     db = honker.open(str(tmp_path / "t.db"))
     sched = Scheduler(db)
-    sched.add("daily-recap", "emails", crontab("0 9 * * *"), payload={"foo": 1}, priority=3)
-    sched.add("hourly-sync", "syncs", every_s(3600))
+    sched.add(name="daily-recap", queue="emails", schedule=crontab("0 9 * * *"), payload={"foo": 1}, priority=3)
+    sched.add(name="hourly-sync", queue="syncs", schedule=every_s(3600))
 
     rows = sched.list()
     by_name = {r["name"]: r for r in rows}
@@ -42,7 +42,7 @@ def test_schedule_list_round_trips_all_fields(tmp_path):
 def test_schedule_pause_resume_idempotent(tmp_path):
     db = honker.open(str(tmp_path / "t.db"))
     sched = Scheduler(db)
-    sched.add("a", "q", crontab("0 9 * * *"))
+    sched.add(name="a", queue="q", schedule=crontab("0 9 * * *"))
 
     assert sched.pause("a") is True
     assert sched.pause("a") is False  # already paused
@@ -61,7 +61,7 @@ def test_schedule_pause_resume_idempotent(tmp_path):
 def test_schedule_update_mutates_fields(tmp_path):
     db = honker.open(str(tmp_path / "t.db"))
     sched = Scheduler(db)
-    sched.add("t", "q", crontab("0 9 * * *"), payload={"v": 1}, priority=0)
+    sched.add(name="t", queue="q", schedule=crontab("0 9 * * *"), payload={"v": 1}, priority=0)
 
     assert sched.update("t", payload={"v": 99}, priority=5) is True
     row = [s for s in sched.list() if s["name"] == "t"][0]
@@ -83,7 +83,7 @@ def test_schedule_update_no_fields_is_noop(tmp_path):
     leader or modifying state. Caller intent must be explicit."""
     db = honker.open(str(tmp_path / "t.db"))
     sched = Scheduler(db)
-    sched.add("t", "q", crontab("0 9 * * *"), payload={"v": 1})
+    sched.add(name="t", queue="q", schedule=crontab("0 9 * * *"), payload={"v": 1})
     before = sched.list()
     assert sched.update("t") is False
     after = sched.list()
@@ -96,7 +96,7 @@ def test_paused_schedule_does_not_emit(tmp_path):
     db = honker.open(str(tmp_path / "t.db"))
     sched = Scheduler(db)
     # Schedule with next_fire_at in the past.
-    sched.add("due", "emails", every_s(1), payload={"x": 1})
+    sched.add(name="due", queue="emails", schedule=every_s(1), payload={"x": 1})
     time.sleep(1.1)
     sched.pause("due")
 
@@ -183,7 +183,7 @@ sched = Scheduler(db)
 print("READY", flush=True)
 sys.stdin.readline()  # parent gates the action
 
-sched.add("from-writer", "emails", every_s(60))
+sched.add(name="from-writer", queue="emails", schedule=every_s(60))
 sched.pause("from-writer")
 print("PAUSED", flush=True)
 sys.stdin.readline()  # parent waits, then signals continue

@@ -148,6 +148,7 @@ class Scheduler:
 
     def add(
         self,
+        *,
         name: str,
         queue: str,
         schedule: CronSchedule,
