@@ -17,17 +17,14 @@ Current shape:
 - watcher backends: `AUTO` / `PRAGMA_DATA_VERSION` for the stable
   PRAGMA watcher, plus explicit experimental `MMAP_SHM` and
   `KERNEL_EVENTS`
-- explicit task registry helpers
+- explicit task registry helpers, typed queue/task wrappers, and
+  `CompletableFuture` result waits
 - Python-parity wake tests: subscribe-before-snapshot races,
   cross-process listener/worker/stream wake, delayed deadlines, concurrent
   claims, and listener churn/resource bounds
 
-Not in this first slice:
-
-- external `Connection` / `DataSource` wrapping
-- Java async/reactive APIs
-- framework integrations
-- annotation scanning / CLI
+Optional integrations such as Spring Boot auto-configuration and
+annotation scanning are intentionally kept outside the core runtime.
 
 ## Quick start
 
@@ -58,6 +55,42 @@ try (Database db = Honker.open("app.db", OpenOptions.builder()
     .build())) {
     // ...
 }
+```
+
+Typed helpers stay JSON-library neutral. Bring Jackson, Gson, JSON-B,
+or your own mapper by implementing `JsonCodec<T>`:
+
+```java
+JsonCodec<Email> emailsJson = new JsonCodec<>() {
+    public String encode(Email value) {
+        try {
+            return mapper.writeValueAsString(value);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public Email decode(String json) {
+        try {
+            return mapper.readValue(json, Email.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+};
+
+TypedQueue<Email> emails = db.queue("emails").typed(emailsJson);
+emails.enqueue(new Email("alice@example.com"));
+TypedJob<Email> job = emails.claimOne("worker-1").orElseThrow();
+sendEmail(job.payload());
+job.ack();
+```
+
+Result waits can use `CompletableFuture`:
+
+```java
+queue.waitResultAsync(id, WaitOptions.timeout(Duration.ofSeconds(10)))
+    .thenAccept(this::handleResult);
 ```
 
 Watcher tuning stays boring by default, but can be made explicit:

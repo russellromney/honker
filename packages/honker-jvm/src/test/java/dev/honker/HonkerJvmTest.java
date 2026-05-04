@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
@@ -38,6 +39,35 @@ class HonkerJvmTest {
             assertEquals("{\"ok\":true}", q.getResult(job.id()).orElseThrow());
             assertTrue(job.ack());
             assertTrue(q.claimOne("worker-2").isEmpty());
+        }
+    }
+
+    @Test
+    void typedQueueAndAsyncResultHelpersAreJavaFriendly() throws Exception {
+        JsonCodec<String> quoted = new JsonCodec<>() {
+            @Override
+            public String encode(String value) {
+                return "\"" + value + "\"";
+            }
+
+            @Override
+            public String decode(String json) {
+                return json.substring(1, json.length() - 1);
+            }
+        };
+
+        try (Database db = open()) {
+            Queue raw = db.queue("typed");
+            TypedQueue<String> typed = raw.typed(quoted);
+            long id = typed.enqueue("hello");
+            TypedJob<String> job = typed.claimOne("worker").orElseThrow();
+            assertEquals(id, job.id());
+            assertEquals("hello", job.payload());
+            assertEquals("hello", job.raw().payload(quoted));
+            raw.saveResult(id, quoted.encode("done"));
+            CompletableFuture<String> future = raw.waitResultAsync(id, WaitOptions.timeout(Duration.ofSeconds(1)));
+            assertEquals("done", quoted.decode(future.get(2, TimeUnit.SECONDS)));
+            assertTrue(job.ack());
         }
     }
 
@@ -458,6 +488,38 @@ class HonkerJvmTest {
                 TaskWorkerOptions.builder().concurrency(1).idlePollInterval(Duration.ofMillis(50)).build()
             )) {
                 assertEquals("{\"args\":[\"a\"],\"kwargs\":{\"b\":2}}", result.waitFor(WaitOptions.timeout(Duration.ofSeconds(2))));
+            }
+        }
+    }
+
+    @Test
+    void typedTaskResultDecodesAndWaitsAsFuture() throws Exception {
+        JsonCodec<Integer> number = new JsonCodec<>() {
+            @Override
+            public String encode(Integer value) {
+                return value.toString();
+            }
+
+            @Override
+            public Integer decode(String json) {
+                return Integer.parseInt(json);
+            }
+        };
+
+        try (Database db = open()) {
+            TaskRegistry registry = new TaskRegistry(db);
+            TypedTaskHandle<Integer> task = registry.registerTyped(
+                "answer",
+                "typed-tasks",
+                number,
+                call -> number.encode(42)
+            );
+            TypedTaskResult<Integer> result = task.enqueue("[]", "{}");
+            try (TaskWorkerHandle ignored = db.runTasks(
+                registry,
+                TaskWorkerOptions.builder().concurrency(1).idlePollInterval(Duration.ofMillis(20)).build()
+            )) {
+                assertEquals(42, result.waitForAsync(WaitOptions.timeout(Duration.ofSeconds(2))).get(3, TimeUnit.SECONDS));
             }
         }
     }

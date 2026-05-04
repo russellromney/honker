@@ -5,6 +5,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 public final class Queue {
     private final Database db;
@@ -66,11 +68,15 @@ public final class Queue {
         return out;
     }
 
-    long nextClaimAt() {
+    public long nextClaimAt() {
         return db.transaction(tx -> tx.query(
             "SELECT honker_queue_next_claim_at(?) AS t",
             Params.of(name)
         ).get(0).getLong("t"));
+    }
+
+    public Database database() {
+        return db;
     }
 
     public int ackBatch(List<Long> jobIds, String workerId) {
@@ -125,6 +131,21 @@ public final class Queue {
                 }
             }
         }
+    }
+
+    public CompletableFuture<String> waitResultAsync(long jobId, WaitOptions waitOptions) {
+        return waitResultAsync(jobId, waitOptions, db.executor());
+    }
+
+    public CompletableFuture<String> waitResultAsync(long jobId, WaitOptions waitOptions, Executor executor) {
+        if (executor == null) {
+            return CompletableFuture.supplyAsync(() -> waitResult(jobId, waitOptions));
+        }
+        return CompletableFuture.supplyAsync(() -> waitResult(jobId, waitOptions), executor);
+    }
+
+    public <T> TypedQueue<T> typed(JsonCodec<T> codec) {
+        return new TypedQueue<>(this, codec);
     }
 
     public int sweepResults() {

@@ -46,6 +46,10 @@ public final class Job {
         return payloadJson;
     }
 
+    public <T> T payload(JsonCodec<T> codec) {
+        return codec.decode(payloadJson);
+    }
+
     public String workerId() {
         return workerId;
     }

@@ -45,6 +45,9 @@ not expose the nice API yet.
   tests, and cross-process proofs. fcntl is intentionally not a backend
   because the repo proof shows it misses idle cross-connection updates
   without an intervening read transaction.
+- JVM/Kotlin ergonomics proof includes typed JSON wrappers,
+  `CompletableFuture` waits, Kotlin notification/job/event flows, and
+  codec-based typed helpers from a clean Maven consumer.
 
 ## What Is Not Proven Yet
 

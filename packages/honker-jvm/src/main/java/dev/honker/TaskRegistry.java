@@ -28,6 +28,20 @@ public final class TaskRegistry {
         return new TaskHandle(db.queue(queue, QueueOptions.builder().maxAttempts(options.retries()).build()), spec);
     }
 
+    public <T> TypedTaskHandle<T> registerTyped(String name, String queue, JsonCodec<T> resultCodec, TaskHandler handler) {
+        return registerTyped(name, queue, resultCodec, handler, TaskOptions.defaults());
+    }
+
+    public <T> TypedTaskHandle<T> registerTyped(
+        String name,
+        String queue,
+        JsonCodec<T> resultCodec,
+        TaskHandler handler,
+        TaskOptions options
+    ) {
+        return new TypedTaskHandle<>(register(name, queue, handler, options), resultCodec);
+    }
+
     public Optional<TaskSpec> get(String name) {
         return Optional.ofNullable(byName.get(name));
     }
