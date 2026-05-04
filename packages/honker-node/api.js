@@ -309,6 +309,21 @@ class Queue {
       ]) === 1
     );
   }
+
+  /** Delete a pending or processing job by id. Returns true iff a row
+   *  was removed. Idempotent on missing. A worker mid-claim on a
+   *  cancelled row will see ack() return false on its next call. */
+  cancel(jobId) {
+    return this._db._callScalar('SELECT honker_cancel(?)', [jobId]) > 0;
+  }
+
+  /** Read a single job row by id. Returns the row object or null if
+   *  the job has been ack'd, dead'd, or never existed. */
+  getJob(jobId) {
+    const raw = this._db._callScalar('SELECT honker_get_job(?)', [jobId]);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  }
 }
 
 class StreamEvent {
@@ -531,6 +546,33 @@ class Scheduler {
 
   remove(name) {
     return this._db._callScalar('SELECT honker_scheduler_unregister(?)', [name]);
+  }
+
+  pause(name) {
+    return this._db._callScalar('SELECT honker_scheduler_pause(?)', [name]) > 0;
+  }
+
+  resume(name) {
+    return this._db._callScalar('SELECT honker_scheduler_resume(?)', [name]) > 0;
+  }
+
+  list() {
+    const raw = this._db._callScalar('SELECT honker_scheduler_list()');
+    return JSON.parse(raw || '[]');
+  }
+
+  update(name, { schedule = undefined, cron = undefined, payload = undefined, priority = undefined, expiresS = undefined } = {}) {
+    const expr = schedule ?? cron;
+    const cronArg = expr ?? null;
+    const payloadArg = payload === undefined ? null : jsonText(payload);
+    const priorityArg = priority === undefined ? null : priority;
+    const touchExpires = expiresS === undefined ? 0 : 1;
+    const expiresArg = expiresS === undefined ? null : expiresS;
+    const n = this._db._callScalar(
+      'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)',
+      [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires],
+    );
+    return n > 0;
   }
 
   tick(now = nowUnix()) {

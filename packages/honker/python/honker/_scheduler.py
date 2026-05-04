@@ -54,6 +54,8 @@ from typing import Any, Optional
 
 from honker import _honker_native
 
+_UNSET = object()
+
 
 class CronSchedule:
     """Thin marker around a scheduler expression.
@@ -188,6 +190,78 @@ class Scheduler:
                 "SELECT honker_scheduler_unregister(?) AS n", [name]
             )
         self._registered.discard(name)
+        return rows[0]["n"] > 0
+
+    # --- lifecycle methods (Phase Mantle) ---------------------------
+    #
+    # Operate on the persisted row directly via SQL functions, so they
+    # work for tasks registered by another process (CLI tool, MCP
+    # wrapper, admin script). Names: pause / resume / list / update.
+
+    def pause(self, name: str) -> bool:
+        """Pause a registered schedule. Sets `enabled=0` so the
+        scheduler skips emitting from this row. Returns True iff a row
+        was paused (False if missing or already paused)."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_scheduler_pause(?) AS n", [name]
+            )
+        return rows[0]["n"] > 0
+
+    def resume(self, name: str) -> bool:
+        """Resume a paused schedule. Returns True iff a row was resumed
+        (False if missing or already enabled)."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_scheduler_resume(?) AS n", [name]
+            )
+        return rows[0]["n"] > 0
+
+    def list(self) -> list[dict]:
+        """Return every registered schedule with its current state
+        (cron_expr, payload, priority, expires_s, next_fire_at,
+        enabled). Useful for admin UIs and 'what's scheduled?' MCP
+        tools."""
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT honker_scheduler_list() AS j")
+        raw = rows[0]["j"] if rows else "[]"
+        return json.loads(raw)
+
+    def update(
+        self,
+        name: str,
+        *,
+        schedule: Optional[CronSchedule] = None,
+        payload: Any = _UNSET,
+        priority: Optional[int] = None,
+        expires: Any = _UNSET,
+    ) -> bool:
+        """Mutate fields of an existing schedule in place. Pass only
+        the fields you want changed; others stay as-is. If `schedule`
+        is provided, `next_fire_at` is recomputed from now. Returns
+        True iff a row was updated (False if name doesn't exist).
+
+        `payload=None` means "set to JSON null". To leave payload
+        unchanged, omit the kwarg. Same for `expires`."""
+        cron_expr = schedule.expr if schedule is not None else None
+        payload_arg = json.dumps(payload) if payload is not _UNSET else None
+        expires_arg = (
+            int(expires) if expires is not _UNSET and expires is not None else None
+        )
+        touch_expires = 1 if expires is not _UNSET else 0
+        priority_arg = int(priority) if priority is not None else None
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?) AS n",
+                [
+                    name,
+                    cron_expr,
+                    payload_arg,
+                    priority_arg,
+                    expires_arg,
+                    touch_expires,
+                ],
+            )
         return rows[0]["n"] > 0
 
     # --- scheduler main loop -----------------------------------------

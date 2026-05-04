@@ -366,7 +366,7 @@ for (const backend of [null, 'kernel', 'shm']) {
     skip: process.platform === 'win32' ? 'rename-over-open denied on Windows' : false,
   }, async () => {
     const fs = require('node:fs');
-    const { dbPath, cleanup } = await createTempDb();
+    const { path: dbPath, cleanup } = createTempDb('honker-watcher-death-', honker.open.bind(honker));
     const open = (...args) => honker.open(...args);
     try {
       const db = open(dbPath, undefined, backend);
@@ -382,20 +382,39 @@ for (const backend of [null, 'kernel', 'shm']) {
       fs.writeFileSync(replacement, '');
       fs.renameSync(replacement, dbPath);
 
-      // Identity check fires every 100ms; 3s is generous.
+      // File replacement can produce a few "conservative wake" undefined
+      // ticks (transient I/O errors before the dead-man's identity
+      // check fires). Drain wakes until next() rejects, bounded by a
+      // total deadline. Death surfaces as a rejected promise; clean
+      // wakes resolve.
+      const deadline = Date.now() + 3000;
       let raised = false;
-      const racePromise = Promise.race([
-        ev.next().then(() => null, (e) => e),
-        new Promise((r) => setTimeout(() => r('TIMEOUT'), 3000)),
-      ]);
-      const result = await racePromise;
-      if (result instanceof Error || (typeof result === 'object' && result !== null && result.message)) {
-        raised = true;
+      let lastErr = null;
+      while (Date.now() < deadline) {
+        const remaining = Math.max(50, deadline - Date.now());
+        try {
+          await Promise.race([
+            ev.next(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('TIMEOUT')), remaining),
+            ),
+          ]);
+        } catch (e) {
+          if (String(e.message || '').includes('TIMEOUT')) break;
+          lastErr = e;
+          raised = true;
+          break;
+        }
       }
       assert.ok(
         raised,
         `backend=${label}: expected updateEvents.next() to reject after ` +
-          `db file replacement, got ${result}`,
+          `db file replacement; deadline reached without watcher death`,
+      );
+      assert.match(
+        String(lastErr.message || ''),
+        /watcher|replaced|dead|disconnect|closed channel/i,
+        `backend=${label}: expected watcher-died-style error, got ${lastErr.message}`,
       );
     } finally {
       cleanup();

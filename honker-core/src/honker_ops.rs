@@ -193,6 +193,75 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // honker_scheduler_pause(name) / _resume(name) -> 1 if toggled, 0 otherwise.
+    conn.create_scalar_function(
+        "honker_scheduler_pause",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let db = unsafe { ctx.get_connection() }?;
+            scheduler_pause(&db, &name).map_err(to_sql_err)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_scheduler_resume",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let db = unsafe { ctx.get_connection() }?;
+            scheduler_resume(&db, &name).map_err(to_sql_err)
+        },
+    )?;
+
+    // honker_scheduler_list() -> JSON array of all schedules with state.
+    conn.create_scalar_function(
+        "honker_scheduler_list",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let db = unsafe { ctx.get_connection() }?;
+            scheduler_list(&db).map_err(to_sql_err)
+        },
+    )?;
+
+    // honker_scheduler_update(name, cron_expr_or_null, payload_or_null,
+    //                          priority_or_null, expires_s_or_null,
+    //                          touch_expires) -> 1 if updated, 0 if missing.
+    // `touch_expires` is a 0/1 flag: when 1 we treat the expires_s arg
+    // as the desired value (which may be NULL = "clear"); when 0 we
+    // leave expires_s untouched. SQL has no good way to distinguish
+    // "user passed NULL" from "user did not specify" otherwise.
+    conn.create_scalar_function(
+        "honker_scheduler_update",
+        6,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let cron_expr: Option<String> = ctx.get(1)?;
+            let payload: Option<String> = ctx.get(2)?;
+            let priority: Option<i64> = ctx.get(3)?;
+            let expires_s_arg: Option<i64> = ctx.get(4)?;
+            let touch_expires: i64 = ctx.get(5)?;
+            let db = unsafe { ctx.get_connection() }?;
+            let expires_s = if touch_expires != 0 {
+                Some(expires_s_arg)
+            } else {
+                None
+            };
+            scheduler_update(
+                &db,
+                &name,
+                cron_expr.as_deref(),
+                payload.as_deref(),
+                priority,
+                expires_s,
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
+
     conn.create_scalar_function("honker_result_save", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
         let job_id: i64 = ctx.get(0)?;
         let value: String = ctx.get(1)?;
@@ -286,6 +355,21 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         let extend_s: i64 = ctx.get(2)?;
         let db = unsafe { ctx.get_connection() }?;
         heartbeat(&db, job_id, &worker_id, extend_s).map_err(to_sql_err)
+    })?;
+
+    // honker_cancel(job_id) -> 1 if a pending/processing row was removed,
+    // 0 otherwise. Idempotent on missing.
+    conn.create_scalar_function("honker_cancel", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let db = unsafe { ctx.get_connection() }?;
+        cancel(&db, job_id).map_err(to_sql_err)
+    })?;
+
+    // honker_get_job(job_id) -> JSON object on hit, empty string on miss.
+    conn.create_scalar_function("honker_get_job", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let db = unsafe { ctx.get_connection() }?;
+        get_job(&db, job_id).map_err(to_sql_err)
     })?;
 
     // honker_cron_next_after(expr, from_unix) -> unix_ts of next boundary
@@ -678,6 +762,109 @@ pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rus
     Ok(1)
 }
 
+/// Cancel a job by id. Removes pending or processing rows from
+/// `_honker_live` regardless of which worker (if any) holds it.
+/// Returns 1 if a row was removed, 0 otherwise. Idempotent.
+///
+/// Use case: an operator decides a queued or in-flight job is no
+/// longer needed (the upstream request was cancelled, the user
+/// changed their mind). Note that for a `state='processing'` row,
+/// the worker holding the claim will see `ack()` return 0 on its
+/// next call — same shape as a claim that simply expired.
+pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
+    let n = conn.execute(
+        "DELETE FROM _honker_live WHERE id = ?1 AND state IN ('pending', 'processing')",
+        rusqlite::params![job_id],
+    )?;
+    Ok(n as i64)
+}
+
+/// Read a single job row by id. Returns a JSON object on success or
+/// the empty string on miss (job ack'd, dead'd, or never existed).
+/// Pure read — does not change state.
+pub fn get_job(conn: &Connection, job_id: i64) -> rusqlite::Result<String> {
+    let row: Option<(
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        Option<String>,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+    )> = conn
+        .query_row(
+            "SELECT id, queue, payload, state, priority, run_at, worker_id,
+                    claim_expires_at, attempts, max_attempts, created_at, expires_at
+               FROM _honker_live WHERE id = ?1",
+            rusqlite::params![job_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((
+        id,
+        queue,
+        payload,
+        state,
+        priority,
+        run_at,
+        worker_id,
+        claim_expires_at,
+        attempts,
+        max_attempts,
+        created_at,
+        expires_at,
+    )) = row
+    else {
+        return Ok(String::new());
+    };
+    let opt_str = |v: &Option<String>| match v {
+        Some(s) => json_str(s),
+        None => "null".into(),
+    };
+    let opt_i = |v: Option<i64>| match v {
+        Some(n) => n.to_string(),
+        None => "null".into(),
+    };
+    Ok(format!(
+        "{{\"id\":{},\"queue\":{},\"payload\":{},\"state\":{},\
+         \"priority\":{},\"run_at\":{},\"worker_id\":{},\
+         \"claim_expires_at\":{},\"attempts\":{},\"max_attempts\":{},\
+         \"created_at\":{},\"expires_at\":{}}}",
+        id,
+        json_str(&queue),
+        json_str(&payload),
+        json_str(&state),
+        priority,
+        run_at,
+        opt_str(&worker_id),
+        opt_i(claim_expires_at),
+        attempts,
+        max_attempts,
+        created_at,
+        opt_i(expires_at),
+    ))
+}
+
 /// Extend the current claim by `extend_s` seconds. Returns 1 if the
 /// heartbeat landed, 0 if we're not the holder (either the row is
 /// in a different state or worker_id doesn't match).
@@ -920,7 +1107,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
         let mut stmt = conn.prepare_cached(
             "SELECT name, queue, cron_expr, payload, priority, expires_s, next_fire_at
              FROM _honker_scheduler_tasks
-             WHERE next_fire_at <= ?1",
+             WHERE next_fire_at <= ?1 AND enabled = 1",
         )?;
         stmt.query_map(rusqlite::params![now_unix], |r| {
             Ok((
@@ -974,11 +1161,143 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
 pub fn scheduler_soonest(conn: &Connection) -> rusqlite::Result<i64> {
     Ok(conn
         .query_row(
-            "SELECT COALESCE(MIN(next_fire_at), 0) FROM _honker_scheduler_tasks",
+            "SELECT COALESCE(MIN(next_fire_at), 0) FROM _honker_scheduler_tasks WHERE enabled = 1",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0))
+}
+
+/// Toggle `enabled` on a registered schedule. Returns 1 if updated, 0
+/// if the name doesn't exist. Wakes the leader so `scheduler_soonest`
+/// is recomputed against the new active set.
+pub fn scheduler_pause(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
+    let n = conn.execute(
+        "UPDATE _honker_scheduler_tasks SET enabled = 0 WHERE name = ?1 AND enabled = 1",
+        rusqlite::params![name],
+    )?;
+    if n > 0 {
+        scheduler_wake(conn)?;
+    }
+    Ok(n as i64)
+}
+
+pub fn scheduler_resume(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
+    let n = conn.execute(
+        "UPDATE _honker_scheduler_tasks SET enabled = 1 WHERE name = ?1 AND enabled = 0",
+        rusqlite::params![name],
+    )?;
+    if n > 0 {
+        scheduler_wake(conn)?;
+    }
+    Ok(n as i64)
+}
+
+/// Return all registered schedules as a JSON array. Each row:
+/// `{name, queue, cron_expr, payload, priority, expires_s,
+///   next_fire_at, enabled}`.
+pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT name, queue, cron_expr, payload, priority, expires_s,
+                next_fire_at, enabled
+           FROM _honker_scheduler_tasks
+           ORDER BY name",
+    )?;
+    let rows: Vec<(String, String, String, String, i64, Option<i64>, i64, i64)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut out = String::from("[");
+    for (i, (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, enabled)) in
+        rows.iter().enumerate()
+    {
+        if i > 0 {
+            out.push(',');
+        }
+        let expires_repr = match expires_s {
+            Some(v) => v.to_string(),
+            None => "null".into(),
+        };
+        out.push_str(&format!(
+            "{{\"name\":{},\"queue\":{},\"cron_expr\":{},\"payload\":{},\
+             \"priority\":{},\"expires_s\":{},\"next_fire_at\":{},\"enabled\":{}}}",
+            json_str(name),
+            json_str(queue),
+            json_str(cron_expr),
+            json_str(payload),
+            priority,
+            expires_repr,
+            next_fire_at,
+            if *enabled != 0 { "true" } else { "false" },
+        ));
+    }
+    out.push(']');
+    Ok(out)
+}
+
+/// Mutate one or more fields of a registered schedule. Pass `None` for
+/// fields that should be left unchanged. If `cron_expr` is provided,
+/// `next_fire_at` is recomputed from `unixepoch()`. Returns 1 if the
+/// row was updated, 0 if it doesn't exist.
+#[allow(clippy::too_many_arguments)]
+pub fn scheduler_update(
+    conn: &Connection,
+    name: &str,
+    cron_expr: Option<&str>,
+    payload: Option<&str>,
+    priority: Option<i64>,
+    expires_s: Option<Option<i64>>,
+) -> rusqlite::Result<i64> {
+    // Verify exists first so we can return 0 cleanly without dynamic SQL gymnastics.
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM _honker_scheduler_tasks WHERE name = ?1",
+            rusqlite::params![name],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(0);
+    }
+    if let Some(p) = payload {
+        conn.execute(
+            "UPDATE _honker_scheduler_tasks SET payload = ?2 WHERE name = ?1",
+            rusqlite::params![name, p],
+        )?;
+    }
+    if let Some(p) = priority {
+        conn.execute(
+            "UPDATE _honker_scheduler_tasks SET priority = ?2 WHERE name = ?1",
+            rusqlite::params![name, p],
+        )?;
+    }
+    if let Some(e) = expires_s {
+        conn.execute(
+            "UPDATE _honker_scheduler_tasks SET expires_s = ?2 WHERE name = ?1",
+            rusqlite::params![name, e],
+        )?;
+    }
+    if let Some(expr) = cron_expr {
+        let now = now_unix(conn)?;
+        let next = super::cron::next_after_unix(expr, now).map_err(to_sql_err)?;
+        conn.execute(
+            "UPDATE _honker_scheduler_tasks
+               SET cron_expr = ?2, next_fire_at = ?3 WHERE name = ?1",
+            rusqlite::params![name, expr, next],
+        )?;
+    }
+    scheduler_wake(conn)?;
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------

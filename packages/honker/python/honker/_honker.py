@@ -506,6 +506,27 @@ class Queue:
             )
         return bool(rows[0]["r"])
 
+    def cancel(self, job_id: int) -> bool:
+        """Delete a pending or processing job by id. Returns True iff a
+        row was removed. Idempotent on missing. A worker mid-claim on a
+        cancelled row will see `ack()` return False on its next call."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_cancel(?) AS r", [int(job_id)]
+            )
+        return bool(rows[0]["r"])
+
+    def get_job(self, job_id: int) -> Optional[dict]:
+        """Read a single job row by id. Returns a dict with the row
+        fields, or None if the job has been ack'd, dead'd, or never
+        existed. Pure read."""
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT honker_get_job(?) AS j", [int(job_id)])
+        raw = rows[0]["j"] if rows else ""
+        if not raw:
+            return None
+        return json.loads(raw)
+
     # --- Huey-style task decorators ----------------------------------
     #
     # `@queue.task()` wraps a function so calling it enqueues a job

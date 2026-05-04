@@ -305,7 +305,8 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       payload TEXT NOT NULL,
       priority INTEGER NOT NULL DEFAULT 0,
       expires_s INTEGER,
-      next_fire_at INTEGER NOT NULL
+      next_fire_at INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS _honker_results (
       job_id INTEGER PRIMARY KEY,
@@ -339,6 +340,21 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
 /// DELETE-journal database. Cross-process wake is their responsibility.
 pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(BOOTSTRAP_HONKER_SQL)?;
+    // Migration: pre-Mantle databases lack `enabled` on _honker_scheduler_tasks.
+    // ADD COLUMN if absent. SQLite ignores the ALTER if the column already exists?
+    // No — it errors. So check first via pragma_table_info.
+    let has_enabled: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM pragma_table_info('_honker_scheduler_tasks') WHERE name='enabled'",
+        )?;
+        stmt.query_row([], |_| Ok(true)).unwrap_or(false)
+    };
+    if !has_enabled {
+        conn.execute(
+            "ALTER TABLE _honker_scheduler_tasks ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -2167,6 +2183,7 @@ while True:
                 "priority",
                 "expires_s",
                 "next_fire_at",
+                "enabled",
             ],
         );
         let res_cols: Vec<String> = conn
