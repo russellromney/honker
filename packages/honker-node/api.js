@@ -311,8 +311,16 @@ class Queue {
   }
 
   /** Delete a pending or processing job by id. Returns true iff a row
-   *  was removed. Idempotent on missing. A worker mid-claim on a
-   *  cancelled row will see ack() return false on its next call. */
+   *  was removed. Idempotent on missing.
+   *
+   *  IMPORTANT: cancel does NOT interrupt a worker that's currently
+   *  running the handler for this job. The worker keeps executing
+   *  until its handler returns (or it dies). What cancel does is
+   *  invalidate the worker's claim — its next ack()/heartbeat() call
+   *  returns false, same shape as an expired claim. If you need the
+   *  handler to actually stop, build that signal in your app (check a
+   *  flag periodically, etc.); honker doesn't propagate cancellation
+   *  to running handlers. */
   cancel(jobId) {
     return this._db._callScalar('SELECT honker_cancel(?)', [jobId]) > 0;
   }
@@ -561,13 +569,19 @@ class Scheduler {
     return JSON.parse(raw || '[]');
   }
 
-  update(name, { schedule = undefined, cron = undefined, payload = undefined, priority = undefined, expiresS = undefined } = {}) {
-    const expr = schedule ?? cron;
-    const cronArg = expr ?? null;
-    const payloadArg = payload === undefined ? null : jsonText(payload);
-    const priorityArg = priority === undefined ? null : priority;
-    const touchExpires = expiresS === undefined ? 0 : 1;
-    const expiresArg = expiresS === undefined ? null : expiresS;
+  update(name, opts = {}) {
+    // Detect "field present" via `in` so null and undefined are
+    // distinguishable: { payload: null } writes JSON null, omitting
+    // the key leaves payload alone. Same shape as the Python binding's
+    // _UNSET sentinel — keeps the two bindings consistent on this
+    // semantic edge.
+    const has = (k) => Object.prototype.hasOwnProperty.call(opts, k);
+    const expr = has('schedule') ? opts.schedule : has('cron') ? opts.cron : null;
+    const cronArg = expr === undefined ? null : expr;
+    const payloadArg = has('payload') ? jsonText(opts.payload) : null;
+    const priorityArg = has('priority') ? opts.priority : null;
+    const touchExpires = has('expiresS') ? 1 : 0;
+    const expiresArg = has('expiresS') ? opts.expiresS : null;
     const n = this._db._callScalar(
       'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)',
       [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires],

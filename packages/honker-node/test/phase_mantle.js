@@ -62,6 +62,42 @@ test('pause/resume idempotent', () => {
   }
 });
 
+test('update with no fields is a no-op and returns false', () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  let db;
+  try {
+    db = open(dbPath);
+    const sched = new honker.Scheduler(db);
+    sched.add({ name: 't', queue: 'q', cron: '0 9 * * *', payload: { v: 1 } });
+    const before = sched.list();
+    assert.equal(sched.update('t'), false);
+    assert.deepEqual(sched.list(), before);
+  } finally {
+    cleanup();
+  }
+});
+
+test('update can write JSON null distinct from omitted payload', () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  let db;
+  try {
+    db = open(dbPath);
+    const sched = new honker.Scheduler(db);
+    sched.add({ name: 't', queue: 'q', cron: '0 9 * * *', payload: { v: 1 } });
+    // Omitted payload — leaves the row alone.
+    sched.update('t', { priority: 7 });
+    let row = sched.list().find((s) => s.name === 't');
+    assert.deepEqual(JSON.parse(row.payload), { v: 1 });
+    assert.equal(row.priority, 7);
+    // payload: null — explicitly write JSON null.
+    sched.update('t', { payload: null });
+    row = sched.list().find((s) => s.name === 't');
+    assert.equal(JSON.parse(row.payload), null);
+  } finally {
+    cleanup();
+  }
+});
+
 test('update mutates fields and recomputes next_fire_at on cron change', () => {
   const { path: dbPath, open, cleanup } = tmpdb();
   let db;

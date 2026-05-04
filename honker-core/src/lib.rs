@@ -340,9 +340,14 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
 /// DELETE-journal database. Cross-process wake is their responsibility.
 pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(BOOTSTRAP_HONKER_SQL)?;
-    // Migration: pre-Mantle databases lack `enabled` on _honker_scheduler_tasks.
-    // ADD COLUMN if absent. SQLite ignores the ALTER if the column already exists?
-    // No — it errors. So check first via pragma_table_info.
+    // Migration: pre-Mantle databases lack `enabled` on
+    // _honker_scheduler_tasks. ADD COLUMN if absent.
+    //
+    // Race: two processes bootstrapping concurrently could both see
+    // "missing" and both attempt the ALTER. SQLite serializes writes
+    // file-wide, so they don't actually run at once — the second
+    // ALTER errors with "duplicate column" because by then the first
+    // has committed. Swallow that specific error; bubble anything else.
     let has_enabled: bool = {
         let mut stmt = conn.prepare(
             "SELECT 1 FROM pragma_table_info('_honker_scheduler_tasks') WHERE name='enabled'",
@@ -350,10 +355,16 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
         stmt.query_row([], |_| Ok(true)).unwrap_or(false)
     };
     if !has_enabled {
-        conn.execute(
+        match conn.execute(
             "ALTER TABLE _honker_scheduler_tasks ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
             [],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {
+                // Lost the race; the other process added it. Fine.
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }
@@ -2097,6 +2108,60 @@ while True:
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    #[test]
+    fn bootstrap_pre_mantle_database_gets_enabled_column() {
+        // Simulate a pre-Mantle database: create _honker_scheduler_tasks
+        // by hand WITHOUT the `enabled` column. Then bootstrap should
+        // detect the missing column and ALTER TABLE ADD it.
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE _honker_scheduler_tasks (
+              name TEXT PRIMARY KEY,
+              queue TEXT NOT NULL,
+              cron_expr TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              priority INTEGER NOT NULL DEFAULT 0,
+              expires_s INTEGER,
+              next_fire_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        // Insert a row to prove existing data survives the migration.
+        conn.execute(
+            "INSERT INTO _honker_scheduler_tasks
+               (name, queue, cron_expr, payload, priority, expires_s, next_fire_at)
+             VALUES ('legacy', 'q', '0 9 * * *', '{}', 0, NULL, 1)",
+            [],
+        )
+        .unwrap();
+
+        bootstrap_honker_schema(&conn).unwrap();
+
+        // Column exists now.
+        let has: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('_honker_scheduler_tasks') WHERE name='enabled'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has, "enabled column should be present after bootstrap");
+
+        // Existing row got the default and survived.
+        let (cnt, enabled): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(enabled), -1) FROM _honker_scheduler_tasks WHERE name='legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1, "existing row must survive migration");
+        assert_eq!(enabled, 1, "existing row must default to enabled=1");
+
+        // Re-running bootstrap is a no-op (idempotent).
+        bootstrap_honker_schema(&conn).unwrap();
     }
 
     #[test]

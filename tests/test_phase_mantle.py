@@ -78,6 +78,18 @@ def test_schedule_update_mutates_fields(tmp_path):
     assert sched.update("missing", payload={}) is False
 
 
+def test_schedule_update_no_fields_is_noop(tmp_path):
+    """update() with no field args returns False without waking the
+    leader or modifying state. Caller intent must be explicit."""
+    db = honker.open(str(tmp_path / "t.db"))
+    sched = Scheduler(db)
+    sched.add("t", "q", crontab("0 9 * * *"), payload={"v": 1})
+    before = sched.list()
+    assert sched.update("t") is False
+    after = sched.list()
+    assert before == after, "no-op update must not mutate state"
+
+
 def test_paused_schedule_does_not_emit(tmp_path):
     """Tick the scheduler with a due task that's been paused; assert no
     job lands in the queue."""

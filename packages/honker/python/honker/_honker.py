@@ -508,8 +508,16 @@ class Queue:
 
     def cancel(self, job_id: int) -> bool:
         """Delete a pending or processing job by id. Returns True iff a
-        row was removed. Idempotent on missing. A worker mid-claim on a
-        cancelled row will see `ack()` return False on its next call."""
+        row was removed. Idempotent on missing.
+
+        IMPORTANT: cancel does NOT interrupt a worker that's currently
+        running the handler for this job. The worker keeps executing
+        until its handler returns (or it dies). What cancel does is
+        invalidate the worker's claim — its next `ack()`/`heartbeat()`
+        call returns False, same shape as an expired claim. If you need
+        the handler to actually stop, build that signal in your app
+        (check a flag periodically, etc.); honker doesn't propagate
+        cancellation to running handlers."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 "SELECT honker_cancel(?) AS r", [int(job_id)]

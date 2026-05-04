@@ -1269,33 +1269,58 @@ pub fn scheduler_update(
     if !exists {
         return Ok(0);
     }
-    if let Some(p) = payload {
-        conn.execute(
-            "UPDATE _honker_scheduler_tasks SET payload = ?2 WHERE name = ?1",
-            rusqlite::params![name, p],
-        )?;
+    let any_field = cron_expr.is_some()
+        || payload.is_some()
+        || priority.is_some()
+        || expires_s.is_some();
+    if !any_field {
+        // No fields to change. Don't wake the leader for a no-op.
+        return Ok(0);
     }
-    if let Some(p) = priority {
-        conn.execute(
-            "UPDATE _honker_scheduler_tasks SET priority = ?2 WHERE name = ?1",
-            rusqlite::params![name, p],
-        )?;
-    }
-    if let Some(e) = expires_s {
-        conn.execute(
-            "UPDATE _honker_scheduler_tasks SET expires_s = ?2 WHERE name = ?1",
-            rusqlite::params![name, e],
-        )?;
-    }
-    if let Some(expr) = cron_expr {
+    // Wrap field UPDATEs in a SAVEPOINT so a concurrent reader can't
+    // observe half-applied state. SAVEPOINT instead of BEGIN/COMMIT so
+    // we play nicely if the caller already holds an outer tx.
+    let next_fire_at = if let Some(expr) = cron_expr {
         let now = now_unix(conn)?;
-        let next = super::cron::next_after_unix(expr, now).map_err(to_sql_err)?;
-        conn.execute(
-            "UPDATE _honker_scheduler_tasks
-               SET cron_expr = ?2, next_fire_at = ?3 WHERE name = ?1",
-            rusqlite::params![name, expr, next],
-        )?;
+        Some(super::cron::next_after_unix(expr, now).map_err(to_sql_err)?)
+    } else {
+        None
+    };
+    conn.execute_batch("SAVEPOINT honker_sched_update")?;
+    let result: rusqlite::Result<()> = (|| {
+        if let Some(p) = payload {
+            conn.execute(
+                "UPDATE _honker_scheduler_tasks SET payload = ?2 WHERE name = ?1",
+                rusqlite::params![name, p],
+            )?;
+        }
+        if let Some(p) = priority {
+            conn.execute(
+                "UPDATE _honker_scheduler_tasks SET priority = ?2 WHERE name = ?1",
+                rusqlite::params![name, p],
+            )?;
+        }
+        if let Some(e) = expires_s {
+            conn.execute(
+                "UPDATE _honker_scheduler_tasks SET expires_s = ?2 WHERE name = ?1",
+                rusqlite::params![name, e],
+            )?;
+        }
+        if let Some(expr) = cron_expr {
+            conn.execute(
+                "UPDATE _honker_scheduler_tasks
+                   SET cron_expr = ?2, next_fire_at = ?3 WHERE name = ?1",
+                rusqlite::params![name, expr, next_fire_at.unwrap()],
+            )?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT honker_sched_update; \
+                                    RELEASE SAVEPOINT honker_sched_update");
+        result?;
     }
+    conn.execute_batch("RELEASE SAVEPOINT honker_sched_update")?;
     scheduler_wake(conn)?;
     Ok(1)
 }
