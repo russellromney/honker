@@ -18,6 +18,8 @@ not expose the nice API yet.
 | Go | CI | yes | yes | yes | yes | Go `PRAGMA data_version` poller |
 | Bun `@russellthehippo/honker-bun` | CI | yes | yes | yes | yes | Bun `PRAGMA data_version` poller |
 | C++ | CI | yes | yes | yes | yes | C++ `PRAGMA data_version` poller |
+| JVM `dev.honker:honker` | local + clean consumer | yes | yes | yes | yes | shared JVM `PRAGMA data_version` watcher |
+| Kotlin `dev.honker:honker-kotlin` | local + clean consumer | wrapper | Flow wrapper | wrapper | wrapper | wraps shared JVM watcher |
 | Ruby `honker` | yes | yes | yes | notify yes, listen no | yes | no async listener API yet |
 | Elixir `honker` | CI | yes | yes | notify yes, listen no | yes | local update snapshots + PRAGMA polling |
 
@@ -31,6 +33,13 @@ not expose the nice API yet.
   Python interop, C++, Bun, Ruby, Elixir, and Ruby <-> Python interop.
 - The packaged-install proof workflow builds and installs Python,
   Node, Ruby, and .NET packages into clean throwaway consumers.
+- JVM and Kotlin bindings have local Maven proof plus a clean Maven
+  consumer proof that runs from outside the repo using the packaged
+  native resource.
+- JVM wake proof now mirrors the Python race/resource shape: long-fallback
+  listener/worker/stream/result waits, cross-process worker/listener/stream
+  wake, concurrent claim uniqueness, delayed deadlines, and listener
+  churn/resource cleanup.
 
 ## What Is Not Proven Yet
 
@@ -43,3 +52,4 @@ not expose the nice API yet.
   stays shorter.
 - Ruby and Elixir do not yet have the same async listener API as
   Python/Node/.NET/Rust/Go/Bun/C++.
+- JVM/Kotlin packages do not yet have published Maven Central proof.

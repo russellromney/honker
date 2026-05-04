@@ -4,7 +4,7 @@
 
 `honker` is a SQLite extension + language bindings that add Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with built-in durable pub/sub, task queue, and event streams, without client polling or a daemon/broker. Any language that can `SELECT load_extension('honker')` gets the same features.
 
-honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, and .NET / C#. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
+honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, .NET / C#, and JVM / Kotlin packages. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
 
 See [Binding support](BINDINGS.md) for the current truth table: which
 bindings have typed queue/stream/listen/scheduler APIs, which ones have
@@ -373,6 +373,8 @@ packages/
   honker-ex/              # Elixir binding
   honker-cpp/             # C++ binding
   honker-dotnet/          # .NET / C# binding
+  honker-jvm/             # JVM / Java-compatible binding
+  honker-kotlin/          # Kotlin convenience wrapper
 tests/                    # integration tests (cross-package)
 bench/                    # benches
 site/                     # honker.dev (Astro)                [git submodule]
@@ -387,6 +389,9 @@ ecosystems. `site/` remains a separate docs-site submodule.
 ```bash
 make test                   # default: rust + python + node (fast, ~10s)
 make test-python-slow       # soak + real-time cron tests (~2 min)
+make test-jvm               # JVM binding tests
+make test-kotlin            # JVM + Kotlin wrapper tests
+make test-jvm-consumer       # clean Maven consumer + packaged native proof
 make test-all               # everything including slow marks
 
 make build                  # PyO3 maturin develop + loadable extension
