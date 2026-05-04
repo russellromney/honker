@@ -1,13 +1,38 @@
 # CHANGELOG
 
+## 2026-05-04 — binding parity release
+
+Release versions:
+
+- `honker-core` / `honker-extension`: 0.2.3
+- Python `honker`: 0.2.3
+- Rust `honker`: 0.3.3
+- Node `@russellthehippo/honker-node`: 0.3.3
+- Bun `@russellthehippo/honker-bun`: 0.2.2
+- Ruby `honker`: 0.1.2
+- Elixir `honker`: 0.1.2
+- .NET `Honker`: 0.2.3
+- JVM `dev.honker:honker` / Kotlin `dev.honker:honker-kotlin`: 0.1.0
+
 ## Unreleased — experimental watcher backends + polling reliability
 
-- New opt-in `watcher_backend` parameter on `honker.open()` (Python + Node)
-  and `WatcherConfig` (Rust). Defaults to polling. Two experimental
-  backends added behind Cargo features — `kernel-watcher` (notify-rs
-  filesystem events) and `shm-fast-path` (mmap'd `-shm` `iChange`
-  read). Source-only in published wheels; selecting them without the
-  feature compiled in falls back to polling with a stderr message.
+- New opt-in `watcher_backend` parameter on `honker.open()` (Python +
+  Node), `WatcherConfig` (core), and `OpenOptions::watcher_backend`
+  (Rust wrapper). Defaults to polling. Two experimental backends added
+  behind Cargo features — `kernel-watcher` (notify-rs filesystem events)
+  and `shm-fast-path` (mmap'd `-shm` `iChange` read). Source-only in
+  published wheels; selecting one without the feature compiled in raises
+  instead of silently falling back to polling.
+- All maintained bindings now participate in the backend-selection
+  contract. Go, Bun, C++, .NET, Ruby, and Elixir accept the polling
+  aliases and reject explicit `kernel` / `shm` requests with a
+  polling-only error until they consume the shared native watcher ABI;
+  unknown backend names are errors everywhere.
+- Backend-isolation hooks: Python `queue.claim(..., idle_poll_s=None)`
+  and `db.listen(..., fallback_poll_s=None)` plus Node
+  `idlePollS: null` / `fallbackPollS: null` disable high-level fallback
+  waits. The watcher-backend queue e2e uses this so fallback polling
+  cannot make a broken experimental backend look green.
 - Polling fix (everyone benefits, no opt-in): `SQLITE_BUSY` /
   `SQLITE_LOCKED` from the watcher's `PRAGMA data_version` poll no
   longer drops the connection. Previously busy → drop → reconnect →

@@ -1,9 +1,9 @@
 [package]
 name = "honker-core"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "Shared Rust foundation for Honker bindings (SQLite loadable extension, PyO3, napi-rs, and friends). Not intended for direct use."
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/russellromney/honker"
 homepage = "https://honker.dev"
 readme = "README.md"
@@ -14,7 +14,7 @@ categories = ["database", "concurrency"]
 bundled-sqlite = ["rusqlite/bundled"]
 # Optional kernel-watch backend: use OS filesystem notifications as wake
 # hints (still verifies via PRAGMA data_version). Experimental.
-kernel-watcher = ["dep:notify"]
+kernel-watcher = ["dep:libc", "dep:notify"]
 # Optional shm fast path: read the SQLite WAL index shared-memory file
 # directly instead of running PRAGMA data_version. Experimental.
 shm-fast-path = ["dep:memmap2"]
@@ -36,6 +36,7 @@ thiserror = "2.0.18"
 notify = { version = "6", optional = true, features = ["macos_kqueue"] }
 # Optional: shm fast path.
 memmap2 = { version = "0.9", optional = true }
+libc = { version = "0.2", optional = true }
 
 # file-id only supports unix and windows. Other targets (WASI, Redox,
 # illumos, etc.) get the `(0, 0)` fallback in stat_identity.

@@ -15,10 +15,17 @@ go get github.com/russellromney/honker-go
 
 You also need the Honker SQLite extension from the main repo.
 
+## Watcher backends
+
+`OpenWithOptions` accepts `OpenOptions{WatcherBackend: "polling"}` (or
+`"poll"`), which is also the default. `"kernel"` / `"shm"` route
+through `honker-core` via the loaded Honker extension and fail loudly
+if that extension was not built with the matching feature.
+
 ## Quick start
 
 ```go
-db, err := honker.Open("app.db", honker.WithExtensionPath("./libhonker_ext.dylib"))
+db, err := honker.Open("app.db", "./libhonker_ext.dylib")
 if err != nil {
     panic(err)
 }

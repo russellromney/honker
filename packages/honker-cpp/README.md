@@ -17,6 +17,14 @@ Full docs:
 
 The C++ binding loads the Honker SQLite extension itself. That means SQLite must be built with loadable extension support.
 
+## Watcher Backends
+
+`honker::Database` accepts an optional third backend argument. The
+default, `"polling"`, and `"poll"` select the polling backend.
+Experimental `"kernel"` / `"shm"` requests route through `honker-core`
+via the loaded Honker extension and fail loudly if that extension was
+not built with the matching feature.
+
 Platform installs:
 
 ```bash

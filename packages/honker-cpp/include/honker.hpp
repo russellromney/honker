@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -17,6 +18,12 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 extern "C" {
     #include <sqlite3.h>
@@ -125,6 +132,7 @@ class Database;
 class Transaction;
 class Job;
 class Queue;
+class Outbox;
 class StreamEvent;
 class Stream;
 class StreamSubscription;
@@ -134,28 +142,54 @@ class Lock;
 class Notification;
 class Subscription;
 
+using watcher_open_fn = void* (*)(const char*, const char*, char*, uintptr_t);
+using watcher_wait_fn = int (*)(void*, uint64_t);
+using watcher_close_fn = void (*)(void*);
+
+inline std::mutex& native_open_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 // =====================================================================
 // Database
 // =====================================================================
 
 class Database {
 public:
-    Database(std::string_view path, std::string_view ext_path) {
+    Database(std::string_view path, std::string_view ext_path, std::string_view watcher_backend = "") {
         const std::string p{path};
         const std::string e{ext_path};
+        std::lock_guard<std::mutex> open_lock(native_open_mutex());
         if (auto rc = honker_cpp_open(p.c_str(), e.c_str(), &db_); rc != 0) {
             throw Error{"honker_cpp_open failed: code " + std::to_string(rc)};
         }
         path_ = p;
+        ext_path_ = e;
+        watcher_backend_ = std::string{watcher_backend};
+        try {
+            open_core_watcher();
+        } catch (...) {
+            close();
+            throw;
+        }
     }
 
     ~Database() { close(); }
 
     Database(Database&& other) noexcept
         : db_(other.db_), path_(std::move(other.path_)),
+          ext_path_(std::move(other.ext_path_)),
+          watcher_backend_(std::move(other.watcher_backend_)),
+          watcher_lib_(other.watcher_lib_),
+          core_watcher_(other.core_watcher_),
+          watcher_wait_(other.watcher_wait_),
+          watcher_close_(other.watcher_close_),
           update_watcher_(std::move(other.update_watcher_)),
           update_watcher_active_(other.update_watcher_active_.load()) {
         other.db_ = nullptr;
+        other.watcher_lib_ = nullptr;
+        other.core_watcher_ = nullptr;
         other.update_watcher_active_ = false;
     }
 
@@ -164,9 +198,17 @@ public:
             close();
             db_ = other.db_;
             path_ = std::move(other.path_);
+            ext_path_ = std::move(other.ext_path_);
+            watcher_backend_ = std::move(other.watcher_backend_);
+            watcher_lib_ = other.watcher_lib_;
+            core_watcher_ = other.core_watcher_;
+            watcher_wait_ = other.watcher_wait_;
+            watcher_close_ = other.watcher_close_;
             update_watcher_ = std::move(other.update_watcher_);
             update_watcher_active_ = other.update_watcher_active_.load();
             other.db_ = nullptr;
+            other.watcher_lib_ = nullptr;
+            other.core_watcher_ = nullptr;
             other.update_watcher_active_ = false;
         }
         return *this;
@@ -178,6 +220,14 @@ public:
     Queue queue(std::string_view name,
                 int64_t visibility_timeout_s = 300,
                 int64_t max_attempts = 3);
+
+    Outbox outbox(std::string_view name,
+                  std::function<void(const nlohmann::json&)> delivery,
+                  int64_t visibility_timeout_s = 60,
+                  int64_t max_attempts = 5,
+                  int64_t base_backoff_s = 5);
+
+    Transaction begin();
 
     Stream stream(std::string_view name);
 
@@ -203,13 +253,36 @@ public:
     // Internal: start/stop update watcher thread for stream subscriptions.
     void start_update_watcher();
     void stop_update_watcher();
-    void wait_update(std::chrono::milliseconds timeout);
+    bool wait_update(std::chrono::milliseconds timeout);
     void mark_updated();
 
 private:
+    void open_core_watcher();
+
+    void close_watcher_lib() {
+#if defined(_WIN32)
+        if (watcher_lib_) {
+            FreeLibrary(static_cast<HMODULE>(watcher_lib_));
+            watcher_lib_ = nullptr;
+        }
+#else
+        if (watcher_lib_) {
+            dlclose(watcher_lib_);
+            watcher_lib_ = nullptr;
+        }
+#endif
+        watcher_wait_ = nullptr;
+        watcher_close_ = nullptr;
+    }
+
     void close() {
         if (db_) {
             stop_update_watcher();
+            if (core_watcher_ && watcher_close_) {
+                watcher_close_(core_watcher_);
+                core_watcher_ = nullptr;
+            }
+            close_watcher_lib();
             honker_cpp_close(db_);
             db_ = nullptr;
         }
@@ -217,6 +290,12 @@ private:
 
     sqlite3* db_ = nullptr;
     std::string path_;
+    std::string ext_path_;
+    std::string watcher_backend_;
+    void* watcher_lib_ = nullptr;
+    void* core_watcher_ = nullptr;
+    watcher_wait_fn watcher_wait_ = nullptr;
+    watcher_close_fn watcher_close_ = nullptr;
     std::thread update_watcher_;
     std::atomic<bool> update_watcher_active_{false};
     std::mutex update_mtx_;
@@ -453,6 +532,66 @@ private:
 };
 
 // =====================================================================
+// Outbox
+// =====================================================================
+
+class Outbox {
+public:
+    int64_t enqueue(std::string_view payload_json,
+                    int64_t delay_sec = 0,
+                    int64_t priority = 0) {
+        return queue_.enqueue(payload_json, delay_sec, priority);
+    }
+
+    int64_t enqueue_tx(Transaction& tx, std::string_view payload_json,
+                       int64_t delay_sec = 0,
+                       int64_t priority = 0) {
+        return queue_.enqueue_tx(tx, payload_json, delay_sec, priority);
+    }
+
+    bool run_once(std::string_view worker_id) {
+        auto job = queue_.claim_one(worker_id);
+        if (!job.has_value()) return false;
+        try {
+            delivery_(nlohmann::json::parse(job->payload()));
+            if (!job->ack()) throw Error{"outbox ack failed"};
+        } catch (const std::exception& e) {
+            if (!job->retry(retry_delay(job->attempts()), e.what())) {
+                throw Error{"outbox retry failed"};
+            }
+        }
+        return true;
+    }
+
+    const std::string& name() const noexcept { return name_; }
+    Queue& queue() noexcept { return queue_; }
+    const Queue& queue() const noexcept { return queue_; }
+
+    Outbox(Queue queue, std::string name,
+           std::function<void(const nlohmann::json&)> delivery,
+           int64_t base_backoff_s)
+        : queue_(std::move(queue)), name_(std::move(name)),
+          delivery_(std::move(delivery)), base_backoff_s_(base_backoff_s) {
+        if (!delivery_) throw Error{"outbox delivery is empty"};
+    }
+
+private:
+    int64_t retry_delay(int64_t attempts) const {
+        if (base_backoff_s_ <= 0) return 0;
+        int64_t delay = base_backoff_s_;
+        for (int64_t i = 1; i < attempts && delay < (1LL << 60); ++i) {
+            delay *= 2;
+        }
+        return delay;
+    }
+
+    Queue queue_;
+    std::string name_;
+    std::function<void(const nlohmann::json&)> delivery_;
+    int64_t base_backoff_s_;
+};
+
+// =====================================================================
 // StreamEvent
 // =====================================================================
 
@@ -536,8 +675,8 @@ public:
                                   int64_t save_every_n = 1000,
                                   std::chrono::milliseconds poll_interval = std::chrono::milliseconds(100));
 
-    Stream(sqlite3* db, std::string name)
-        : db_(db), name_(std::move(name)) {}
+    Stream(Database* owner, sqlite3* db, std::string name)
+        : owner_(owner), db_(db), name_(std::move(name)) {}
 
 private:
     std::vector<StreamEvent> parse_events(char* rows) {
@@ -562,6 +701,7 @@ private:
         return out;
     }
 
+    Database*   owner_;
     sqlite3*    db_;
     std::string name_;
 };
@@ -572,10 +712,11 @@ private:
 
 class StreamSubscription {
 public:
-    StreamSubscription(sqlite3* db, std::string topic, std::string consumer,
+    StreamSubscription(Database* owner, sqlite3* db, std::string topic, std::string consumer,
                        int64_t save_every_n, std::chrono::milliseconds poll_interval)
-        : db_(db), topic_(std::move(topic)), consumer_(std::move(consumer)),
+        : owner_(owner), db_(db), topic_(std::move(topic)), consumer_(std::move(consumer)),
           save_every_n_(save_every_n), poll_interval_(poll_interval) {
+        owner_->start_update_watcher();
         last_offset_ = honker_cpp_stream_get_offset(db_, consumer_.c_str(), topic_.c_str());
     }
 
@@ -600,7 +741,7 @@ public:
             buffer_ = read_batch();
             idx_ = 0;
             if (buffer_.empty()) {
-                std::this_thread::sleep_for(poll_interval_);
+                owner_->wait_update(poll_interval_);
             }
         }
     }
@@ -642,6 +783,7 @@ private:
         pending_ = 0;
     }
 
+    Database*   owner_;
     sqlite3*    db_;
     std::string topic_;
     std::string consumer_;
@@ -956,7 +1098,7 @@ public:
                     "SELECT id, channel, payload FROM _honker_notifications "
                     "WHERE channel = ? AND id > ? ORDER BY id LIMIT 1";
                 sqlite3_stmt* stmt = nullptr;
-                if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                if (sqlite3_prepare_v2(db_->raw(), sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
                     sqlite3_bind_text(stmt, 1, c.c_str(), -1, SQLITE_STATIC);
                     sqlite3_bind_int64(stmt, 2, last_id_);
                 if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -970,20 +1112,23 @@ public:
                 sqlite3_finalize(stmt);
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            db_->wait_update(std::min(std::chrono::milliseconds(100), remaining));
         }
         return std::nullopt;
     }
 
 private:
     friend class Database;
-    Subscription(sqlite3* db, std::string channel)
+    Subscription(Database* db, std::string channel)
         : db_(db), channel_(std::move(channel)) {
+        db_->start_update_watcher();
         // Attach at current max id so we only see new notifications.
         const std::string c{channel_};
         const std::string sql = "SELECT COALESCE(MAX(id), 0) FROM _honker_notifications WHERE channel = ?";
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(db_->raw(), sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, c.c_str(), -1, SQLITE_STATIC);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
                 last_id_ = sqlite3_column_int64(stmt, 0);
@@ -992,7 +1137,7 @@ private:
         }
     }
 
-    sqlite3*    db_;
+    Database*   db_;
     std::string channel_;
     int64_t     last_id_ = 0;
 };
@@ -1007,8 +1152,26 @@ inline Queue Database::queue(std::string_view name,
     return Queue{db_, std::string{name}, visibility_timeout_s, max_attempts};
 }
 
+inline Transaction Database::begin() {
+    return Transaction{db_};
+}
+
+inline Outbox Database::outbox(std::string_view name,
+                               std::function<void(const nlohmann::json&)> delivery,
+                               int64_t visibility_timeout_s,
+                               int64_t max_attempts,
+                               int64_t base_backoff_s) {
+    const std::string n{name};
+    return Outbox{
+        queue("_outbox:" + n, visibility_timeout_s, max_attempts),
+        n,
+        std::move(delivery),
+        base_backoff_s,
+    };
+}
+
 inline Stream Database::stream(std::string_view name) {
-    return Stream{db_, std::string{name}};
+    return Stream{this, db_, std::string{name}};
 }
 
 inline Scheduler Database::scheduler() {
@@ -1061,12 +1224,46 @@ inline int64_t Database::notify(std::string_view channel, std::string_view paylo
 }
 
 inline Subscription Database::listen(std::string_view channel) {
-    return Subscription{db_, std::string{channel}};
+    return Subscription{this, std::string{channel}};
 }
 
 // =====================================================================
 // Database commit watcher (internal)
 // =====================================================================
+
+inline void Database::open_core_watcher() {
+    char err[1024] = {0};
+#if defined(_WIN32)
+    watcher_lib_ = static_cast<void*>(LoadLibraryA(ext_path_.c_str()));
+    if (!watcher_lib_) {
+        throw Error{"LoadLibrary failed for " + ext_path_};
+    }
+    auto open_fn = reinterpret_cast<watcher_open_fn>(
+        GetProcAddress(static_cast<HMODULE>(watcher_lib_), "honker_watcher_open"));
+    watcher_wait_ = reinterpret_cast<watcher_wait_fn>(
+        GetProcAddress(static_cast<HMODULE>(watcher_lib_), "honker_watcher_wait"));
+    watcher_close_ = reinterpret_cast<watcher_close_fn>(
+        GetProcAddress(static_cast<HMODULE>(watcher_lib_), "honker_watcher_close"));
+#else
+    watcher_lib_ = dlopen(ext_path_.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!watcher_lib_) {
+        const char* msg = dlerror();
+        throw Error{"dlopen failed for " + ext_path_ + ": " + (msg ? msg : "unknown error")};
+    }
+    auto open_fn = reinterpret_cast<watcher_open_fn>(dlsym(watcher_lib_, "honker_watcher_open"));
+    watcher_wait_ = reinterpret_cast<watcher_wait_fn>(dlsym(watcher_lib_, "honker_watcher_wait"));
+    watcher_close_ = reinterpret_cast<watcher_close_fn>(dlsym(watcher_lib_, "honker_watcher_close"));
+#endif
+    if (!open_fn || !watcher_wait_ || !watcher_close_) {
+        close_watcher_lib();
+        throw Error{"Honker extension missing core watcher ABI symbols"};
+    }
+    core_watcher_ = open_fn(path_.c_str(), watcher_backend_.c_str(), err, sizeof(err));
+    if (!core_watcher_) {
+        close_watcher_lib();
+        throw Error{std::string{"watcher_backend probe failed: "} + err};
+    }
+}
 
 // Platform-specific file identity for the dead-man's switch.
 #if defined(_WIN32)
@@ -1092,67 +1289,24 @@ inline bool file_identity(const std::string& path, uint64_t& dev, uint64_t& ino)
 inline void Database::start_update_watcher() {
     if (update_watcher_active_.exchange(true)) return;
     update_watcher_ = std::thread([this]() {
-        uint64_t init_dev = 0, init_ino = 0;
-        file_identity(path_, init_dev, init_ino);
-
-        // Seed initial data_version.
-        uint32_t last_version = 0;
-        auto query_dv = [this](uint32_t& out) -> bool {
-            sqlite3_stmt* stmt = nullptr;
-            if (sqlite3_prepare_v2(db_, "PRAGMA data_version", -1, &stmt, nullptr) != SQLITE_OK)
-                return false;
-            bool ok = false;
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                out = static_cast<uint32_t>(sqlite3_column_int(stmt, 0));
-                ok = true;
-            }
-            sqlite3_finalize(stmt);
-            return ok;
-        };
-        query_dv(last_version);
-
-        uint64_t tick = 0;
         while (update_watcher_active_.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-            // Path 1: PRAGMA data_version (fast path)
-            uint32_t version = 0;
-            if (query_dv(version)) {
-                if (version != last_version) {
-                    last_version = version;
-                    {
-                        std::lock_guard<std::mutex> lk(update_mtx_);
-                        update_changed_ = true;
-                    }
-                    update_cv_.notify_all();
-                }
-            } else {
-                // Transient failure — force conservative wake
+            int code = watcher_wait_(core_watcher_, 100);
+            if (code == 1) {
                 {
                     std::lock_guard<std::mutex> lk(update_mtx_);
                     update_changed_ = true;
                 }
                 update_cv_.notify_all();
-            }
-
-            // Path 2: stat identity check (dead-man's switch)
-            if (++tick % 100 == 0) {
-                uint64_t dev = 0, ino = 0;
-                if (!file_identity(path_, dev, ino)) {
-                    // File vanished — force wake, let caller recover
-                    {
-                        std::lock_guard<std::mutex> lk(update_mtx_);
-                        update_changed_ = true;
-                    }
-                    update_cv_.notify_all();
-                } else if (dev != init_dev || ino != init_ino) {
-                    throw std::runtime_error(
-                        "honker: database file replaced (dev=" +
-                        std::to_string(init_dev) + "->" + std::to_string(dev) +
-                        ", ino=" + std::to_string(init_ino) + "->" + std::to_string(ino) +
-                        ") at " + path_ + ". Restart required."
-                    );
+            } else if (code == 0) {
+                continue;
+            } else {
+                {
+                    std::lock_guard<std::mutex> lk(update_mtx_);
+                    update_changed_ = true;
+                    update_watcher_active_ = false;
                 }
+                update_cv_.notify_all();
+                return;
             }
         }
     });
@@ -1164,10 +1318,12 @@ inline void Database::stop_update_watcher() {
     if (update_watcher_.joinable()) update_watcher_.join();
 }
 
-inline void Database::wait_update(std::chrono::milliseconds timeout) {
+inline bool Database::wait_update(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(update_mtx_);
-    update_cv_.wait_for(lk, timeout, [this]() { return update_changed_ || !update_watcher_active_.load(); });
+    const bool woke = update_cv_.wait_for(lk, timeout, [this]() { return update_changed_ || !update_watcher_active_.load(); });
+    const bool changed = woke && update_changed_;
     update_changed_ = false;
+    return changed;
 }
 
 inline void Database::mark_updated() {
@@ -1183,9 +1339,9 @@ inline void Database::mark_updated() {
 // =====================================================================
 
 inline StreamSubscription Stream::subscribe(std::string_view consumer,
-                                             int64_t save_every_n,
-                                             std::chrono::milliseconds poll_interval) {
-    return StreamSubscription{db_, name_, std::string{consumer}, save_every_n, poll_interval};
+                                            int64_t save_every_n,
+                                            std::chrono::milliseconds poll_interval) {
+    return StreamSubscription{owner_, db_, name_, std::string{consumer}, save_every_n, poll_interval};
 }
 
 } // namespace honker

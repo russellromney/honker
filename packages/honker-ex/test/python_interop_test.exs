@@ -42,13 +42,24 @@ defmodule HonkerPythonInteropTest do
       |> Enum.reject(&is_nil/1)
 
     Enum.find(candidates, fn python ->
-      {_, status} =
-        System.cmd(python, ["-c", probe],
-          env: [{"PYTHONPATH", python_path()}],
-          stderr_to_stdout: true
-        )
+      executable? =
+        if Path.type(python) == :absolute do
+          File.exists?(python)
+        else
+          System.find_executable(python) != nil
+        end
 
-      status == 0
+      if executable? do
+        {_, status} =
+          System.cmd(python, ["-c", probe],
+            env: [{"PYTHONPATH", python_path()}],
+            stderr_to_stdout: true
+          )
+
+        status == 0
+      else
+        false
+      end
     end)
   end
 

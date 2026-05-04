@@ -1,11 +1,14 @@
 package honker
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 // findExtension locates libhonker.{dylib,so} under the repo's
@@ -88,6 +91,143 @@ func TestEnqueueClaimAck(t *testing.T) {
 	}
 	if next != nil {
 		t.Fatalf("expected empty queue after ack, got job %d", next.ID)
+	}
+}
+
+func TestOutboxTransactionalEnqueueAndDelivery(t *testing.T) {
+	extPath := findExtension(t)
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+
+	db, err := Open(dbPath, extPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	delivered := make(chan int, 1)
+	outbox := db.Outbox("webhook", func(ctx context.Context, payload json.RawMessage) error {
+		var row map[string]int
+		if err := json.Unmarshal(payload, &row); err != nil {
+			return err
+		}
+		delivered <- row["order"]
+		return nil
+	}, OutboxOptions{})
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin rollback tx: %v", err)
+	}
+	if _, err := outbox.EnqueueTx(tx, map[string]any{"order": 1}, EnqueueOptions{}); err != nil {
+		t.Fatalf("outbox enqueue rollback tx: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if job, err := outbox.Queue().ClaimOne("w"); err != nil || job != nil {
+		t.Fatalf("rollback outbox job = (%v, %v), want empty", job, err)
+	}
+
+	tx, err = db.Begin()
+	if err != nil {
+		t.Fatalf("begin commit tx: %v", err)
+	}
+	if _, err := outbox.EnqueueTx(tx, map[string]any{"order": 2}, EnqueueOptions{}); err != nil {
+		t.Fatalf("outbox enqueue commit tx: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- outbox.RunWorker(ctx, "w") }()
+
+	select {
+	case got := <-delivered:
+		if got != 2 {
+			t.Fatalf("delivered order = %d, want 2", got)
+		}
+		cancel()
+	case err := <-errCh:
+		t.Fatalf("worker exited early: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for outbox delivery")
+	}
+}
+
+func TestWatcherBackendOptionsDetectCommits(t *testing.T) {
+	extPath := findExtension(t)
+	tests := []string{"", "poll", "polling", "kernel", "kernel-watcher", "shm", "shm-fast-path"}
+	for _, backend := range tests {
+		t.Run(backend, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "t.db")
+			db, err := OpenWithOptions(dbPath, extPath, OpenOptions{WatcherBackend: backend})
+			if err != nil {
+				if strings.Contains(err.Error(), "requires the") ||
+					strings.Contains(err.Error(), "-shm unavailable") ||
+					strings.Contains(err.Error(), "unsupported SQLite layout") {
+					t.Skipf("watcher backend %q unavailable in this build/environment: %v", backend, err)
+				}
+				t.Fatalf("open: %v", err)
+			}
+			defer db.Close()
+
+			subID, updateCh := db.updates.subscribe()
+			defer db.updates.unsubscribe(subID)
+
+			writer, err := Open(dbPath, extPath)
+			if err != nil {
+				t.Fatalf("open writer: %v", err)
+			}
+			defer writer.Close()
+			if _, err := writer.Notify("backend", map[string]any{"backend": backend}); err != nil {
+				t.Fatalf("notify: %v", err)
+			}
+
+			select {
+			case <-updateCh:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("watcher backend %q did not observe commit", backend)
+			}
+		})
+	}
+}
+
+func TestWatcherBackendOptionsAcceptPollingAliases(t *testing.T) {
+	tests := []string{"", "poll", "polling"}
+	for _, backend := range tests {
+		t.Run(backend, func(t *testing.T) {
+			_, err := OpenWithOptions(
+				filepath.Join(t.TempDir(), "t.db"),
+				"/missing/libhonker_ext.so",
+				OpenOptions{WatcherBackend: backend},
+			)
+			if err == nil {
+				t.Fatal("expected missing extension error after watcher backend validation")
+			}
+			if strings.Contains(err.Error(), "watcher backend") {
+				t.Fatalf("polling alias should pass watcher validation, got %v", err)
+			}
+		})
+	}
+}
+
+func TestWatcherBackendOptionsRejectUnknownNames(t *testing.T) {
+	extPath := findExtension(t)
+	tests := []string{"bogus", "KERNEL", " polling "}
+	for _, backend := range tests {
+		t.Run(backend, func(t *testing.T) {
+			_, err := OpenWithOptions(
+				filepath.Join(t.TempDir(), "t.db"),
+				extPath,
+				OpenOptions{WatcherBackend: backend},
+			)
+			if err == nil || !strings.Contains(err.Error(), "unknown watcher backend") {
+				t.Fatalf("expected unknown watcher backend error, got %v", err)
+			}
+		})
 	}
 }
 

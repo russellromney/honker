@@ -175,17 +175,17 @@ jobs:
           fi
           uv pip install --python "$VENV_PY" pytest pytest-asyncio pytest-xdist maturin
       - name: Build honker-extension
-        run: cargo build --release -p honker-extension
+        run: cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
       - name: Build PyO3 _honker_native (maturin develop)
         working-directory: packages/honker
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             . ../../.venv/Scripts/activate
-            maturin develop --release --features bundled-sqlite
+            maturin develop --release --features bundled-sqlite,kernel-watcher,shm-fast-path
           else
             . ../../.venv/bin/activate
-            maturin develop --release
+            maturin develop --release --features kernel-watcher,shm-fast-path
           fi
       - name: Run pytest
         shell: bash
@@ -225,7 +225,7 @@ jobs:
         with:
           dotnet-version: "10.0.x"
       - name: Build honker-extension
-        run: cargo build --release -p honker-extension
+        run: cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
       - name: Run .NET binding tests
         run: dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj --verbosity normal
       - name: Pack NuGet smoke test
@@ -280,16 +280,16 @@ jobs:
           cd packages/honker
           . "../../$ACTIVATE"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            maturin develop --release --features bundled-sqlite
+            maturin develop --release --features bundled-sqlite,kernel-watcher,shm-fast-path
           else
-            maturin develop --release
+            maturin develop --release --features kernel-watcher,shm-fast-path
           fi
       - name: Build .node binary
         working-directory: packages/honker-node
         shell: bash
         run: |
           npm install
-          npx napi build --platform --release
+          npx napi build --platform --release --features kernel-watcher,shm-fast-path
       - name: Test (basic — node only)
         working-directory: packages/honker-node
         shell: bash
@@ -314,6 +314,10 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/cross_lang_queue_stream_notify.js
+      - name: Test watcher backend proofs
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/watcher_backends.js test/watcher_backends_e2e.js test/watcher_backends_queue_e2e.js
 
   binding-smoke:
     name: binding smoke · ubuntu aggregate
@@ -352,7 +356,7 @@ jobs:
       - name: Install C++ binding deps
         run: sudo apt-get install -y libsqlite3-dev nlohmann-json3-dev
       - name: Build honker-extension
-        run: cargo build --release -p honker-extension
+        run: cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
       - name: Build Python binding
         shell: bash
         run: |
@@ -360,11 +364,11 @@ jobs:
           . .venv/bin/activate
           uv pip install pytest pytest-xdist maturin
           cd packages/honker
-          maturin develop --release
+          maturin develop --release --features kernel-watcher,shm-fast-path
       - name: Rust wrapper
         env:
           HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
-        run: cargo test --manifest-path packages/honker-rs/Cargo.toml
+        run: cargo test --manifest-path packages/honker-rs/Cargo.toml --features kernel-watcher,shm-fast-path
       - name: Go
         working-directory: packages/honker-go
         env:
@@ -392,8 +396,11 @@ jobs:
           bun test
       - name: Ruby
         working-directory: packages/honker-ruby
+        env:
+          HONKER_REQUIRE_RUBY_EXTENSION_LOADING: "1"
         run: |
           bundle install
+          bundle exec ruby -e 'require "sqlite3"; db = SQLite3::Database.new(":memory:"); abort "sqlite3 gem lacks loadable-extension support" unless db.respond_to?(:enable_load_extension) && db.respond_to?(:load_extension)'
           bundle exec ruby -Ilib spec/honker_spec.rb
           bundle exec ruby -Ilib spec/smoke_spec.rb
           bundle exec ruby -Ilib spec/parity_spec.rb

@@ -75,9 +75,10 @@ class Listener:
         if you need durability past that window, use `db.stream(...)`.
     """
 
-    def __init__(self, db, channel: str):
+    def __init__(self, db, channel: str, fallback_poll_s: Optional[float] = 15.0):
         self.db = db
         self.channel = channel
+        self.fallback_poll_s = fallback_poll_s
         self._buffer: deque = deque()
         # Subscribe BEFORE the MAX(id) snapshot so a publish landing in
         # the window between the two is captured in our mpsc channel
@@ -109,10 +110,13 @@ class Listener:
                     self._last_seen = int(r["id"])
                     self._buffer.append(Notification(r))
                 continue
-            # No new rows — wait on WAL. 15s paranoia timeout.
+            # No new rows — wait on WAL. The fallback timeout is only a
+            # paranoia path; backend-isolation tests pass
+            # fallback_poll_s=None so polling cannot hide a broken
+            # experimental watcher backend.
             try:
                 await asyncio.wait_for(
-                    self._updates.__anext__(), timeout=15.0
+                    self._updates.__anext__(), timeout=self.fallback_poll_s
                 )
             except asyncio.TimeoutError:
                 pass
@@ -330,13 +334,14 @@ class Queue:
     def claim(
         self,
         worker_id: str,
-        idle_poll_s: float = 5.0,
+        idle_poll_s: Optional[float] = 5.0,
     ) -> AsyncIterator[Job]:
         """Async iterator over this queue. Yields one claimed Job per
         `__anext__` via a single-row `claim_batch(worker_id, 1)` — one
         write transaction per job. Wakes on database update from any process;
         `idle_poll_s` is a paranoia fallback for environments where the
-        stat watcher can't fire.
+        update watcher can't fire. Pass `None` to disable that fallback
+        in backend-isolation tests.
 
         For batched claims, call `claim_batch(worker_id, n)` directly.
         """
@@ -968,11 +973,14 @@ class Database:
     def transaction(self):
         return self._inner.transaction()
 
-    def listen(self, channel: str):
-        return Listener(self, channel)
+    def listen(self, channel: str, fallback_poll_s: Optional[float] = 15.0):
+        return Listener(self, channel, fallback_poll_s=fallback_poll_s)
 
     def update_events(self):
         return self._inner.update_events()
+
+    def close(self):
+        return self._inner.close()
 
     def query(self, sql: str, params=None):
         return self._inner.query(sql, params)
@@ -1216,8 +1224,8 @@ def open(
       * `"shm"` — mmap `-shm` fast path (experimental, requires the
         `shm-fast-path` Cargo feature)
 
-    Wheels not built with the experimental features silently fall back
-    to polling when one is requested.
+    Wheels not built with the requested experimental feature raise a
+    `ValueError` instead of silently falling back to polling.
     """
     return Database(_core_open(
         path, max_readers=max_readers, watcher_backend=watcher_backend
@@ -1236,10 +1244,12 @@ class _WorkerQueueIter:
          wake when the row actually becomes claimable, even if no new
          commit lands then.
       3. `idle_poll_s` timeout: paranoia fallback if the update watcher
-         can't fire (sandboxed FS, odd container mount).
+         can't fire (sandboxed FS, odd container mount). Set
+         `idle_poll_s=None` to disable this fallback in backend-isolation
+         tests.
     """
 
-    def __init__(self, queue: Queue, worker_id: str, idle_poll_s: float):
+    def __init__(self, queue: Queue, worker_id: str, idle_poll_s: Optional[float]):
         self.queue = queue
         self.worker_id = worker_id
         self.idle_poll_s = idle_poll_s
@@ -1276,9 +1286,11 @@ class _WorkerQueueIter:
                 timeout_s = self.idle_poll_s
                 next_claim_at = self.queue._next_claim_at()
                 if next_claim_at > 0:
-                    timeout_s = min(
-                        timeout_s,
-                        max(0.0, next_claim_at - time.time()),
+                    until_deadline = max(0.0, next_claim_at - time.time())
+                    timeout_s = (
+                        until_deadline
+                        if timeout_s is None
+                        else min(timeout_s, until_deadline)
                     )
                 try:
                     await asyncio.wait_for(

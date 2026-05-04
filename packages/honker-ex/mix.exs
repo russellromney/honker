@@ -4,7 +4,7 @@ defmodule Honker.MixProject do
   def project do
     [
       app: :honker,
-      version: "0.1.1",
+      version: "0.1.2",
       elixir: "~> 1.17",
       description:
         "Durable queues, streams, pub/sub, and scheduler on SQLite. " <>
@@ -29,7 +29,7 @@ defmodule Honker.MixProject do
 
   defp package do
     [
-      licenses: ["Apache-2.0"],
+      licenses: ["MIT", "Apache-2.0"],
       links: %{
         "GitHub" => "https://github.com/russellromney/honker",
         "Docs" => "https://honker.dev"

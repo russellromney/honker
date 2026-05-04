@@ -1,17 +1,8 @@
 """Tests for Phase Mantle: schedule lifecycle (pause/resume/list/update)
-and queue cancel/get_job.
+and queue cancel/get_job. Same scenarios are mirrored in every binding's
+own test file."""
 
-Each method is exercised via the Python binding, plus a cross-process
-test confirming a paused schedule actually stops emitting and a
-resumed one starts again.
-"""
-
-import asyncio
 import json
-import os
-import subprocess
-import sys
-import tempfile
 import time
 
 import pytest
@@ -186,68 +177,3 @@ def test_queue_cancel_processing_invalidates_ack(tmp_path):
     assert q.cancel(jid) is True
     # Worker's ack now returns False — same shape as expired claim.
     assert job.ack() is False
-
-
-# ---------- cross-process: pause observed in another process ----------
-
-
-_WRITER_SCRIPT = r"""
-import sys, json, time
-sys.path.insert(0, {packages!r})
-import honker
-from honker import Scheduler, every_s
-
-db = honker.open({db_path!r})
-sched = Scheduler(db)
-print("READY", flush=True)
-sys.stdin.readline()  # parent gates the action
-
-sched.add(name="from-writer", queue="emails", schedule=every_s(60))
-sched.pause("from-writer")
-print("PAUSED", flush=True)
-sys.stdin.readline()  # parent waits, then signals continue
-"""
-
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
-
-
-def test_cross_process_pause_observed(tmp_path):
-    db_path = str(tmp_path / "cross.db")
-    # Initialize the schema once so both processes see the same tables.
-    honker.open(db_path)
-
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            _WRITER_SCRIPT.format(packages=PACKAGES_ROOT, db_path=db_path),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        ready = proc.stdout.readline().strip()
-        assert ready == "READY"
-        proc.stdin.write("\n")
-        proc.stdin.flush()
-        paused = proc.stdout.readline().strip()
-        assert paused == "PAUSED"
-
-        # In our process, the schedule should be visible AND paused.
-        db2 = honker.open(db_path)
-        sched2 = Scheduler(db2)
-        rows = sched2.list()
-        match = [r for r in rows if r["name"] == "from-writer"]
-        assert match, f"writer's schedule should be visible: {rows}"
-        assert match[0]["enabled"] is False, "should be paused from writer"
-    finally:
-        try:
-            proc.stdin.write("\n")
-            proc.stdin.flush()
-        except Exception:
-            pass
-        proc.wait(timeout=5)

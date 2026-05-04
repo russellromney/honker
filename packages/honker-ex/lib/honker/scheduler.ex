@@ -24,7 +24,6 @@ defmodule Honker.Scheduler do
   @lock_ttl_s 60
   @heartbeat_ms 20_000
   @standby_poll_ms 5_000
-  @update_poll_ms 50
 
   @doc """
   Register a recurring scheduled task. Idempotent by `:name`.
@@ -302,24 +301,14 @@ defmodule Honker.Scheduler do
     end
   end
 
-  defp data_version(%Database{conn: conn}) do
-    case Honker.query_first(conn, "PRAGMA data_version", []) do
-      {:ok, [n]} when is_integer(n) -> n
-      {:ok, [n]} -> n
-      _ -> 0
-    end
-  end
-
   defp wait_update_or_timeout(_db, ms, _stop_fun) when ms <= 0, do: :ok
 
   defp wait_update_or_timeout(db, ms, stop_fun) do
     deadline = System.monotonic_time(:millisecond) + ms
-    last_version = data_version(db)
-    last_local = Honker.update_snapshot(db.conn)
-    do_wait_update_or_timeout(db, deadline, last_version, last_local, stop_fun)
+    do_wait_update_or_timeout(db, deadline, stop_fun)
   end
 
-  defp do_wait_update_or_timeout(db, deadline, last_version, last_local, stop_fun) do
+  defp do_wait_update_or_timeout(db, deadline, stop_fun) do
     now = System.monotonic_time(:millisecond)
 
     cond do
@@ -330,16 +319,11 @@ defmodule Honker.Scheduler do
         :ok
 
       true ->
-        slice = min(@update_poll_ms, deadline - now)
-        Process.sleep(slice)
+        slice = min(100, deadline - now)
 
-        version = data_version(db)
-        local = Honker.update_snapshot(db.conn)
-
-        cond do
-          version != last_version -> :ok
-          local != last_local -> :ok
-          true -> do_wait_update_or_timeout(db, deadline, last_version, last_local, stop_fun)
+        case Honker.wait_for_update(db, slice) do
+          :changed -> :ok
+          _ -> do_wait_update_or_timeout(db, deadline, stop_fun)
         end
     end
   end

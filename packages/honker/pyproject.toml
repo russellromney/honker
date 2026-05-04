@@ -4,16 +4,17 @@ build-backend = "maturin"
 
 [project]
 name = "honker"
-version = "0.2.2"
+version = "0.2.3"
 description = "Durable queues, streams, pub/sub, and cron scheduler on SQLite. One file, zero servers."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Russell Romney" }]
 keywords = ["sqlite", "queue", "pubsub", "stream", "outbox", "notify", "listen"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: Apache Software License",
+  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",

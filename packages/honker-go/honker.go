@@ -23,6 +23,58 @@
 // honker-extension crate.
 package honker
 
+/*
+#cgo darwin LDFLAGS: -ldl
+#cgo linux LDFLAGS: -ldl
+#include <stdint.h>
+#include <stdlib.h>
+#include <dlfcn.h>
+
+typedef void* (*honker_watcher_open_fn)(const char*, const char*, char*, uintptr_t);
+typedef int (*honker_watcher_wait_fn)(void*, uint64_t);
+typedef void (*honker_watcher_close_fn)(void*);
+
+static void* honker_dl_open(const char* path, char* err, uintptr_t err_len) {
+	void* lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (lib != NULL) return lib;
+	const char* msg = dlerror();
+	if (err != NULL && err_len > 0) {
+		uintptr_t i = 0;
+		if (msg != NULL) {
+			for (; i + 1 < err_len && msg[i] != '\0'; i++) err[i] = msg[i];
+		}
+		err[i] = '\0';
+	}
+	return NULL;
+}
+
+static void* honker_dl_sym(void* lib, const char* name, char* err, uintptr_t err_len) {
+	dlerror();
+	void* sym = dlsym(lib, name);
+	const char* msg = dlerror();
+	if (msg == NULL) return sym;
+	if (err != NULL && err_len > 0) {
+		uintptr_t i = 0;
+		for (; i + 1 < err_len && msg[i] != '\0'; i++) err[i] = msg[i];
+		err[i] = '\0';
+	}
+	return NULL;
+}
+
+static void* honker_call_watcher_open(void* fn, const char* path, const char* backend, char* err, uintptr_t err_len) {
+	return ((honker_watcher_open_fn)fn)(path, backend, err, err_len);
+}
+
+static int honker_call_watcher_wait(void* fn, void* watcher, uint64_t timeout_ms) {
+	return ((honker_watcher_wait_fn)fn)(watcher, timeout_ms);
+}
+
+static void honker_call_watcher_close(void* fn, void* watcher) {
+	((honker_watcher_close_fn)fn)(watcher);
+}
+*/
+import "C"
+
 import (
 	"context"
 	"database/sql"
@@ -35,6 +87,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
@@ -46,6 +99,15 @@ type Database struct {
 	db      *sql.DB
 	dbPath  string
 	updates *updateWatcher
+}
+
+// OpenOptions configures Database.Open behavior.
+type OpenOptions struct {
+	// WatcherBackend selects the update-detection backend implemented
+	// by honker-core through the loaded Honker extension. Accepted
+	// aliases match the core contract exactly: "", "poll", "polling",
+	// "kernel", "kernel-watcher", "shm", and "shm-fast-path".
+	WatcherBackend string
 }
 
 // driverCounter generates a unique sql.Register name per Open() so
@@ -98,6 +160,11 @@ PRAGMA wal_autocheckpoint = 10000;
 // extensionPath, applies the default PRAGMAs on every connection,
 // and bootstraps the Honker schema. Caller must Close() when done.
 func Open(path string, extensionPath string) (*Database, error) {
+	return OpenWithOptions(path, extensionPath, OpenOptions{})
+}
+
+// OpenWithOptions is like Open, with binding-level configuration.
+func OpenWithOptions(path string, extensionPath string, opts OpenOptions) (*Database, error) {
 	n := driverCounter.Add(1)
 	driverName := fmt.Sprintf("sqlite3_honker_%d", n)
 	entryPoint := deriveEntryPoint(extensionPath)
@@ -131,7 +198,7 @@ func Open(path string, extensionPath string) (*Database, error) {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 	d := &Database{db: sqlDB, dbPath: path}
-	d.updates, err = newUpdateWatcher(driverName, path)
+	d.updates, err = newUpdateWatcher(extensionPath, path, opts.WatcherBackend)
 	if err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("update watcher: %w", err)
@@ -168,32 +235,38 @@ func fileIdentity(path string) (uint64, uint64, error) {
 }
 
 type updateWatcher struct {
-	mu     sync.Mutex
-	subs   map[uint64]chan struct{}
-	nextID uint64
-	done   chan struct{}
-	wg     sync.WaitGroup
-	db     *sql.DB
-	dbPath string
+	mu       sync.Mutex
+	subs     map[uint64]chan struct{}
+	nextID   uint64
+	done     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	lib      unsafe.Pointer
+	watcher  unsafe.Pointer
+	waitFn   unsafe.Pointer
+	closeFn  unsafe.Pointer
 }
 
-func newUpdateWatcher(driverName string, dbPath string) (*updateWatcher, error) {
-	db, err := sql.Open(driverName, dbPath)
+func newUpdateWatcher(extensionPath string, dbPath string, backend string) (*updateWatcher, error) {
+	lib, openFn, waitFn, closeFn, err := loadCoreWatcherABI(extensionPath)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
-		db.Close()
+	watcher, err := openCoreWatcher(openFn, dbPath, backend)
+	if err != nil {
+		C.dlclose(lib)
 		return nil, err
 	}
 	w := &updateWatcher{
-		subs:   make(map[uint64]chan struct{}),
-		done:   make(chan struct{}),
-		db:     db,
-		dbPath: dbPath,
+		subs:    make(map[uint64]chan struct{}),
+		done:    make(chan struct{}),
+		lib:     lib,
+		watcher: watcher,
+		waitFn:  waitFn,
+		closeFn: closeFn,
 	}
 	w.wg.Add(1)
-	go w.poll()
+	go w.waitLoop()
 	return w, nil
 }
 
@@ -214,57 +287,39 @@ func (w *updateWatcher) unsubscribe(id uint64) {
 }
 
 func (w *updateWatcher) stop() {
-	close(w.done)
+	w.stopOnce.Do(func() {
+		close(w.done)
+	})
 	w.wg.Wait()
-	w.db.Close()
+	if w.watcher != nil {
+		C.honker_call_watcher_close(w.closeFn, w.watcher)
+		w.watcher = nil
+	}
+	if w.lib != nil {
+		C.dlclose(w.lib)
+		w.lib = nil
+	}
 }
 
-func (w *updateWatcher) poll() {
+func (w *updateWatcher) waitLoop() {
 	defer w.wg.Done()
 
-	initDev, initIno, _ := fileIdentity(w.dbPath)
-	var lastVersion uint32
-	// Seed initial data_version.
-	_ = w.db.QueryRow("PRAGMA data_version").Scan(&lastVersion)
-
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	var tick uint64
 	for {
 		select {
 		case <-w.done:
 			return
-		case <-ticker.C:
+		default:
 		}
 
-		// Path 1: PRAGMA data_version (fast path)
-		var version uint32
-		if err := w.db.QueryRow("PRAGMA data_version").Scan(&version); err != nil {
-			// Transient failure (connection pool will retry next tick).
-			// Force one conservative wake.
+		code := C.honker_call_watcher_wait(w.waitFn, w.watcher, 100)
+		switch code {
+		case 1:
 			w.fire()
+		case 0:
 			continue
-		}
-		if version != lastVersion {
-			lastVersion = version
+		default:
 			w.fire()
-		}
-
-		// Path 2: stat identity check (dead-man's switch)
-		tick++
-		if tick%100 == 0 {
-			dev, ino, err := fileIdentity(w.dbPath)
-			if err != nil {
-				// File vanished — force wake, let caller recover.
-				w.fire()
-				continue
-			}
-			if dev != initDev || ino != initIno {
-				panic(fmt.Sprintf(
-					"honker: database file replaced: expected (dev=%d, ino=%d), found (dev=%d, ino=%d) at %s. Restart required.",
-					initDev, initIno, dev, ino, w.dbPath,
-				))
-			}
+			return
 		}
 	}
 }
@@ -278,6 +333,76 @@ func (w *updateWatcher) fire() {
 		default:
 		}
 	}
+}
+
+func loadCoreWatcherABI(extensionPath string) (lib unsafe.Pointer, openFn unsafe.Pointer, waitFn unsafe.Pointer, closeFn unsafe.Pointer, err error) {
+	cPath := C.CString(extensionPath)
+	defer C.free(unsafe.Pointer(cPath))
+	errBuf := make([]byte, 1024)
+	lib = C.honker_dl_open(cPath, (*C.char)(unsafe.Pointer(&errBuf[0])), C.uintptr_t(len(errBuf)))
+	if lib == nil {
+		return nil, nil, nil, nil, fmt.Errorf("dlopen honker extension: %s", cErrorString(errBuf))
+	}
+	defer func() {
+		if err != nil && lib != nil {
+			C.dlclose(lib)
+		}
+	}()
+
+	openFn, err = lookupCoreWatcherSymbol(lib, "honker_watcher_open")
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	waitFn, err = lookupCoreWatcherSymbol(lib, "honker_watcher_wait")
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	closeFn, err = lookupCoreWatcherSymbol(lib, "honker_watcher_close")
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return lib, openFn, waitFn, closeFn, nil
+}
+
+func lookupCoreWatcherSymbol(lib unsafe.Pointer, name string) (unsafe.Pointer, error) {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	errBuf := make([]byte, 1024)
+	sym := C.honker_dl_sym(lib, cName, (*C.char)(unsafe.Pointer(&errBuf[0])), C.uintptr_t(len(errBuf)))
+	if sym == nil {
+		return nil, fmt.Errorf("honker extension missing %s: %s", name, cErrorString(errBuf))
+	}
+	return sym, nil
+}
+
+func openCoreWatcher(openFn unsafe.Pointer, dbPath string, backend string) (unsafe.Pointer, error) {
+	cPath := C.CString(dbPath)
+	defer C.free(unsafe.Pointer(cPath))
+	cBackend := C.CString(backend)
+	defer C.free(unsafe.Pointer(cBackend))
+	errBuf := make([]byte, 1024)
+	watcher := C.honker_call_watcher_open(
+		openFn,
+		cPath,
+		cBackend,
+		(*C.char)(unsafe.Pointer(&errBuf[0])),
+		C.uintptr_t(len(errBuf)),
+	)
+	if watcher == nil {
+		return nil, fmt.Errorf("%s", cErrorString(errBuf))
+	}
+	return watcher, nil
+}
+
+func cErrorString(buf []byte) string {
+	n := 0
+	for n < len(buf) && buf[n] != 0 {
+		n++
+	}
+	if n == 0 {
+		return "unknown error"
+	}
+	return string(buf[:n])
 }
 
 // -------------------------------------------------------------------
@@ -349,6 +474,109 @@ func (d *Database) Queue(name string, opts QueueOptions) *Queue {
 		opts.MaxAttempts = 3
 	}
 	return &Queue{db: d, name: name, opts: opts}
+}
+
+// OutboxOptions configures transactional side-effect delivery.
+type OutboxOptions struct {
+	VisibilityTimeoutS int
+	MaxAttempts        int
+	BaseBackoffS       int64
+}
+
+// OutboxDelivery is called for each claimed outbox payload. Return an
+// error to retry with exponential backoff.
+type OutboxDelivery func(context.Context, json.RawMessage) error
+
+// Outbox is transactional side-effect delivery built on a reserved
+// Honker queue named "_outbox:<name>".
+type Outbox struct {
+	queue        *Queue
+	name         string
+	delivery     OutboxDelivery
+	baseBackoffS int64
+}
+
+// Outbox returns a handle to a named transactional outbox.
+func (d *Database) Outbox(name string, delivery OutboxDelivery, opts OutboxOptions) *Outbox {
+	if opts.VisibilityTimeoutS == 0 {
+		opts.VisibilityTimeoutS = 60
+	}
+	if opts.MaxAttempts == 0 {
+		opts.MaxAttempts = 5
+	}
+	if opts.BaseBackoffS == 0 {
+		opts.BaseBackoffS = 5
+	}
+	return &Outbox{
+		queue: d.Queue("_outbox:"+name, QueueOptions{
+			VisibilityTimeoutS: opts.VisibilityTimeoutS,
+			MaxAttempts:        opts.MaxAttempts,
+		}),
+		name:         name,
+		delivery:     delivery,
+		baseBackoffS: opts.BaseBackoffS,
+	}
+}
+
+func (o *Outbox) Name() string { return o.name }
+
+func (o *Outbox) Queue() *Queue { return o.queue }
+
+func (o *Outbox) Enqueue(payload any, opts EnqueueOptions) (int64, error) {
+	return o.queue.Enqueue(payload, opts)
+}
+
+func (o *Outbox) EnqueueTx(tx *Transaction, payload any, opts EnqueueOptions) (int64, error) {
+	return o.queue.EnqueueTx(tx, payload, opts)
+}
+
+// RunWorker claims outbox jobs until ctx is cancelled.
+func (o *Outbox) RunWorker(ctx context.Context, workerID string) error {
+	if o.delivery == nil {
+		return fmt.Errorf("outbox delivery is nil")
+	}
+	waker := o.queue.ClaimWaker()
+	defer waker.Close()
+	for {
+		job, err := waker.Next(ctx, workerID)
+		if err != nil {
+			return err
+		}
+		if job == nil {
+			return ctx.Err()
+		}
+		if err := o.delivery(ctx, json.RawMessage(job.Payload)); err != nil {
+			ok, retryErr := job.Retry(o.retryDelay(job.Attempts), err.Error())
+			if retryErr != nil {
+				return retryErr
+			}
+			if !ok {
+				return fmt.Errorf("outbox retry failed for job %d", job.ID)
+			}
+			continue
+		}
+		ok, err := job.Ack()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("outbox ack failed for job %d", job.ID)
+		}
+	}
+}
+
+func (o *Outbox) retryDelay(attempts int64) int64 {
+	if o.baseBackoffS <= 0 {
+		return 0
+	}
+	if attempts <= 1 {
+		return o.baseBackoffS
+	}
+	delay := o.baseBackoffS
+	for i := int64(1); i < attempts && delay < 1<<60; i++ {
+		delay *= 2
+	}
+	return delay
 }
 
 // QueueOptions holds per-queue defaults.
@@ -846,8 +1074,8 @@ type Scheduler struct {
 
 // ScheduledTask is a periodic task registration.
 type ScheduledTask struct {
-	Name     string
-	Queue    string
+	Name  string
+	Queue string
 	// Schedule is the canonical recurring schedule expression.
 	// It accepts:
 	//   - 5-field cron

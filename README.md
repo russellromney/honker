@@ -4,13 +4,19 @@
 
 `honker` is a SQLite extension + language bindings that add Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with built-in durable pub/sub, task queue, and event streams, without client polling or a daemon/broker. Any language that can `SELECT load_extension('honker')` gets the same features.
 
-honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, and .NET / C#. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
+honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, .NET / C#, and JVM / Kotlin packages. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
 
 See [Binding support](BINDINGS.md) for the current truth table: which
 bindings have typed queue/stream/listen/scheduler APIs, which ones have
 packaged-install proof, and what CI actually proves.
 
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
+
+Some bindings expose experimental watcher backends, such as mmap of
+`<db>-shm` in WAL mode or kernel file events. AUTO backend modes stay
+conservative and use `PRAGMA data_version`. The stable semantics stay
+the same: wake on committed updates, ignore rolled-back work, and
+re-read SQLite state after every wake.
 
 > Experimental. API may change.
 
@@ -61,8 +67,11 @@ Today:
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval
 - SQLite loadable extension so any SQLite client can read the same tables
-- Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir, .NET / C#
-- Works inside an ORM-owned SQLite connection. SQLAlchemy, SQLModel, Django, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto ([guide](https://honker.dev/guides/orm/))
+- Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir, .NET / C#,
+  Java/JVM, and Kotlin
+- Works inside an ORM-owned SQLite connection. SQLAlchemy, SQLModel,
+  Django, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto, Hibernate,
+  jOOQ, MyBatis, Exposed ([guide](https://honker.dev/guides/orm/))
 
 Deliberately not built: task pipelines/chains/groups/chords, multi-writer replication, workflow orchestration with DAGs.
 
@@ -176,6 +185,105 @@ Current cross-language direct proof runs on every platform:
 Python -> Node wake through Node `updateEvents()`, and Node -> Python
 listener wake through Python `listen()`.
 
+### Java / JVM
+
+```java
+import dev.honker.*;
+
+try (Database db = Honker.open("app.db")) {
+    Queue emails = db.queue("emails");
+    long id = emails.enqueue("{\"to\":\"alice@example.com\"}");
+
+    Job job = emails.claimOne("worker-1").orElseThrow();
+    sendEmail(job.payloadJson());
+    job.ack();
+
+    emails.saveResult(id, "{\"ok\":true}");
+    emails.waitResultAsync(id, WaitOptions.timeout(Duration.ofSeconds(10)))
+        .thenAccept(this::handleResult);
+}
+```
+
+The JVM binding keeps JSON-library choice out of the core jar. Bring
+Jackson, Gson, Moshi, JSON-B, or a hand-written mapper by implementing
+`JsonCodec<T>`:
+
+```java
+JsonCodec<Email> emailJson = new JsonCodec<>() {
+    public String encode(Email value) {
+        try {
+            return mapper.writeValueAsString(value);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public Email decode(String json) {
+        try {
+            return mapper.readValue(json, Email.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+};
+
+try (Database db = Honker.open("app.db")) {
+    TypedQueue<Email> emails = db.queue("emails").typed(emailJson);
+    emails.enqueue(new Email("alice@example.com"));
+
+    TypedJob<Email> job = emails.claimOne("worker-1").orElseThrow();
+    sendEmail(job.payload());
+    job.ack();
+}
+```
+
+Java handles are `AutoCloseable`, and worker/listener/subscriber
+options accept executors so application frameworks can own thread
+pools and shutdown.
+
+### Kotlin
+
+```kotlin
+honker("app.db").use { db ->
+    val emails = db.queue("emails")
+    emails.enqueueJson("""{"to":"alice@example.com"}""")
+
+    emails.asFlow("worker-1").collect { job ->
+        sendEmail(job.payloadJson())
+        job.ack()
+    }
+}
+```
+
+Kotlin adds coroutine-friendly wrappers without duplicating the JVM
+runtime:
+
+```kotlin
+db.listen("orders")
+    .asFlow()
+    .collect { notification -> println(notification.payloadJson) }
+
+db.stream("user-events")
+    .asFlow()
+    .collect { event -> push(event.payloadJson) }
+
+val result = task.enqueueJson().await(Duration.ofSeconds(10))
+```
+
+Typed helpers use the same `JsonCodec<T>` seam:
+
+```kotlin
+val emailJson = object : JsonCodec<Email> {
+    override fun encode(value: Email) = mapper.writeValueAsString(value)
+    override fun decode(json: String) = mapper.readValue(json, Email::class.java)
+}
+
+db.queue("emails").enqueue(Email("alice@example.com"), emailJson)
+val job = db.queue("emails").asFlow("worker-1").first()
+sendEmail(job.decode(emailJson))
+job.ack()
+```
+
 ### SQLite extension (any SQLite 3.9+ client)
 
 ```sql
@@ -214,7 +322,9 @@ The extension shares `_honker_live`, `_honker_dead`, and `_honker_notifications`
 
 ## Design
 
-This repo includes the `honker` SQLite loadable extension and bindings for Python, Node, Rust, Go, Ruby, Bun, Elixir, C++, and .NET / C#.
+This repo includes the `honker` SQLite loadable extension and bindings
+for Python, Node, Rust, Go, Ruby, Bun, Elixir, C++, .NET / C#,
+Java/JVM, and Kotlin.
 
 For most applications, [SQLite alone is sufficient](https://www.epicweb.dev/why-you-should-probably-be-using-sqlite). There are already great libraries that leverage SQLite for durable messaging. [Huey](https://github.com/coleifer/huey) is the one honker draws the most from. This project is inspired by it and seeks to do something similar across languages and frameworks by moving package logic into a SQLite extension.
 
@@ -258,7 +368,11 @@ Idle cost is a single `PRAGMA data_version` query per millisecond per database. 
 
 ### Wake backend (advanced)
 
-Polling is the default. It's the only backend shipped in published wheels. Two opt-in alternatives exist behind Cargo features for source builds: kernel filesystem events, and an mmap read of SQLite's WAL index. Both can give lower idle CPU or faster wakes, but they can also miss wakes or fire wakes you didn't ask for. All three watch for the database file being swapped under them; if that happens they shut down loudly — every subscriber sees an error from `update_events()` instead of hanging.
+Polling is the default. It's the only backend shipped in published wheels. Two opt-in alternatives exist behind Cargo features for source builds: kernel filesystem events, and an mmap read of SQLite's WAL index. Builds without the requested feature reject `kernel` / `shm` explicitly instead of silently substituting polling. Both experimental backends can give lower idle CPU or faster wakes, but they can also miss wakes or fire wakes you didn't ask for. All three watch for the database file being swapped under them; if that happens they shut down loudly — every subscriber sees an error from `update_events()` instead of hanging.
+
+Binding support is tracked in [BINDINGS.md](BINDINGS.md). All maintained
+bindings route blocking wake waits through the same `honker-core`
+watcher, either in-process or through the shared extension ABI.
 
 One thing changed for everyone, no opt-in needed: the polling backend now keeps its connection through transient `SQLITE_BUSY` / `SQLITE_LOCKED` errors during commits. Before, it would drop and reconnect, which could miss wakes on non-WAL journal modes (DELETE / TRUNCATE / PERSIST). Now it just retries the next tick.
 
@@ -340,7 +454,7 @@ async def create_order(order: dict):
 
 SSE endpoints are ~30 lines of `async def stream(...): yield f"data: ...\n\n"` over `db.listen(channel)` or `db.stream(name).subscribe(...)`. For Django/Flask, run the worker as a dedicated CLI process (same pattern as Celery/RQ).
 
-### Using an ORM (SQLAlchemy, Django, Drizzle, ActiveRecord, Ecto, …)
+### Using an ORM (SQLAlchemy, Django, Drizzle, Hibernate, jOOQ, Exposed, …)
 
 Load `libhonker_ext` on your ORM's connection and call the SQL functions inside the ORM's own transaction. The enqueue commits atomically with your business write.
 
@@ -358,7 +472,53 @@ with Session(engine) as s, s.begin():
               {"q": "emails", "p": '{"to":"alice@example.com"}'})
 ```
 
-Workers run as a separate process using `honker.open("app.db")`. The commit watcher wakes on commits from any connection to the file. See [Using with an ORM](https://honker.dev/guides/orm/) for Django, SQLModel, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto, a typed-payload `TypedQueue[T]` wrapper pattern for SQLModel/Pydantic, and the Prisma caveat.
+For JVM ORMs, use the ORM-owned JDBC connection inside the ORM
+transaction. Configure sqlite-jdbc with extension loading enabled, load
+the extension once per connection, then enqueue with SQL where the
+business write happens.
+
+```java
+// Hibernate / JPA
+entityManager.unwrap(Session.class).doWork(conn -> {
+    try (PreparedStatement stmt = conn.prepareStatement(
+        "SELECT honker_enqueue(?, ?, NULL, NULL, 0, 3, NULL)"
+    )) {
+        stmt.setString(1, "emails");
+        stmt.setString(2, "{\"to\":\"alice@example.com\"}");
+        stmt.executeQuery().close();
+    }
+});
+```
+
+```kotlin
+// jOOQ
+ctx.transaction { cfg ->
+    val tx = DSL.using(cfg)
+    tx.insertInto(ORDERS).set(ORDERS.USER_ID, 42).execute()
+    tx.fetchValue(
+        "SELECT honker_enqueue(?, ?, NULL, NULL, 0, 3, NULL)",
+        "emails",
+        """{"to":"alice@example.com"}""",
+    )
+}
+```
+
+```kotlin
+// Exposed
+transaction {
+    Orders.insert { it[userId] = 42 }
+    exec(
+        "SELECT honker_enqueue('emails', '{\"to\":\"alice@example.com\"}', NULL, NULL, 0, 3, NULL)"
+    )
+}
+```
+
+Workers run as a separate process using `honker.open("app.db")` or
+`Honker.open("app.db")`. The commit watcher wakes on commits from any
+connection to the file. See [Using with an ORM](https://honker.dev/guides/orm/)
+for Django, SQLModel, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto,
+a typed-payload `TypedQueue[T]` wrapper pattern for SQLModel/Pydantic,
+and the Prisma caveat.
 
 ## Performance
 
@@ -381,6 +541,8 @@ packages/
   honker-ex/              # Elixir binding
   honker-cpp/             # C++ binding
   honker-dotnet/          # .NET / C# binding
+  honker-jvm/             # JVM / Java-compatible binding
+  honker-kotlin/          # Kotlin convenience wrapper
 tests/                    # integration tests (cross-package)
 bench/                    # benches
 site/                     # honker.dev (Astro)                [git submodule]
@@ -395,6 +557,9 @@ ecosystems. `site/` remains a separate docs-site submodule.
 ```bash
 make test                   # default: rust + python + node (fast, ~10s)
 make test-python-slow       # soak + real-time cron tests (~2 min)
+make test-jvm               # JVM binding tests
+make test-kotlin            # JVM + Kotlin wrapper tests
+make test-jvm-consumer       # clean Maven consumer + packaged native proof
 make test-all               # everything including slow marks
 
 make build                  # PyO3 maturin develop + loadable extension

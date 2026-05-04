@@ -25,11 +25,7 @@ fn core_err<E: std::fmt::Display>(e: E) -> PyErr {
 fn parse_watcher_backend(backend: Option<String>) -> PyResult<WatcherConfig> {
     honker_core::WatcherBackend::parse(backend.as_deref())
         .map(|backend| WatcherConfig { backend })
-        .map_err(|other| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown watcher_backend {other:?}; valid: None, 'polling', 'kernel', 'shm'"
-            ))
-        })
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 // ---------------------------------------------------------------------

@@ -35,11 +35,22 @@ import textwrap
 from typing import Optional
 
 import pytest
+import honker
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
 
 BACKENDS = [None, "kernel", "shm"]
+
+
+def _ensure_backend_available(db_path: str, backend: Optional[str]) -> None:
+    try:
+        db = honker.open(db_path, watcher_backend=backend)
+        db.queue("shared")
+    except ValueError as exc:
+        if backend in {"kernel", "shm"} and "requires the" in str(exc):
+            pytest.skip(str(exc))
+        raise
 
 
 def _backend_arg(backend: Optional[str]) -> str:
@@ -71,12 +82,12 @@ _WORKER_SCRIPT = textwrap.dedent(
 
         processed = []
         # Wake-driven iterator — uses update_events() under the hood,
-        # which is the surface the watcher backends drive. idle_poll_s
-        # is the paranoia fallback (5 s default); we exit on a tighter
-        # 2 s asyncio.wait_for so a broken backend surfaces as
-        # "processed 0 jobs," not as "fell back to idle_poll_s and
-        # passed anyway."
-        iterator = q.claim(worker_id).__aiter__()
+        # which is the surface the watcher backends drive. Disable the
+        # iterator's internal idle-poll fallback; the outer
+        # asyncio.wait_for is the test timeout, not a production wake
+        # source. A broken backend surfaces as "processed 0 jobs," not
+        # as "fell back to idle_poll_s and passed anyway."
+        iterator = q.claim(worker_id, idle_poll_s=None).__aiter__()
         while True:
             try:
                 job = await asyncio.wait_for(iterator.__anext__(), timeout=idle_exit_s)
@@ -188,8 +199,7 @@ def test_queue_1writer_1worker(tmp_path, backend):
     # Bootstrap the db file (creates honker schema, WAL, the works) so
     # the worker's first claim() doesn't have to race the schema
     # bootstrap.
-    import honker
-    honker.open(db_path).queue("shared")  # forces bootstrap_honker_schema
+    _ensure_backend_available(db_path, backend)  # forces bootstrap_honker_schema
 
     n = 25
 
@@ -218,8 +228,7 @@ def test_queue_1writer_1worker(tmp_path, backend):
 def test_queue_1writer_many_workers_no_double_claim(tmp_path, backend):
     db_path = str(tmp_path / "q.db")
 
-    import honker
-    honker.open(db_path).queue("shared")
+    _ensure_backend_available(db_path, backend)
 
     n = 60
     num_workers = 3
@@ -269,8 +278,7 @@ def test_queue_1writer_many_workers_no_double_claim(tmp_path, backend):
 def test_queue_many_writers_1worker_drains(tmp_path, backend):
     db_path = str(tmp_path / "q.db")
 
-    import honker
-    honker.open(db_path).queue("shared")
+    _ensure_backend_available(db_path, backend)
 
     num_writers = 3
     per_writer = 15

@@ -8,9 +8,9 @@
 // consumer here is a little more low-level than Python's `db.listen()`,
 // which bundles both.
 //
-// Wheels built without the experimental Cargo features silently fall
-// back to polling for `"kernel"` and `"shm"` — the suite still runs
-// them so a regression in the fallback path also surfaces here.
+// Builds without the experimental Cargo features reject explicit
+// `"kernel"` / `"shm"` requests. That keeps this suite honest: when an
+// experimental backend case runs, fallback polling cannot make it pass.
 
 'use strict';
 
@@ -29,6 +29,18 @@ function spawnNode(script) {
   return spawn(process.execPath, ['-e', script], {
     stdio: ['pipe', 'pipe', 'inherit'],
   });
+}
+
+function openOrSkipBackend(t, open, dbPath, backend) {
+  try {
+    return open(dbPath, undefined, backend);
+  } catch (err) {
+    if ((backend === 'kernel' || backend === 'shm') && /requires the/.test(String(err))) {
+      t.skip(String(err));
+      return null;
+    }
+    throw err;
+  }
 }
 
 function waitForExit(proc) {
@@ -104,6 +116,12 @@ function createLineReader(stream) {
 }
 
 const REQUIRE_HONKER = path.resolve(__dirname, '..');
+const BACKENDS = process.platform === 'win32'
+  // Windows ReadDirectoryChangesW does not currently deliver the
+  // cross-process WAL writes this notify/listen proof needs. The queue
+  // topology tests still cover Windows kernel wake behavior separately.
+  ? [null, 'shm']
+  : [null, 'kernel', 'shm'];
 
 // Inline script for the writer subprocess. Reads commands from stdin
 // to gate when commits start, so the parent can subscribe to updateEvents()
@@ -181,14 +199,15 @@ function tmpdb() {
 // notifications. Listener must observe every one through updateEvents().
 // ----------------------------------------------------------------------
 
-for (const backend of [null, 'kernel', 'shm']) {
+for (const backend of BACKENDS) {
   const label = backend === null ? 'polling' : backend;
 
-  test(`watcherBackend=${label} cross-process: listener detects every commit`, async () => {
+  test(`watcherBackend=${label} cross-process: listener detects every commit`, async (t) => {
     const { path: dbPath, open, cleanup } = tmpdb();
     let proc;
     try {
-      const db = open(dbPath, undefined, backend);
+      const db = openOrSkipBackend(t, open, dbPath, backend);
+      if (!db) return;
       // Pre-warm the WAL so the kernel-watcher can attach a per-file
       // -wal watch at startup.
       const tx = db.transaction();
@@ -208,13 +227,14 @@ for (const backend of [null, 'kernel', 'shm']) {
       const ev = db.updateEvents();
       // One tick so the napi-rs blocking task is actually scheduled.
       await new Promise((r) => setTimeout(r, 20));
+      const drain = drainNotifications({
+        db, ev, channel, sinceId: 0, n, timeoutMs: n * spacingMs + 2000,
+      });
+      await new Promise((r) => setTimeout(r, 20));
 
       proc.stdin.write('go\n');
 
-      const timeoutMs = n * spacingMs + 2000;
-      const { seen } = await drainNotifications({
-        db, ev, channel, sinceId: 0, n, timeoutMs,
-      });
+      const { seen } = await drain;
       ev.close();
 
       const payloads = seen.map((p) => parseInt(p, 10)).sort((a, b) => a - b);
@@ -229,11 +249,12 @@ for (const backend of [null, 'kernel', 'shm']) {
     }
   });
 
-  test(`watcherBackend=${label} cross-process: burst load — no missed notifications`, async () => {
+  test(`watcherBackend=${label} cross-process: burst load — no missed notifications`, async (t) => {
     const { path: dbPath, open, cleanup } = tmpdb();
     let proc;
     try {
-      const db = open(dbPath, undefined, backend);
+      const db = openOrSkipBackend(t, open, dbPath, backend);
+      if (!db) return;
       const tx = db.transaction();
       tx.execute('CREATE TABLE _warm (i INTEGER)');
       tx.commit();
@@ -248,15 +269,17 @@ for (const backend of [null, 'kernel', 'shm']) {
 
       const ev = db.updateEvents();
       await new Promise((r) => setTimeout(r, 20));
+      const drain = drainNotifications({
+        db, ev, channel, sinceId: 0, n, timeoutMs: 3000,
+      });
+      await new Promise((r) => setTimeout(r, 20));
 
       proc.stdin.write('go\n');
       // Wait for writer to finish committing. Persisted-row check
       // below is the real assertion; this just bounds the wait.
       await nextLine((l) => l === 'DONE', 5000);
 
-      const { seen } = await drainNotifications({
-        db, ev, channel, sinceId: 0, n, timeoutMs: 3000,
-      });
+      const { seen } = await drain;
       ev.close();
 
       const persisted = db.query(
@@ -277,11 +300,12 @@ for (const backend of [null, 'kernel', 'shm']) {
     }
   });
 
-  test(`watcherBackend=${label} cross-process: listener survives writer SIGKILL`, async () => {
+  test(`watcherBackend=${label} cross-process: listener survives writer SIGKILL`, async (t) => {
     const { path: dbPath, open, cleanup } = tmpdb();
     let proc1; let proc2;
     try {
-      const db = open(dbPath, undefined, backend);
+      const db = openOrSkipBackend(t, open, dbPath, backend);
+      if (!db) return;
       const tx = db.transaction();
       tx.execute('CREATE TABLE _warm (i INTEGER)');
       tx.commit();
@@ -298,14 +322,16 @@ for (const backend of [null, 'kernel', 'shm']) {
       proc1 = spawnNode(writerScript({ dbPath, channel, n: 5, spacingMs: 20 }));
       const nextLine1 = createLineReader(proc1.stdout);
       await nextLine1((l) => l === 'READY', 5000);
+      const drain1 = drainNotifications({
+        db, ev, channel, sinceId: 0, n: 5, timeoutMs: 2000,
+      });
+      await new Promise((r) => setTimeout(r, 20));
       proc1.stdin.write('go\n');
 
       // Drain batch 1 BEFORE killing — proves writer #1's notifications
       // were delivered and gives us the last-seen id for batch 2's
       // SELECT cursor.
-      const drained1 = await drainNotifications({
-        db, ev, channel, sinceId: 0, n: 5, timeoutMs: 2000,
-      });
+      const drained1 = await drain1;
       assert.equal(
         drained1.seen.length, 5,
         `backend=${label}: writer #1 delivery saw ${drained1.seen.length} of 5`,
@@ -320,11 +346,13 @@ for (const backend of [null, 'kernel', 'shm']) {
       proc2 = spawnNode(writerScript({ dbPath, channel, n: 5, spacingMs: 20 }));
       const nextLine2 = createLineReader(proc2.stdout);
       await nextLine2((l) => l === 'READY', 5000);
-      proc2.stdin.write('go\n');
-
-      const drained2 = await drainNotifications({
+      const drain2 = drainNotifications({
         db, ev, channel, sinceId: drained1.lastId, n: 5, timeoutMs: 2500,
       });
+      await new Promise((r) => setTimeout(r, 20));
+      proc2.stdin.write('go\n');
+
+      const drained2 = await drain2;
       ev.close();
 
       assert.equal(
@@ -356,7 +384,7 @@ for (const backend of [null, 'kernel', 'shm']) {
 //         must reject within ~2s rather than hang on a dead channel.
 // ----------------------------------------------------------------------
 
-for (const backend of [null, 'kernel', 'shm']) {
+for (const backend of BACKENDS) {
   const label = backend === null ? 'polling' : backend;
 
   test(`watcherBackend=${label} updateEvents().next() rejects when watcher dies`, {
@@ -364,12 +392,15 @@ for (const backend of [null, 'kernel', 'shm']) {
     // so the dead-man's switch trigger is unreachable. Skip on Windows
     // (matches the Rust + Python tests of the same scenario).
     skip: process.platform === 'win32' ? 'rename-over-open denied on Windows' : false,
-  }, async () => {
+  }, async (t) => {
     const fs = require('node:fs');
-    const { path: dbPath, cleanup } = createTempDb('honker-watcher-death-', honker.open.bind(honker));
-    const open = (...args) => honker.open(...args);
+    const { path: dbPath, open, cleanup } = createTempDb(
+      'honker-node-watchers-e2e-',
+      honker.open.bind(honker),
+    );
     try {
-      const db = open(dbPath, undefined, backend);
+      const db = openOrSkipBackend(t, open, dbPath, backend);
+      if (!db) return;
       // Pre-warm so the file actually exists with a journal.
       const tx = db.transaction();
       tx.execute('CREATE TABLE _warm (i INTEGER)');
@@ -382,28 +413,21 @@ for (const backend of [null, 'kernel', 'shm']) {
       fs.writeFileSync(replacement, '');
       fs.renameSync(replacement, dbPath);
 
-      // File replacement can produce a few "conservative wake" undefined
-      // ticks (transient I/O errors before the dead-man's identity
-      // check fires). Drain wakes until next() rejects, bounded by a
-      // total deadline. Death surfaces as a rejected promise; clean
-      // wakes resolve.
-      const deadline = Date.now() + 3000;
+      // Identity check fires every 100ms; 3s is generous. Replacement
+      // may first produce an ordinary wake, so keep awaiting until the
+      // death guard disconnects the subscription.
       let raised = false;
-      let lastErr = null;
-      while (Date.now() < deadline) {
-        const remaining = Math.max(50, deadline - Date.now());
-        try {
-          await Promise.race([
-            ev.next(),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('TIMEOUT')), remaining),
-            ),
-          ]);
-        } catch (e) {
-          if (String(e.message || '').includes('TIMEOUT')) break;
-          lastErr = e;
+      const deadline = Date.now() + 3000;
+      let result = null;
+      while (Date.now() < deadline && !raised) {
+        const remaining = Math.max(0, deadline - Date.now());
+        result = await Promise.race([
+          ev.next().then(() => null, (e) => e),
+          new Promise((r) => setTimeout(() => r('TIMEOUT'), remaining)),
+        ]);
+        if (result === 'TIMEOUT') break;
+        if (result instanceof Error || (typeof result === 'object' && result !== null && result.message)) {
           raised = true;
-          break;
         }
       }
       assert.ok(
@@ -412,9 +436,9 @@ for (const backend of [null, 'kernel', 'shm']) {
           `db file replacement; deadline reached without watcher death`,
       );
       assert.match(
-        String(lastErr.message || ''),
+        String((result && result.message) || ''),
         /watcher|replaced|dead|disconnect|closed channel/i,
-        `backend=${label}: expected watcher-died-style error, got ${lastErr.message}`,
+        `backend=${label}: expected watcher-died-style error, got ${result && result.message}`,
       );
     } finally {
       cleanup();

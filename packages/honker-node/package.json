@@ -1,11 +1,13 @@
 {
   "name": "@russellthehippo/honker-node",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Node binding for honker — durable queues, streams, pub/sub, and scheduler on SQLite.",
   "main": "wrapper.js",
   "types": "wrapper.d.ts",
   "homepage": "https://honker.dev",
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "index.js",
     "wrapper.js",
@@ -14,7 +16,7 @@
     "index.d.ts",
     "README.md",
     "LICENSE",
-    "*.node"
+    "LICENSE-*"
   ],
   "napi": {
     "binaryName": "honker",
@@ -31,14 +33,20 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node --test test/basic.js test/parity.test.js test/cross_lang_python_to_node.js test/cross_lang_node_to_python.js test/cross_lang_supporting.js test/watcher_backends.js test/watcher_backends_e2e.js test/phase_mantle.js"
+    "test": "node --test test/basic.js test/parity.test.js test/cross_lang_python_to_node.js test/cross_lang_node_to_python.js test/cross_lang_supporting.js test/watcher_backends.js test/watcher_backends_e2e.js test/watcher_backends_queue_e2e.js test/phase_mantle.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0"
   },
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/russellromney/honker"
+  },
+  "optionalDependencies": {
+    "@russellthehippo/honker-node-darwin-arm64": "0.3.3",
+    "@russellthehippo/honker-node-darwin-x64": "0.3.3",
+    "@russellthehippo/honker-node-linux-x64-gnu": "0.3.3",
+    "@russellthehippo/honker-node-linux-arm64-gnu": "0.3.3"
   }
 }
