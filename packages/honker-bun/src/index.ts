@@ -12,6 +12,7 @@
  */
 
 import { Database as BunDB } from "bun:sqlite";
+import { dlopen, FFIType } from "bun:ffi";
 
 // ---------------------------------------------------------------------
 // SQLite lib shim (Bun's bundled SQLite lacks loadable-extension support)
@@ -81,12 +82,24 @@ export interface EnqueueOptions {
   tx?: Transaction;
 }
 
+export interface OutboxOptions {
+  visibilityTimeoutS?: number;
+  maxAttempts?: number;
+  baseBackoffS?: number;
+}
+
 export interface NotifyOptions {
   tx?: Transaction;
 }
 
 export interface OpenOptions {
   sqliteLibPath?: string;
+  /**
+   * Update-detection backend implemented by honker-core through the
+   * loaded Honker extension. Explicit kernel/shm requests fail loudly
+   * when the extension was not built with the matching feature.
+   */
+  watcherBackend?: string | null;
 }
 
 export interface ScheduledTask {
@@ -139,15 +152,62 @@ interface RawStreamEvent {
   created_at: number;
 }
 
-function firstValue(row: Record<string, unknown> | null | undefined): unknown {
-  if (!row) return null;
-  const keys = Object.keys(row);
-  return keys.length === 0 ? null : row[keys[0]];
+class CoreWatcher {
+  private readonly lib: ReturnType<typeof dlopen>;
+  private readonly handle: unknown;
+  private closed = false;
+
+  constructor(dbPath: string, extensionPath: string, watcherBackend?: string | null) {
+    this.lib = dlopen(extensionPath, {
+      honker_watcher_open: {
+        args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64],
+        returns: FFIType.ptr,
+      },
+      honker_watcher_wait: {
+        args: [FFIType.ptr, FFIType.u64],
+        returns: FFIType.i32,
+      },
+      honker_watcher_close: {
+        args: [FFIType.ptr],
+        returns: FFIType.void,
+      },
+    });
+    const error = Buffer.alloc(1024);
+    const dbPathBytes = cString(dbPath);
+    const backendBytes = cString(watcherBackend ?? "");
+    this.handle = this.lib.symbols.honker_watcher_open(
+      dbPathBytes,
+      backendBytes,
+      error,
+      BigInt(error.length),
+    );
+    if (!this.handle) {
+      const nul = error.indexOf(0);
+      const end = nul < 0 ? error.length : nul;
+      throw new Error(error.subarray(0, end).toString("utf8") || "unknown watcher error");
+    }
+  }
+
+  wait(timeoutMs: number): boolean {
+    if (this.closed) return false;
+    const code = this.lib.symbols.honker_watcher_wait(
+      this.handle,
+      BigInt(Math.max(0, Math.ceil(timeoutMs))),
+    );
+    if (code === 1) return true;
+    if (code === 0) return false;
+    throw new Error("honker update watcher closed or died");
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.lib.symbols.honker_watcher_close(this.handle);
+  }
 }
 
-function readDataVersion(raw: BunDB): number {
-  const row = raw.query<Record<string, unknown>, []>("PRAGMA data_version").get();
-  return Number(firstValue(row) ?? 0);
+function cString(value: string): Buffer {
+  return Buffer.from(`${value}\0`, "utf8");
 }
 
 // ---------------------------------------------------------------------
@@ -160,8 +220,16 @@ function readDataVersion(raw: BunDB): number {
  */
 export class Database {
   private _eventSeq = 0;
+  private _watcher: CoreWatcher;
 
-  constructor(public readonly raw: BunDB) {}
+  constructor(
+    public readonly raw: BunDB,
+    dbPath: string,
+    extensionPath: string,
+    watcherBackend?: string | null,
+  ) {
+    this._watcher = new CoreWatcher(dbPath, extensionPath, watcherBackend);
+  }
 
   /** Get a handle to a named queue. */
   queue(name: string, opts: QueueOptions = {}): Queue {
@@ -169,6 +237,15 @@ export class Database {
       visibilityTimeoutS: opts.visibilityTimeoutS ?? 300,
       maxAttempts: opts.maxAttempts ?? 3,
     });
+  }
+
+  /** Transactional side-effect delivery built on a reserved queue. */
+  outbox(
+    name: string,
+    delivery: (payload: unknown, job: Job) => unknown | Promise<unknown>,
+    opts: OutboxOptions = {},
+  ): Outbox {
+    return new Outbox(this, name, delivery, opts);
   }
 
   /** Get a handle to a named stream. */
@@ -282,6 +359,7 @@ export class Database {
 
   /** Close the underlying database. */
   close(): void {
+    this._watcher.close();
     this.raw.close();
   }
 
@@ -291,6 +369,10 @@ export class Database {
 
   _eventSnapshot(): number {
     return this._eventSeq;
+  }
+
+  _waitForCoreUpdate(timeoutMs: number): boolean {
+    return this._watcher.wait(timeoutMs);
   }
 }
 
@@ -302,10 +384,11 @@ export function open(
 ): Database {
   ensureCustomSqlite(opts.sqliteLibPath);
   const raw = new BunDB(path, { create: true, readwrite: true });
+  raw.exec("PRAGMA busy_timeout = 5000;");
   raw.loadExtension(extensionPath);
   raw.exec(DEFAULT_PRAGMAS);
   raw.exec("SELECT honker_bootstrap()");
-  return new Database(raw);
+  return new Database(raw, path, extensionPath, opts.watcherBackend);
 }
 
 // ---------------------------------------------------------------------
@@ -385,27 +468,24 @@ export class Transaction {
 
 export class UpdateEvents {
   private closed = false;
-  private lastDataVersion: number;
   private lastEventSeq: number;
 
   constructor(
     private readonly db: Database,
-    private readonly pollMs: number = 50,
+    private readonly pollMs: number = 100,
   ) {
-    this.lastDataVersion = readDataVersion(db.raw);
     this.lastEventSeq = db._eventSnapshot();
   }
 
   async next(signal?: AbortSignal): Promise<void> {
     while (!this.closed && !signal?.aborted) {
-      const dataVersion = readDataVersion(this.db.raw);
       const eventSeq = this.db._eventSnapshot();
-      if (dataVersion !== this.lastDataVersion || eventSeq !== this.lastEventSeq) {
-        this.lastDataVersion = dataVersion;
+      if (eventSeq !== this.lastEventSeq) {
         this.lastEventSeq = eventSeq;
         return;
       }
-      await sleep(this.pollMs, signal);
+      if (this.db._waitForCoreUpdate(this.pollMs)) return;
+      await sleep(0, signal);
     }
   }
 
@@ -506,10 +586,75 @@ export class Queue {
    * Returns a ClaimWaker that waits on DB updates or the next claim
    * deadline, with a fallback poll.
    */
-  claimWaker(opts: { idlePollS?: number; pollMs?: number } = {}): ClaimWaker {
+  claimWaker(opts: { idlePollS?: number | null; pollMs?: number | null } = {}): ClaimWaker {
     const idlePollMs =
-      opts.idlePollS != null ? Math.max(0, opts.idlePollS * 1000) : opts.pollMs ?? 5000;
+      opts.idlePollS === null
+        ? null
+        : opts.idlePollS != null
+          ? Math.max(0, opts.idlePollS * 1000)
+          : opts.pollMs ?? 5000;
     return new ClaimWaker(this, idlePollMs);
+  }
+}
+
+export class Outbox {
+  readonly queue: Queue;
+  readonly maxAttempts: number;
+  readonly baseBackoffS: number;
+
+  constructor(
+    private readonly db: Database,
+    public readonly name: string,
+    private readonly delivery: (payload: unknown, job: Job) => unknown | Promise<unknown>,
+    opts: OutboxOptions = {},
+  ) {
+    if (typeof delivery !== "function") {
+      throw new TypeError("delivery must be a function");
+    }
+    this.maxAttempts = opts.maxAttempts ?? 5;
+    this.baseBackoffS = opts.baseBackoffS ?? 5;
+    this.queue = db.queue(`_outbox:${name}`, {
+      visibilityTimeoutS: opts.visibilityTimeoutS ?? 60,
+      maxAttempts: this.maxAttempts,
+    });
+  }
+
+  enqueue(payload: unknown, opts: EnqueueOptions = {}): number {
+    return this.queue.enqueue(payload, opts);
+  }
+
+  enqueueTx(tx: Transaction, payload: unknown, opts: EnqueueOptions = {}): number {
+    return this.queue.enqueue(payload, { ...opts, tx });
+  }
+
+  async runWorker(
+    workerId: string,
+    opts: { idlePollS?: number | null; pollMs?: number | null; signal?: AbortSignal } = {},
+  ): Promise<void> {
+    const waker = this.queue.claimWaker(opts);
+    try {
+      while (!opts.signal?.aborted) {
+        const job = await waker.next(workerId, { signal: opts.signal });
+        if (!job) return;
+        try {
+          await this.delivery(job.payload, job);
+          if (!job.ack()) throw new Error(`outbox ack failed for job ${job.id}`);
+        } catch (err) {
+          if (opts.signal?.aborted) throw err;
+          const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
+          if (!job.retry(this.retryDelay(job.attempts), message)) {
+            throw new Error(`outbox retry failed for job ${job.id}: ${message}`);
+          }
+        }
+      }
+    } finally {
+      waker.close();
+    }
+  }
+
+  private retryDelay(attempts: number): number {
+    if (this.baseBackoffS <= 0) return 0;
+    return Math.ceil(this.baseBackoffS * (2 ** Math.max(0, attempts - 1)));
   }
 }
 
@@ -593,7 +738,7 @@ export class ClaimWaker {
 
   constructor(
     private readonly queue: Queue,
-    private readonly idlePollMs: number,
+    private readonly idlePollMs: number | null,
   ) {
     this.updates = queue.dbHandle().updateEvents();
   }
@@ -617,7 +762,8 @@ export class ClaimWaker {
       const nextClaimAt = this.queue.nextClaimAt();
       let waitMs = this.idlePollMs;
       if (nextClaimAt && nextClaimAt > 0) {
-        waitMs = Math.min(waitMs, Math.max(0, nextClaimAt * 1000 - Date.now()));
+        const untilNext = Math.max(0, nextClaimAt * 1000 - Date.now());
+        waitMs = waitMs == null ? untilNext : Math.min(waitMs, untilNext);
       }
       await waitForUpdateOrTimeout(this.updates, opts.signal, waitMs);
     }
@@ -734,8 +880,8 @@ export class Stream {
     opts: {
       saveEveryN?: number;
       saveEveryS?: number;
-      idlePollS?: number;
-      pollMs?: number;
+      idlePollS?: number | null;
+      pollMs?: number | null;
       signal?: AbortSignal;
     } = {},
   ): AsyncIterableIterator<StreamEvent> {
@@ -744,7 +890,11 @@ export class Stream {
       consumer,
       opts.saveEveryN ?? 1000,
       opts.saveEveryS ?? 1,
-      opts.idlePollS != null ? Math.max(0, opts.idlePollS * 1000) : opts.pollMs ?? 5000,
+      opts.idlePollS === null
+        ? null
+        : opts.idlePollS != null
+          ? Math.max(0, opts.idlePollS * 1000)
+          : opts.pollMs ?? 5000,
       opts.signal,
     );
   }
@@ -769,7 +919,7 @@ async function* subscribeImpl(
   consumer: string,
   saveEveryN: number,
   saveEveryS: number,
-  idlePollMs: number,
+  idlePollMs: number | null,
   signal?: AbortSignal,
 ): AsyncIterableIterator<StreamEvent> {
   let lastOffset = stream.getOffset(consumer);
@@ -816,7 +966,7 @@ async function* listenImpl(
   db: Database,
   channel: string,
   signal: AbortSignal | undefined,
-  idlePollMs: number,
+  idlePollMs: number | null,
 ): AsyncIterableIterator<Notification> {
   const startId = db.raw
     .query<{ v: number }, []>(
@@ -1069,8 +1219,12 @@ export class Lock {
 async function waitForUpdateOrTimeout(
   updates: UpdateEvents,
   signal: AbortSignal | undefined,
-  timeoutMs: number,
+  timeoutMs: number | null,
 ): Promise<void> {
+  if (timeoutMs == null) {
+    await updates.next(signal);
+    return;
+  }
   const ms = Math.max(0, timeoutMs);
   const inner = new AbortController();
   const forwardAbort = () => inner.abort();

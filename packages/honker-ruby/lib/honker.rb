@@ -18,6 +18,7 @@
 # is one SQL call via the `sqlite3` gem. No extra process, no Redis.
 
 require "json"
+require "fiddle"
 require "sqlite3"
 
 require_relative "honker/version"
@@ -27,10 +28,52 @@ require_relative "honker/scheduler"
 require_relative "honker/lock"
 
 module Honker
+  class CoreWatcher
+    def initialize(db_path, extension_path, backend)
+      @lib = Fiddle.dlopen(extension_path)
+      @open = Fiddle::Function.new(
+        @lib["honker_watcher_open"],
+        [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T],
+        Fiddle::TYPE_VOIDP,
+      )
+      @wait = Fiddle::Function.new(
+        @lib["honker_watcher_wait"],
+        [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG_LONG],
+        Fiddle::TYPE_INT,
+      )
+      @close = Fiddle::Function.new(
+        @lib["honker_watcher_close"],
+        [Fiddle::TYPE_VOIDP],
+        Fiddle::TYPE_VOID,
+      )
+      err = "\0" * 1024
+      @handle = @open.call(db_path.to_s, backend.to_s, err, err.bytesize)
+      return unless @handle.to_i.zero?
+
+      raise ArgumentError, err.delete_suffix("\0").split("\0", 2).first
+    end
+
+    def wait(timeout_s)
+      code = @wait.call(@handle, (timeout_s * 1000).ceil)
+      return true if code == 1
+      return false if code == 0
+
+      raise Error, "honker update watcher closed or died"
+    end
+
+    def close
+      return if @handle.nil? || @handle.to_i.zero?
+
+      @close.call(@handle)
+      @handle = nil
+    end
+  end
+
   DEFAULT_PRAGMAS = <<~SQL
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
+    PRAGMA mmap_size = 0;
     PRAGMA foreign_keys = ON;
     PRAGMA cache_size = -32000;
     PRAGMA temp_store = MEMORY;
@@ -43,17 +86,25 @@ module Honker
   class Database
     attr_reader :db
 
-    def initialize(path, extension_path:)
+    def initialize(path, extension_path:, watcher_backend: nil)
+      unless watcher_backend.nil? || watcher_backend.is_a?(String)
+        raise ArgumentError, "unknown watcher backend"
+      end
+
       @db = SQLite3::Database.new(path)
       @local_update_seq = 0
+      @db.busy_timeout = 5000
+      @db.execute("PRAGMA mmap_size = 0")
       @db.enable_load_extension(true)
       @db.load_extension(extension_path)
       @db.enable_load_extension(false)
       @db.execute_batch(DEFAULT_PRAGMAS)
       @db.execute("SELECT honker_bootstrap()")
+      @watcher = CoreWatcher.new(path, extension_path, watcher_backend)
     end
 
     def close
+      @watcher&.close
       @db&.close
     end
 
@@ -63,6 +114,10 @@ module Honker
 
     def update_snapshot
       @local_update_seq
+    end
+
+    def wait_for_update(timeout_s)
+      @watcher.wait(timeout_s)
     end
 
     # Returns a Queue handle for a named queue.
@@ -75,6 +130,18 @@ module Honker
         name,
         visibility_timeout_s: visibility_timeout_s,
         max_attempts: max_attempts,
+      )
+    end
+
+    # Transactional side-effect delivery built on a reserved queue.
+    def outbox(name, delivery, visibility_timeout_s: 60, max_attempts: 5, base_backoff_s: 5)
+      Outbox.new(
+        self,
+        name,
+        delivery,
+        visibility_timeout_s: visibility_timeout_s,
+        max_attempts: max_attempts,
+        base_backoff_s: base_backoff_s,
       )
     end
 
@@ -280,6 +347,65 @@ module Honker
         "SELECT honker_heartbeat(?, ?, ?)",
         [job_id, worker_id, extend_s],
       )[0] == 1
+    end
+  end
+
+  class Outbox
+    attr_reader :name, :queue, :max_attempts, :base_backoff_s
+
+    def initialize(db, name, delivery, visibility_timeout_s:, max_attempts:, base_backoff_s:)
+      raise ArgumentError, "delivery must respond to #call" unless delivery.respond_to?(:call)
+
+      @name = name
+      @delivery = delivery
+      @max_attempts = max_attempts
+      @base_backoff_s = base_backoff_s
+      @queue = db.queue(
+        "_outbox:#{name}",
+        visibility_timeout_s: visibility_timeout_s,
+        max_attempts: max_attempts,
+      )
+    end
+
+    def enqueue(payload, tx: nil, delay: nil, run_at: nil, priority: 0, expires: nil)
+      if tx
+        @queue.enqueue_tx(tx, payload, delay: delay, run_at: run_at, priority: priority, expires: expires)
+      else
+        @queue.enqueue(payload, delay: delay, run_at: run_at, priority: priority, expires: expires)
+      end
+    end
+
+    def run_once(worker_id)
+      job = @queue.claim_one(worker_id)
+      return false unless job
+
+      begin
+        if @delivery.arity == 1
+          @delivery.call(job.payload)
+        else
+          @delivery.call(job.payload, job)
+        end
+        raise "outbox ack failed for job #{job.id}" unless job.ack
+      rescue StandardError => e
+        delay_s = retry_delay(job.attempts)
+        raise "outbox retry failed for job #{job.id}" unless job.retry(delay_s: delay_s, error: "#{e}\n#{e.backtrace&.join("\n")}")
+      end
+      true
+    end
+
+    def run_worker(worker_id, stop: nil, idle_sleep_s: 0.1)
+      until stop&.call
+        processed = run_once(worker_id)
+        sleep(idle_sleep_s) unless processed
+      end
+    end
+
+    private
+
+    def retry_delay(attempts)
+      return 0 if @base_backoff_s <= 0
+
+      (@base_backoff_s * (2**[attempts - 1, 0].max)).ceil
     end
   end
 

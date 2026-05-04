@@ -31,6 +31,7 @@ defmodule Honker do
   PRAGMA journal_mode = WAL;
   PRAGMA synchronous = NORMAL;
   PRAGMA busy_timeout = 5000;
+  PRAGMA mmap_size = 0;
   PRAGMA foreign_keys = ON;
   PRAGMA cache_size = -32000;
   PRAGMA temp_store = MEMORY;
@@ -42,7 +43,7 @@ defmodule Honker do
     A Honker database handle. Wraps the Exqlite reference + a
     registry of per-queue options (visibility timeout, max attempts).
     """
-    defstruct [:conn, queue_opts: %{}]
+    defstruct [:conn, :path, :watcher_id, queue_opts: %{}]
   end
 
   @update_table :honker_local_update_seq
@@ -55,18 +56,36 @@ defmodule Honker do
   Open (or create) a SQLite database at `path`. Loads the Honker
   extension from `extension_path`, applies default PRAGMAs, and
   bootstraps the schema.
+
+  `:watcher_backend` is implemented by `honker-core` through the loaded
+  Honker extension. It accepts the same aliases as the other bindings:
+  `nil`, `""`, `"poll"`, `"polling"`, `"kernel"`, `"kernel-watcher"`,
+  `"shm"`, and `"shm-fast-path"`.
   """
   def open(path, opts) do
     extension_path = Keyword.fetch!(opts, :extension_path)
+    backend = watcher_backend_param(Keyword.get(opts, :watcher_backend))
 
     with {:ok, conn} <- Sqlite3.open(path),
+         :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout = 5000;"),
          :ok <- Sqlite3.enable_load_extension(conn, true),
          :ok <- run_bare(conn, "SELECT load_extension(?1)", [extension_path]),
          :ok <- Sqlite3.enable_load_extension(conn, false),
          :ok <- Sqlite3.execute(conn, @default_pragmas),
-         :ok <- run_bare(conn, "SELECT honker_bootstrap()", []) do
-      {:ok, %Database{conn: conn}}
+         :ok <- run_bare(conn, "SELECT honker_bootstrap()", []),
+         {:ok, [watcher_id]} <-
+           query_first(conn, "SELECT honker_update_watcher_open(?1, ?2)", [path, backend]) do
+      {:ok, %Database{conn: conn, path: path, watcher_id: watcher_id}}
     end
+  end
+
+  defp watcher_backend_param(nil), do: nil
+  defp watcher_backend_param(backend) when is_binary(backend), do: backend
+  defp watcher_backend_param(backend), do: inspect(backend)
+
+  def close(%Database{conn: conn, watcher_id: watcher_id}) do
+    _ = query_first(conn, "SELECT honker_update_watcher_close(?1)", [watcher_id])
+    Sqlite3.close(conn)
   end
 
   @doc """
@@ -79,6 +98,11 @@ defmodule Honker do
     vis = Keyword.get(opts, :visibility_timeout_s, 300)
     max = Keyword.get(opts, :max_attempts, 3)
     %{db | queue_opts: Map.put(db.queue_opts, queue_name, {vis, max})}
+  end
+
+  @doc "Return a transactional outbox handle backed by `_outbox:<name>`."
+  def outbox(%Database{} = db, name, delivery, opts \\ []) do
+    Honker.Outbox.new(db, name, delivery, opts)
   end
 
   @doc """
@@ -206,6 +230,19 @@ defmodule Honker do
     case :ets.lookup(@update_table, conn) do
       [{^conn, n}] -> n
       _ -> 0
+    end
+  end
+
+  @doc false
+  def wait_for_update(%Database{conn: conn, watcher_id: watcher_id}, timeout_ms) do
+    case query_first(conn, "SELECT honker_update_watcher_wait(?1, ?2)", [
+           watcher_id,
+           max(0, timeout_ms)
+         ]) do
+      {:ok, [1]} -> :changed
+      {:ok, [0]} -> :timeout
+      {:ok, [-1]} -> {:error, "honker update watcher closed or died"}
+      other -> other
     end
   end
 

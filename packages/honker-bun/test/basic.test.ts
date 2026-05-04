@@ -30,6 +30,84 @@ if (!extPath && process.env.CI) {
 }
 const maybe = extPath ? describe : describe.skip;
 
+describe("honker-bun watcher backend option", () => {
+  test("watcher backends detect commits", async () => {
+    if (!extPath) return;
+    for (const watcherBackend of [
+      null,
+      "",
+      "poll",
+      "polling",
+      "kernel",
+      "kernel-watcher",
+      "shm",
+      "shm-fast-path",
+    ]) {
+      const dir = mkdtempSync(join(tmpdir(), "honker-bun-watchers-"));
+      const dbPath = join(dir, "t.db");
+      let db: ReturnType<typeof open> | null = null;
+      let writer: ReturnType<typeof open> | null = null;
+      try {
+        try {
+          db = open(dbPath, extPath, { watcherBackend });
+        } catch (err) {
+          const msg = String(err);
+          if (
+            msg.includes("requires the") ||
+            msg.includes("-shm unavailable") ||
+            msg.includes("unsupported SQLite layout")
+          ) {
+            continue;
+          }
+          throw err;
+        }
+        const updates = db.updateEvents();
+        writer = open(dbPath, extPath);
+        writer.notify("backend", { watcherBackend });
+        await Promise.race([
+          updates.next(),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`backend ${watcherBackend} did not observe commit`)),
+              2000,
+            ),
+          ),
+        ]);
+        updates.close();
+      } finally {
+        writer?.close();
+        db?.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("rejects unknown backend names before opening sqlite", () => {
+    for (const watcherBackend of ["bogus", "KERNEL", " polling "]) {
+      expect(() =>
+        open("/tmp/honker-bun-missing.db", extPath ?? "/missing/libhonker_ext.so", {
+          watcherBackend,
+        }),
+      ).toThrow(extPath ? /unknown watcher backend/ : /dlopen|no such file/);
+    }
+  });
+
+  test("accepts polling aliases", () => {
+    if (!extPath) return;
+    for (const watcherBackend of [null, "", "poll", "polling"]) {
+      const dir = mkdtempSync(join(tmpdir(), "honker-bun-"));
+      const dbPath = join(dir, "t.db");
+      const db = open(dbPath, extPath, { watcherBackend });
+      try {
+        expect(db.raw.query("SELECT 1 AS v").get()).toEqual({ v: 1 });
+      } finally {
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
 maybe("honker-bun basic", () => {
   let dir: string;
   let dbPath: string;

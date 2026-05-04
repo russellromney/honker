@@ -13,9 +13,9 @@ crate-type = ["cdylib"]
 
 [features]
 # Forward to honker-core. Enable at build time with
-# `npm run build -- --features kernel-watcher`. Wheels built without
-# these features silently fall back to polling when a JS caller passes
-# `watcherBackend: "kernel"` or `"shm"`.
+# `npm run build -- --features kernel-watcher`. Builds without these
+# features reject an explicit `watcherBackend: "kernel"` or `"shm"`
+# request instead of silently substituting polling.
 kernel-watcher = ["honker-core/kernel-watcher"]
 shm-fast-path = ["honker-core/shm-fast-path"]
 

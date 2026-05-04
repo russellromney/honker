@@ -20,8 +20,9 @@ crate-type = ["cdylib"]
 bundled-sqlite = ["honker-core/bundled-sqlite", "rusqlite/bundled"]
 # Forward to honker-core. Pass `--features kernel-watcher` (or both)
 # to maturin to ship a wheel with the experimental backends compiled
-# in. Wheels without these flags fall back to polling when a Python
-# caller passes `watcher_backend="kernel"` or `"shm"`.
+# in. Wheels without these flags reject an explicit
+# `watcher_backend="kernel"` or `"shm"` request instead of silently
+# substituting polling.
 kernel-watcher = ["honker-core/kernel-watcher"]
 shm-fast-path = ["honker-core/shm-fast-path"]
 

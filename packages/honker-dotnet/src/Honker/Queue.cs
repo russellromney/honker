@@ -69,7 +69,9 @@ public sealed class Queue
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         using var poller = _database.CreatePoller();
-        var fallback = idlePoll ?? TimeSpan.FromSeconds(5);
+        TimeSpan? fallback = idlePoll == Timeout.InfiniteTimeSpan
+            ? null
+            : idlePoll ?? TimeSpan.FromSeconds(5);
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -90,7 +92,7 @@ public sealed class Queue
                     continue;
                 }
 
-                if (untilNext < waitFor)
+                if (waitFor is null || untilNext < waitFor)
                 {
                     waitFor = untilNext;
                 }

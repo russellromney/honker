@@ -1,59 +1,104 @@
-using Microsoft.Data.Sqlite;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace Honker;
 
 internal sealed class UpdatePoller : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly TimeSpan _pollInterval;
-    private long _lastSeenVersion;
+    private delegate IntPtr WatcherOpen(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string dbPath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? backend,
+        byte[] error,
+        UIntPtr errorLen);
 
-    public UpdatePoller(string connectionString, TimeSpan pollInterval)
+    private delegate int WatcherWait(IntPtr watcher, ulong timeoutMs);
+    private delegate void WatcherClose(IntPtr watcher);
+
+    private readonly IntPtr _library;
+    private readonly IntPtr _watcher;
+    private readonly WatcherWait _wait;
+    private readonly WatcherClose _close;
+    private bool _disposed;
+
+    public UpdatePoller(string dbPath, string extensionPath, string? watcherBackend)
     {
-        _pollInterval = pollInterval <= TimeSpan.Zero ? TimeSpan.FromMilliseconds(1) : pollInterval;
-        _connection = new SqliteConnection(connectionString);
-        _connection.Open();
-        _lastSeenVersion = ReadDataVersion();
+        _library = NativeLibrary.Load(extensionPath);
+        try
+        {
+            var open = Marshal.GetDelegateForFunctionPointer<WatcherOpen>(
+                NativeLibrary.GetExport(_library, "honker_watcher_open")
+            );
+            _wait = Marshal.GetDelegateForFunctionPointer<WatcherWait>(
+                NativeLibrary.GetExport(_library, "honker_watcher_wait")
+            );
+            _close = Marshal.GetDelegateForFunctionPointer<WatcherClose>(
+                NativeLibrary.GetExport(_library, "honker_watcher_close")
+            );
+
+            var error = new byte[1024];
+            _watcher = open(dbPath, watcherBackend, error, (UIntPtr)error.Length);
+            if (_watcher == IntPtr.Zero)
+            {
+                throw new InvalidOperationException(DecodeError(error));
+            }
+        }
+        catch
+        {
+            NativeLibrary.Free(_library);
+            throw;
+        }
     }
 
-    public async Task WaitForChangeAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    public async Task WaitForChangeAsync(TimeSpan? timeout, CancellationToken cancellationToken)
     {
-        if (timeout <= TimeSpan.Zero)
+        if (timeout is not null && timeout <= TimeSpan.Zero)
         {
             return;
         }
 
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
+        var deadline = timeout is null ? (DateTime?)null : DateTime.UtcNow + timeout.Value;
+        while (deadline is null || DateTime.UtcNow < deadline.Value)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            var current = ReadDataVersion();
-            if (current != _lastSeenVersion)
-            {
-                _lastSeenVersion = current;
-                return;
-            }
-
-            var remaining = deadline - DateTime.UtcNow;
-            if (remaining <= TimeSpan.Zero)
+            var remaining = deadline is null ? TimeSpan.FromMilliseconds(100) : deadline.Value - DateTime.UtcNow;
+            if (deadline is not null && remaining <= TimeSpan.Zero)
             {
                 return;
             }
 
-            await Task.Delay(remaining < _pollInterval ? remaining : _pollInterval, cancellationToken);
+            var chunk = Math.Min(100, Math.Max(1, (int)Math.Ceiling(remaining.TotalMilliseconds)));
+            var code = _wait(_watcher, (ulong)chunk);
+            switch (code)
+            {
+                case 1:
+                    return;
+                case 0:
+                    await Task.Yield();
+                    continue;
+                default:
+                    throw new InvalidOperationException("honker update watcher closed or died");
+            }
         }
     }
 
     public void Dispose()
     {
-        _connection.Dispose();
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        _close(_watcher);
+        NativeLibrary.Free(_library);
     }
 
-    private long ReadDataVersion()
+    private static string DecodeError(byte[] error)
     {
-        using var command = _connection.CreateCommand();
-        command.CommandText = "PRAGMA data_version";
-        return Convert.ToInt64(command.ExecuteScalar());
+        var len = Array.IndexOf(error, (byte)0);
+        if (len < 0)
+        {
+            len = error.Length;
+        }
+        return len == 0 ? "unknown watcher error" : Encoding.UTF8.GetString(error, 0, len);
     }
 }

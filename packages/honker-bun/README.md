@@ -15,12 +15,20 @@ bun add @russellthehippo/honker-bun
 
 You also need the Honker SQLite extension from the main repo.
 
+## Watcher backends
+
+`open(path, extPath, { watcherBackend: "polling" })` accepts the
+default polling backend aliases (`"polling"` / `"poll"`). Experimental
+`"kernel"` / `"shm"` requests route through `honker-core` via the loaded
+Honker extension and fail loudly if that extension was not built with
+the matching feature.
+
 ## Quick start
 
 ```ts
 import { open } from "@russellthehippo/honker-bun";
 
-const db = open("app.db");
+const db = open("app.db", "./libhonker_ext.dylib");
 const q = db.queue("emails");
 
 q.enqueue({ to: "alice@example.com" });
