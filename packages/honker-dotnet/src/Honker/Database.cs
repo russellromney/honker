@@ -13,10 +13,8 @@ public sealed class Database : IDisposable
     private readonly Dictionary<string, Outbox> _outboxes = new(StringComparer.Ordinal);
     private readonly Scheduler _scheduler;
     private readonly string _extensionPath;
-    private readonly object _pollerLock = new();
-    private UpdatePoller? _sharedPoller;
 
-    private Database(string path, OpenOptions options, SqliteConnection connection, string extensionPath, UpdatePoller sharedPoller)
+    private Database(string path, OpenOptions options, SqliteConnection connection, string extensionPath)
     {
         Path = System.IO.Path.GetFullPath(path);
         Options = options;
@@ -24,7 +22,6 @@ public sealed class Database : IDisposable
         _connection = connection;
         _scheduler = new Scheduler(this);
         _extensionPath = extensionPath;
-        _sharedPoller = sharedPoller;
     }
 
     public string Path { get; }
@@ -43,12 +40,16 @@ public sealed class Database : IDisposable
         connection.Open();
         var resolvedExtensionPath = System.IO.Path.GetFullPath(extensionPath);
         InstallConnection(connection, resolvedExtensionPath, bootstrap: true);
-        // Probe the watcher backend by constructing the shared poller
-        // eagerly. If the backend is unsupported, the constructor throws
-        // here at Open() time instead of at first GetPoller() call.
-        var poller = new UpdatePoller(
-            System.IO.Path.GetFullPath(path), resolvedExtensionPath, options.WatcherBackend);
-        return new Database(path, options, connection, resolvedExtensionPath, poller);
+        // Probe the watcher backend so unsupported backends fail at
+        // Open() time rather than at first poll. Discarded immediately
+        // — consumers create their own pollers via CreatePoller().
+        // The Rust-side SharedUpdateWatcher cache means each poller
+        // reuses one watcher thread per (path, backend), so per-call
+        // construction is cheap.
+        using (new UpdatePoller(System.IO.Path.GetFullPath(path), resolvedExtensionPath, options.WatcherBackend))
+        {
+        }
+        return new Database(path, options, connection, resolvedExtensionPath);
     }
 
     public Queue Queue(string name, QueueOptions? options = null)
@@ -245,21 +246,13 @@ public sealed class Database : IDisposable
     }
 
     /// <summary>
-    /// Get the shared <see cref="UpdatePoller"/> for this Database.
-    /// Eagerly created at <see cref="Open"/>. Owned by the Database —
-    /// callers MUST NOT dispose it; lifetime is bound to Database.Dispose.
-    ///
-    /// Sharing is correct: the poller maintains its own per-waiter
-    /// fanout and safely supports any number of concurrent
-    /// <see cref="UpdatePoller.WaitForChangeAsync"/> callers.
+    /// Construct a fresh <see cref="UpdatePoller"/> for this Database.
+    /// Caller owns the lifetime — wrap in `using`. Cheap because the
+    /// underlying Rust SharedUpdateWatcher is cached per (path, backend).
     /// </summary>
-    internal UpdatePoller GetPoller()
+    internal UpdatePoller CreatePoller()
     {
-        lock (_pollerLock)
-        {
-            return _sharedPoller
-                ?? throw new ObjectDisposedException(nameof(Database));
-        }
+        return new UpdatePoller(Path, _extensionPath, Options.WatcherBackend);
     }
 
     internal SqliteConnection CreateReadConnection()
@@ -326,13 +319,6 @@ public sealed class Database : IDisposable
 
     public void Dispose()
     {
-        UpdatePoller? poller;
-        lock (_pollerLock)
-        {
-            poller = _sharedPoller;
-            _sharedPoller = null;
-        }
-        poller?.Dispose();
         _connection.Dispose();
     }
 

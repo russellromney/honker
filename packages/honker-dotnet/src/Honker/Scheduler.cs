@@ -132,7 +132,7 @@ public sealed class Scheduler
 
     public async Task RunAsync(string owner, CancellationToken cancellationToken = default)
     {
-        var poller = _database.GetPoller();
+        using var poller = _database.CreatePoller();
         const int lockTtlSeconds = 60;
         var heartbeatInterval = TimeSpan.FromSeconds(30);
 

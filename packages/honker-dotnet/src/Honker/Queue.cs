@@ -68,7 +68,7 @@ public sealed class Queue
         TimeSpan? idlePoll = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var poller = _database.GetPoller();
+        using var poller = _database.CreatePoller();
         TimeSpan? fallback = idlePoll == Timeout.InfiniteTimeSpan
             ? null
             : idlePoll ?? TimeSpan.FromSeconds(5);
@@ -262,7 +262,7 @@ public sealed class Queue
 
     public async Task<JsonElement?> WaitResult(long jobId, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
     {
-        var poller = _database.GetPoller();
+        using var poller = _database.CreatePoller();
         var deadline = timeout is null ? (DateTime?)null : DateTime.UtcNow + timeout.Value;
 
         while (true)

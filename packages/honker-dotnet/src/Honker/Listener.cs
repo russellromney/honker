@@ -18,7 +18,7 @@ public sealed class Listener : IAsyncEnumerable<Notification>, IAsyncEnumerator<
     {
         _database = database;
         _channel = channel;
-        _poller = database.GetPoller();
+        _poller = database.CreatePoller();
         _readConnection = database.CreateReadConnection();
         using var command = _readConnection.CreateCommand();
         command.CommandText = "SELECT COALESCE(MAX(id), 0) FROM _honker_notifications WHERE channel=@p0";
@@ -87,7 +87,7 @@ public sealed class Listener : IAsyncEnumerable<Notification>, IAsyncEnumerator<
 
     public ValueTask DisposeAsync()
     {
-        // _poller is owned by the Database — do NOT dispose it here.
+        _poller.Dispose();
         _readConnection.Dispose();
         return ValueTask.CompletedTask;
     }

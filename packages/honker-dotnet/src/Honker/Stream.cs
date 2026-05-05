@@ -104,7 +104,7 @@ public sealed class Stream
             _saveEveryN = saveEveryN;
             _saveEverySeconds = saveEverySeconds;
             _cancellationToken = cancellationToken;
-            _poller = stream._database.GetPoller();
+            _poller = stream._database.CreatePoller();
             _readConnection = stream._database.CreateReadConnection();
             _lastSaveAtTicks = Stopwatch.GetTimestamp();
         }
@@ -154,7 +154,7 @@ public sealed class Stream
 
         public ValueTask DisposeAsync()
         {
-            // _poller is owned by the Database — do NOT dispose it here.
+            _poller.Dispose();
             _readConnection.Dispose();
             return ValueTask.CompletedTask;
         }
