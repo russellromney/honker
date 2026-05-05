@@ -16,6 +16,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Honker\Honker.csproj" />
+    <!-- Build the queue helper alongside tests. Tests spawn it as a
+         subprocess directly; the previous approach (dotnet test with
+         a filter argument) paid full vstest startup on every spawn. -->
+    <ProjectReference Include="..\Honker.QueueHelper\Honker.QueueHelper.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
