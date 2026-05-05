@@ -33,18 +33,34 @@ if (mode == "worker")
     var workerId = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_WORKER")!;
     var readyPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_READY")!;
     var resultPath = Environment.GetEnvironmentVariable("HONKER_DOTNET_QUEUE_RESULT")!;
+    var workerStarted = Stopwatch.StartNew();
+    var logPath = resultPath + ".log";
+    var logLock = new object();
+    void log(string msg)
+    {
+        var line = $"[helper-worker {workerId} +{workerStarted.ElapsedMilliseconds}ms] {msg}";
+        Console.Error.WriteLine(line);
+        lock (logLock)
+        {
+            File.AppendAllText(logPath, line + "\n");
+        }
+    }
+    log($"start backend={backend ?? "polling"} db={path}");
     using var db = Database.Open(path, new OpenOptions
     {
         ExtensionPath = ext,
         WatcherBackend = backend,
     });
+    log("Database.Open returned");
     var queue = db.Queue("shared");
     await File.WriteAllTextAsync(readyPath, "ready");
+    log("ready file written");
     var processed = new List<int>();
     // Safety net only: parent always enqueues an explicit stop job for
     // a deterministic exit. 30s leaves headroom on slow CI runners.
     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
+    var sawStop = false;
     try
     {
         await foreach (var job in queue.ClaimAsync(workerId, Timeout.InfiniteTimeSpan, cts.Token))
@@ -52,11 +68,13 @@ if (mode == "worker")
             var stop = job.Payload.TryGetProperty("stop", out var stopValue) && stopValue.GetBoolean();
             if (!job.Ack())
             {
-                Console.Error.WriteLine($"ack failed for job {job.Id}");
+                log($"ack failed for job {job.Id}");
                 return 3;
             }
             if (stop)
             {
+                sawStop = true;
+                log("got stop job, exiting");
                 break;
             }
 
@@ -66,10 +84,13 @@ if (mode == "worker")
     }
     catch (OperationCanceledException) when (cts.IsCancellationRequested)
     {
-        // Idle timeout bounds the helper. Parent still asserts the
-        // expected job set, so success is not silently allowed.
+        log($"cts fired without stop job; processed.Count={processed.Count}");
     }
 
+    if (!sawStop)
+    {
+        log($"exiting without stop; processed.Count={processed.Count}");
+    }
     await File.WriteAllTextAsync(resultPath, string.Join(Environment.NewLine, processed));
     return 0;
 }

@@ -121,7 +121,7 @@ public sealed class BindingTests
         }
 
         await WaitProcessAsync(worker.Process);
-        AssertIntSet(ReadProcessResult(worker.ResultPath), 25);
+        AssertWorkerResult(worker, 25);
     }
 
     [Theory]
@@ -214,7 +214,7 @@ public sealed class BindingTests
         }
 
         await WaitProcessAsync(worker.Process);
-        AssertIntSet(ReadProcessResult(worker.ResultPath), 60);
+        AssertWorkerResult(worker, 60);
     }
 
     private sealed record QueueWorkerProcess(Process Process, string ReadyPath, string ResultPath);
@@ -345,6 +345,17 @@ public sealed class BindingTests
     private static void AssertIntSet(IEnumerable<int> values, int count)
     {
         Assert.Equal(Enumerable.Range(0, count), values.OrderBy(v => v));
+    }
+
+    private static void AssertWorkerResult(QueueWorkerProcess worker, int count)
+    {
+        var values = ReadProcessResult(worker.ResultPath);
+        if (values.Count != count || !values.OrderBy(v => v).SequenceEqual(Enumerable.Range(0, count)))
+        {
+            var logPath = worker.ResultPath + ".log";
+            var workerLog = File.Exists(logPath) ? File.ReadAllText(logPath) : "(no log file)";
+            Assert.Fail($"worker result mismatch.\nexpected 0..{count - 1}\nactual: [{string.Join(",", values)}]\nworker log:\n{workerLog}");
+        }
     }
 
     [Fact]
