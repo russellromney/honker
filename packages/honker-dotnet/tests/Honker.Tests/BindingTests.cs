@@ -236,7 +236,8 @@ public sealed class BindingTests
             var queue = db.Queue("shared");
             await File.WriteAllTextAsync(readyPath, "ready");
             var processed = new List<int>();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            // Initial window covers parent spawn + 25 sequential enqueues on slow Linux runners; per-job stays 2s.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
             try
             {
