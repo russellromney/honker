@@ -4,12 +4,6 @@
 
 `honker` is a SQLite extension + language bindings that add Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with built-in durable pub/sub, task queue, and event streams, without client polling or a daemon/broker. Any language that can `SELECT load_extension('honker')` gets the same features.
 
-honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, .NET / C#, and JVM / Kotlin packages. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
-
-See [Binding support](BINDINGS.md) for the current truth table: which
-bindings have typed queue/stream/listen/scheduler APIs, which ones have
-packaged-install proof, and what CI actually proves.
-
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
 
 Some bindings expose experimental watcher backends, such as mmap of
@@ -25,6 +19,12 @@ SQLite is increasingly the database for shipped projects. Those inevitably requi
 honker takes the approach that if SQLite is the primary datastore, the queue should live in the same file. That means `INSERT INTO orders` and `queue.enqueue(...)` commit in the same transaction. Rollback drops both. The queue is just rows in a table with a partial index.
 
 Prior art:  [`pg_notify`](https://www.postgresql.org/docs/current/sql-notify.html) (fast triggers, no retry/visibility), [Huey](https://github.com/coleifer/huey) (SQLite-backed Python), [pg-boss](https://github.com/timgit/pg-boss) and [Oban](https://github.com/sorentwo/oban) (the Postgres-side gold standards we're chasing on SQLite). If you already run Postgres, use those, as they are excellent.
+
+honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, .NET / C#, and JVM / Kotlin packages. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
+
+See [Binding support](BINDINGS.md) for the current truth table: which
+bindings have typed queue/stream/listen/scheduler APIs, which ones have
+packaged-install proof, and what CI actually proves.
 
 ## At a glance
 
