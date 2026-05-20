@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-05-20 — Python 0.2.4
+
+- Python `honker`: 0.2.4
+- Python transaction/query params now accept sqlite-style positional
+  sequences such as tuples, fixing `tx.execute(..., (value,))`.
+- Python wheels now include the Honker SQLite loadable extension and
+  expose `honker.extension_info()` / `honker.load_extension(conn)` for
+  sqlite3 and ORM-owned connections.
+
 ## 2026-05-04 — binding parity release
 
 Release versions:
