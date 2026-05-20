@@ -34,3 +34,4 @@ Documentation = "https://honker.dev/docs/"
 python-source = "python"
 module-name = "honker._honker_native"
 features = ["pyo3/extension-module"]
+include = [{ path = "python/honker/_lib/*", format = "wheel" }]

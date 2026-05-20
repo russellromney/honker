@@ -62,11 +62,24 @@ fn py_to_value(item: &Bound<'_, PyAny>) -> PyResult<Value> {
     )))
 }
 
-fn build_params(params: Option<&Bound<'_, PyList>>) -> PyResult<Vec<Value>> {
+fn build_params(params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
     let mut out = Vec::new();
     if let Some(p) = params {
-        for item in p.iter() {
-            out.push(py_to_value(&item)?);
+        if p.is_none() {
+            return Ok(out);
+        }
+        if p.cast::<PyDict>().is_ok() {
+            return Err(PyTypeError::new_err(
+                "SQL params must be a positional sequence, not a dict",
+            ));
+        }
+        if p.cast::<PyBytes>().is_ok() || p.extract::<String>().is_ok() {
+            return Err(PyTypeError::new_err(
+                "SQL params must be a sequence of values, not a string or bytes",
+            ));
+        }
+        for item in p.try_iter()? {
+            out.push(py_to_value(&item?)?);
         }
     }
     Ok(out)
@@ -76,7 +89,7 @@ fn run_query<'py>(
     py: Python<'py>,
     conn: &Connection,
     sql: &str,
-    params: Option<&Bound<'_, PyList>>,
+    params: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Bound<'py, PyList>> {
     let values = build_params(params)?;
     // prepare_cached hits rusqlite's per-connection statement cache.
@@ -110,7 +123,7 @@ fn run_query<'py>(
 fn run_execute(
     conn: &Connection,
     sql: &str,
-    params: Option<&Bound<'_, PyList>>,
+    params: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<usize> {
     let values = build_params(params)?;
     let mut stmt = conn.prepare_cached(sql).map_err(core_err)?;
@@ -239,7 +252,7 @@ impl Database {
         &self,
         py: Python<'py>,
         sql: String,
-        params: Option<Bound<'py, PyList>>,
+        params: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyList>> {
         let conn = self.readers.acquire().map_err(core_err)?;
         let result = run_query(py, &conn, &sql, params.as_ref());
@@ -413,7 +426,7 @@ impl Transaction {
         &self,
         _py: Python<'_>,
         sql: String,
-        params: Option<Bound<'_, PyList>>,
+        params: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let state = self.inner.lock();
         let conn = state
@@ -429,7 +442,7 @@ impl Transaction {
         &self,
         py: Python<'py>,
         sql: String,
-        params: Option<Bound<'py, PyList>>,
+        params: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyList>> {
         let state = self.inner.lock();
         let conn = state

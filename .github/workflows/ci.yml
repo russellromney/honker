@@ -175,7 +175,10 @@ jobs:
           fi
           uv pip install --python "$VENV_PY" pytest pytest-asyncio pytest-xdist maturin
       - name: Build honker-extension
-        run: cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+        shell: bash
+        run: |
+          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+          scripts/copy-python-extension.sh
       - name: Build PyO3 _honker_native (maturin develop)
         working-directory: packages/honker
         shell: bash
@@ -357,7 +360,8 @@ jobs:
       - name: Install C++ binding deps
         run: sudo apt-get install -y libsqlite3-dev nlohmann-json3-dev
       - name: Build honker-extension
-        run: cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+        run: |
+          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
       - name: Build Python binding
         shell: bash
         run: |

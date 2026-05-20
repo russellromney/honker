@@ -466,8 +466,7 @@ Load `libhonker_ext` on your ORM's connection and call the SQL functions inside 
 # SQLAlchemy
 @event.listens_for(engine, "connect")
 def _load_honker(conn, _):
-    conn.enable_load_extension(True)
-    conn.load_extension("/path/to/libhonker_ext")
+    honker.load_extension(conn)
     conn.execute("SELECT honker_bootstrap()")
 
 with Session(engine) as s, s.begin():

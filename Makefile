@@ -66,9 +66,10 @@ test-all: test test-python-slow
 
 # ---- builds ----
 
-build: build-pyo3 build-ext
+build: build-ext build-pyo3
 
-build-pyo3:
+build-pyo3: build-ext
+	scripts/copy-python-extension.sh
 	cd packages/honker && VIRTUAL_ENV=$(CURDIR)/.venv \
 		$(CURDIR)/.venv/bin/python -m maturin develop --release
 

@@ -13,12 +13,33 @@ Full docs live in the main repo and docs site:
 pip install honker
 ```
 
-You also need the Honker SQLite extension. Use a release build from the main repo, or build it yourself:
+The Python wheel includes Honker's SQLite loadable extension when the
+package is built through the release/proof workflow. To load Honker into
+your own `sqlite3` or ORM connection:
+
+```python
+import honker
+import sqlite3
+
+conn = sqlite3.connect("app.db")
+honker.load_extension(conn)
+conn.execute("SELECT honker_bootstrap()")
+```
+
+If a client needs the raw pieces instead, use `extension_info()`:
+
+```python
+path, entrypoint = honker.extension_info()
+```
+
+For local source builds, build and copy the extension before building
+the wheel:
 
 ```bash
 git clone https://github.com/russellromney/honker
 cd honker
 cargo build --release -p honker-extension
+scripts/copy-python-extension.sh
 ```
 
 ## Quick start

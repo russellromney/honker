@@ -34,6 +34,7 @@ if [[ ! -f "$EXT" ]]; then
   echo "honker extension not found at $EXT" >&2
   exit 1
 fi
+scripts/copy-python-extension.sh
 
 echo "== python wheel install =="
 "$PYTHON_BIN" -m venv "$TMP/py"
@@ -45,6 +46,7 @@ echo "== python wheel install =="
 "$TMP/py/bin/python" -m pip install "$TMP"/wheels/*.whl >/dev/null
 "$TMP/py/bin/python" - <<'PY'
 import tempfile
+import sqlite3
 import honker
 
 with tempfile.TemporaryDirectory() as d:
@@ -55,6 +57,14 @@ with tempfile.TemporaryDirectory() as d:
     assert job and job.id == job_id
     assert job.payload["to"] == "alice@example.com"
     assert job.ack()
+    path, entrypoint = honker.extension_info()
+    con = sqlite3.connect(f"{d}/ext.db")
+    con.enable_load_extension(True)
+    con.load_extension(path, entrypoint=entrypoint)
+    con.execute("SELECT honker_bootstrap()")
+    helper_con = sqlite3.connect(f"{d}/helper.db")
+    honker.load_extension(helper_con)
+    helper_con.execute("SELECT honker_bootstrap()")
 print("python package smoke ok")
 PY
 
