@@ -36,6 +36,7 @@ jobs:
           . .venv/bin/activate
           uv pip install pytest pytest-asyncio pytest-xdist maturin
           cargo build --release -p honker-extension
+          scripts/copy-python-extension.sh
           cd packages/honker
           maturin develop --release
       - name: Cross-process and crash proofs

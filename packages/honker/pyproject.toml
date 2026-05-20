@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "honker"
-version = "0.2.4"
+version = "0.2.5"
 description = "Durable queues, streams, pub/sub, and cron scheduler on SQLite. One file, zero servers."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Programming Language :: Rust",
   "Topic :: Database",
   "Topic :: System :: Distributed Computing",

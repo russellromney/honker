@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-05-20 — Python 0.2.5
+
+- Python `honker`: 0.2.5
+- Python wheels now use the CPython stable ABI for Python 3.11+, so
+  each OS/arch wheel covers Python 3.11 through 3.14 instead of forcing
+  unsupported interpreters to fall back to source installs.
+- Python release proof now rejects wheels missing the bundled Honker
+  SQLite loadable extension.
+
 ## 2026-05-20 — Python 0.2.4
 
 - Python `honker`: 0.2.4

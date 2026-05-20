@@ -29,7 +29,7 @@ shm-fast-path = ["honker-core/shm-fast-path"]
 [dependencies]
 honker-core = { path = "../../honker-core", version = "0.2.3" }
 parking_lot = "0.12.5"
-pyo3 = { version = "0.28.3", features = ["extension-module"] }
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py311"] }
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
 
 [target.'cfg(windows)'.dependencies]
