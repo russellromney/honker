@@ -1,0 +1,72 @@
+name: Release · PyPI
+
+on:
+  push:
+    tags:
+      - "py-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload built wheels to PyPI"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: python wheel · ${{ matrix.os }}
+    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.14"
+
+      - name: Install maturin
+        run: python -m pip install "maturin>=1.7,<2"
+
+      - name: Build ABI3 wheel
+        shell: bash
+        env:
+          RUNNER_OS_NAME: ${{ runner.os }}
+        run: |
+          cargo build --release -p honker-extension
+          scripts/copy-python-extension.sh
+          if [[ "$RUNNER_OS_NAME" == "Windows" ]]; then
+            python -m maturin build --release \
+              --features bundled-sqlite \
+              --manifest-path packages/honker/Cargo.toml \
+              --out dist
+          else
+            python -m maturin build --release \
+              --manifest-path packages/honker/Cargo.toml \
+              --out dist
+          fi
+          python scripts/proof/check-python-wheel.py dist/*.whl
+
+      - name: Upload wheels to PyPI
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SHOULD_PUBLISH: ${{ github.event.inputs.publish }}
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [[ "$EVENT_NAME" == "push" && "$REF_NAME" == py-v* ]]; then
+            python -m maturin upload --skip-existing dist/*.whl
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$SHOULD_PUBLISH" == "true" ]]; then
+            python -m maturin upload --skip-existing dist/*.whl
+          else
+            echo "built wheels only; not publishing"
+          fi

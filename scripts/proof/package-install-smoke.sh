@@ -43,6 +43,7 @@ echo "== python wheel install =="
   -i "$TMP/py/bin/python" \
   --manifest-path "$ROOT/packages/honker/Cargo.toml" \
   --out "$TMP/wheels"
+"$PYTHON_BIN" "$ROOT/scripts/proof/check-python-wheel.py" "$TMP"/wheels/*.whl
 "$TMP/py/bin/python" -m pip install "$TMP"/wheels/*.whl >/dev/null
 "$TMP/py/bin/python" - <<'PY'
 import tempfile
