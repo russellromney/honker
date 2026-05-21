@@ -1,0 +1,101 @@
+name: Release · RubyGems
+
+on:
+  push:
+    tags:
+      - "rb-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload built gems to RubyGems"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  platform-gems:
+    name: ruby gem · ${{ matrix.gem_platform }}
+    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Native builds on a matching runner for each precompiled gem.
+      # Windows, Intel macOS, and musl are intentionally not built here;
+      # those users install the generic gem (see the generic-gem job).
+      matrix:
+        include:
+          - os: ubuntu-latest
+            gem_platform: x86_64-linux
+          - os: ubuntu-24.04-arm
+            gem_platform: aarch64-linux
+          - os: macos-latest
+            gem_platform: arm64-darwin
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f  # v1.306.0
+        with:
+          ruby-version: "3.4"
+
+      - name: Build platform gem
+        shell: bash
+        env:
+          HONKER_GEM_PLATFORM: ${{ matrix.gem_platform }}
+        run: |
+          cargo build --release -p honker-extension
+          scripts/copy-ruby-extension.sh
+          cd packages/honker-ruby
+          gem build honker.gemspec --output "$RUNNER_TEMP/honker.gem"
+          ruby ../../scripts/proof/check-ruby-gem.rb "$RUNNER_TEMP/honker.gem"
+
+      - name: Smoke-test the gem
+        shell: bash
+        run: |
+          gem install "$RUNNER_TEMP/honker.gem"
+          ruby scripts/proof/ruby-gem-smoke.rb
+
+      - name: Upload gem to RubyGems
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'rb-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+        shell: bash
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: gem push "$RUNNER_TEMP/honker.gem"
+
+  generic-gem:
+    name: ruby gem · generic
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f  # v1.306.0
+        with:
+          ruby-version: "3.4"
+
+      - name: Build generic gem
+        shell: bash
+        run: |
+          scripts/copy-ruby-sources.sh
+          cd packages/honker-ruby
+          gem build honker.gemspec --output "$RUNNER_TEMP/honker.gem"
+          ruby ../../scripts/proof/check-ruby-gem.rb --generic "$RUNNER_TEMP/honker.gem"
+
+      - name: Smoke-test the gem (compiles on install)
+        shell: bash
+        run: |
+          gem install "$RUNNER_TEMP/honker.gem"
+          ruby scripts/proof/ruby-gem-smoke.rb
+
+      - name: Upload gem to RubyGems
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'rb-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+        shell: bash
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: gem push "$RUNNER_TEMP/honker.gem"

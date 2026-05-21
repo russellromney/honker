@@ -6,24 +6,20 @@
 # write; to make the job atomic with your INSERT, drive both from
 # a single transaction on the underlying sqlite3 gem connection.
 #
-#   ruby -Ilib examples/atomic.rb
+# From a checkout, build the extension and point Honker at it:
+#   cargo build --release -p honker-extension
+#   HONKER_EXTENSION_PATH=target/release/libhonker_ext.so ruby examples/atomic.rb
 
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "honker"
 require "tmpdir"
-
-EXT_PATH = ENV["HONKER_EXTENSION_PATH"] ||
-           File.expand_path(
-             "../../../target/release/libhonker_ext.dylib",
-             __dir__,
-           )
 
 def count(raw, sql)
   raw.get_first_row(sql).first
 end
 
 Dir.mktmpdir("honker-") do |dir|
-  db = Honker::Database.new(File.join(dir, "app.db"), extension_path: EXT_PATH)
+  db = Honker::Database.new(File.join(dir, "app.db"))
   raw = db.db
 
   raw.execute(

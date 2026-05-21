@@ -13,7 +13,24 @@ Full docs:
 gem "honker"
 ```
 
-You also need the Honker SQLite extension from the main repo.
+How the SQLite extension reaches the gem depends on your platform:
+
+- **Precompiled** (x86_64 Linux, arm64 Linux, and Apple Silicon macOS):
+  the extension is pre-built and included in the gem.
+- **Every other platform**: the generic gem builds the extension after
+  install with `rustc` (from [rustup.rs](https://rustup.rs)).
+
+### Installing from git
+
+`honker` lives in a subdirectory of a polyglot monorepo, so a `github:`
+dependency needs Bundler's `glob:` option to point at the gemspec. The
+git checkout has no prebuilt extension either, so it builds on install
+and needs `rustc`:
+
+```ruby
+gem "honker", github: "russellromney/honker",
+    glob: "packages/honker-ruby/honker.gemspec"
+```
 
 ## Watcher backends
 
@@ -28,7 +45,7 @@ the matching feature.
 ```ruby
 require "honker"
 
-db = Honker::Database.new("app.db", extension_path: "./libhonker_ext.dylib")
+db = Honker::Database.new("app.db")
 q = db.queue("emails")
 
 q.enqueue({to: "alice@example.com"})

@@ -2,4 +2,10 @@
 Gemfile.lock
 pkg/
 tmp/
+lib/honker/libhonker_ext.*
+lib/honker/honker_ext.dll
+ext/honker/honker-extension/
+ext/honker/honker-core/
+ext/honker/target/
+ext/honker/Makefile
 .DS_Store
