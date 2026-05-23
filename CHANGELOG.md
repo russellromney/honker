@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-05-23 — Ruby 0.3.0
+
+- Ruby `honker`: 0.3.0
+- New `Honker::Railtie` runs `honker_bootstrap()` against
+  `ActiveRecord::Base.connection` in `config.after_initialize`, so Rails
+  apps no longer need a hand-written initializer. Loaded conditionally,
+  so Rails remains a non-dependency.
+- New module-level helpers collapse the extension-load + bootstrap
+  ceremony every ORM integration was copy-pasting: `Honker.extension_path`,
+  `Honker.load_extension`, `Honker.bootstrap`, `Honker.setup`, and
+  `Honker.sequel_after_connect` (a ready-made proc for Sequel/Rom/Hanami
+  `after_connect:`).
+
 ## 2026-05-20 - Ruby 0.2.0
 
 - Ruby `honker`: 0.2.0

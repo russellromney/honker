@@ -135,6 +135,74 @@ the underlying `sqlite3` gem connection your ORM is already using and
 load the Honker extension into that handle, so `honker_enqueue(...)`
 and friends are callable from inside one of its transactions.
 
+### Rails / ActiveRecord
+
+Point ActiveRecord at the bundled extension via `database.yml`:
+
+```yaml
+# config/database.yml
+production:
+  adapter: sqlite3
+  database: app.sqlite3
+  extensions:
+    - <%= Honker.extension_path %>
+```
+
+```ruby
+# Gemfile
+gem "honker"
+```
+
+That's it. `Honker::Railtie` runs `Honker.bootstrap` against
+`ActiveRecord::Base.connection` in `config.after_initialize`, so no
+initializer is required.
+
+Multi-database apps still need to call `Honker.bootstrap(some_other_conn)`
+themselves for non-primary connections.
+
+### Sequel (and ROM / Hanami::DB)
+
+`Honker.sequel_after_connect` returns the right `after_connect:` proc,
+so each new connection in the pool gets the extension loaded and the
+schema bootstrapped:
+
+```ruby
+require "sequel"
+require "honker"
+
+DB = Sequel.connect(
+  "sqlite://app.sqlite3",
+  after_connect: Honker.sequel_after_connect,
+)
+
+DB.synchronize do |conn|
+  conn.execute("SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)")
+end
+```
+
+To bootstrap once from a migration instead of on every connect, pass
+`bootstrap: false`:
+
+```ruby
+DB = Sequel.connect(
+  "sqlite://app.sqlite3",
+  after_connect: Honker.sequel_after_connect(bootstrap: false),
+)
+```
+
+### Setup helpers
+
+Both recipes above are built from the same module-level helpers, which
+wrap the extension-load and `honker_bootstrap()` ceremony:
+
+```ruby
+Honker.extension_path                  # => bundled path (or HONKER_EXTENSION_PATH override)
+Honker.load_extension(conn)            # enable_load_extension(true) → load → enable_load_extension(false)
+Honker.bootstrap(conn)                 # SELECT honker_bootstrap()
+Honker.setup(conn)                     # load_extension then bootstrap
+Honker.sequel_after_connect            # proc { |conn| Honker.setup(conn) } for Sequel/Rom/Hanami
+```
+
 See the per-ORM walkthroughs at
 [honker.dev/guides/orm/ruby](https://honker.dev/guides/orm/ruby/).
 
