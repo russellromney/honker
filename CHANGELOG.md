@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 2026-05-20 - Ruby 0.2.0
+
+- Ruby `honker`: 0.2.0
+- Ruby gems now bundle the Honker SQLite loadable extension. Precompiled
+  gems ship the native library for x86_64 Linux, arm64 Linux, and Apple
+  Silicon macOS, so `Honker::Database.new` resolves it automatically and
+  `extension_path:` is now optional. On every other platform, and for
+  `github:` installs, the generic gem compiles the extension from
+  bundled Rust source on install (a Rust toolchain is required).
+- New `Release · RubyGems` workflow builds and smoke-tests those gems;
+  the release proof rejects platform gems missing the bundled extension.
+
 ## 2026-05-20 — Python 0.2.5
 
 - Python `honker`: 0.2.5

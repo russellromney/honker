@@ -19,6 +19,7 @@
 
 require "json"
 require "fiddle"
+require "rbconfig"
 require "sqlite3"
 
 require_relative "honker/version"
@@ -28,6 +29,52 @@ require_relative "honker/scheduler"
 require_relative "honker/lock"
 
 module Honker
+  # Honker's error class, raised by ExtensionResolver and CoreWatcher.
+  class Error < StandardError; end
+
+  # Resolves the path to the Honker SQLite loadable extension. Platform
+  # gems ship it bundled in lib/honker/; an explicit path and the
+  # HONKER_EXTENSION_PATH override take precedence.
+  class ExtensionResolver
+    def initialize(env: ENV.fetch("HONKER_EXTENSION_PATH", nil), bundled: nil)
+      @env = env
+      @bundled = bundled || File.expand_path("honker/#{extension_filename}", __dir__)
+    end
+
+    # Returns the extension path: an explicit `extension_path`, else
+    # HONKER_EXTENSION_PATH, else the bundled extension. Raises
+    # Honker::Error when HONKER_EXTENSION_PATH or the bundled extension
+    # is missing.
+    def resolve(extension_path = nil)
+      return extension_path unless extension_path.nil?
+      return env_extension unless env.nil? || env.empty?
+
+      path = bundled
+      return path if File.file?(path)
+
+      raise Error, "Honker SQLite extension not found at #{path}; " \
+                   "set HONKER_EXTENSION_PATH or pass extension_path:"
+    end
+
+    private
+
+    attr_reader :env, :bundled
+
+    def env_extension
+      return env if File.file?(env)
+
+      raise Error, "HONKER_EXTENSION_PATH does not exist: #{env}"
+    end
+
+    def extension_filename
+      case RbConfig::CONFIG.fetch("host_os")
+      when /mswin|mingw|cygwin/ then "honker_ext.dll"
+      when /darwin/ then "libhonker_ext.dylib"
+      else "libhonker_ext.so"
+      end
+    end
+  end
+
   class CoreWatcher
     def initialize(db_path, extension_path, backend)
       @lib = Fiddle.dlopen(extension_path)
@@ -86,21 +133,23 @@ module Honker
   class Database
     attr_reader :db
 
-    def initialize(path, extension_path:, watcher_backend: nil)
+    def initialize(path, extension_path: nil, watcher_backend: nil,
+                   extension_resolver: ExtensionResolver.new)
       unless watcher_backend.nil? || watcher_backend.is_a?(String)
         raise ArgumentError, "unknown watcher backend"
       end
 
+      resolved_extension = extension_resolver.resolve(extension_path)
       @db = SQLite3::Database.new(path)
       @local_update_seq = 0
       @db.busy_timeout = 5000
       @db.execute("PRAGMA mmap_size = 0")
       @db.enable_load_extension(true)
-      @db.load_extension(extension_path)
+      @db.load_extension(resolved_extension)
       @db.enable_load_extension(false)
       @db.execute_batch(DEFAULT_PRAGMAS)
       @db.execute("SELECT honker_bootstrap()")
-      @watcher = CoreWatcher.new(path, extension_path, watcher_backend)
+      @watcher = CoreWatcher.new(path, resolved_extension, watcher_backend)
     end
 
     def close

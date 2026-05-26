@@ -2,18 +2,14 @@
 #
 # Basic example: enqueue a few jobs, claim them, ack each.
 #
-#   ruby examples/basic.rb
+# From a checkout, build the extension and point Honker at it:
+#   cargo build --release -p honker-extension
+#   HONKER_EXTENSION_PATH=target/release/libhonker_ext.so ruby examples/basic.rb
 
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "honker"
 
-EXT_PATH = ENV["HONKER_EXTENSION_PATH"] ||
-           File.expand_path(
-             "../../../target/release/libhonker_extension.dylib",
-             __dir__,
-           )
-
-db = Honker::Database.new("demo.db", extension_path: EXT_PATH)
+db = Honker::Database.new("demo.db")
 q  = db.queue("emails")
 
 3.times do |i|

@@ -107,27 +107,16 @@ JS
 )
 
 echo "== ruby gem install =="
+scripts/copy-ruby-extension.sh
+RUBY_GEM_PLATFORM="$("$RUBY_BIN" -e 'p = Gem::Platform.local; print [p.cpu, p.os].join("-")')"
 (
   cd "$ROOT/packages/honker-ruby"
-  "$RUBY_BIN" -S gem build honker.gemspec --output "$TMP/honker.gem"
+  HONKER_GEM_PLATFORM="$RUBY_GEM_PLATFORM" \
+    "$RUBY_BIN" -S gem build honker.gemspec --output "$TMP/honker.gem"
 )
+"$RUBY_BIN" "$ROOT/scripts/proof/check-ruby-gem.rb" "$TMP/honker.gem"
 GEM_HOME="$TMP/gems" GEM_PATH="$TMP/gems" "$RUBY_BIN" -S gem install "$TMP/honker.gem" >/dev/null
-GEM_HOME="$TMP/gems" GEM_PATH="$TMP/gems" HONKER_EXTENSION_PATH="$EXT" "$RUBY_BIN" <<'RB'
-require "tmpdir"
-require "honker"
-
-Dir.mktmpdir("honker-ruby-proof-") do |dir|
-  db = Honker::Database.new(File.join(dir, "app.db"), extension_path: ENV.fetch("HONKER_EXTENSION_PATH"))
-  q = db.queue("emails")
-  id = q.enqueue({to: "alice@example.com"})
-  job = q.claim_one("worker-1")
-  raise "claim failed" unless job && job.id == id
-  raise "payload mismatch" unless job.payload["to"] == "alice@example.com"
-  raise "ack failed" unless job.ack
-  db.close
-end
-puts "ruby package smoke ok"
-RB
+GEM_HOME="$TMP/gems" GEM_PATH="$TMP/gems" "$RUBY_BIN" "$ROOT/scripts/proof/ruby-gem-smoke.rb"
 
 echo "== dotnet nuget install =="
 RID="linux-x64"
