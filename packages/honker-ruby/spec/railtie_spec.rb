@@ -8,6 +8,7 @@
 
 require "tmpdir"
 require "minitest/autorun"
+require "minitest/mock"
 
 begin
   require "rails/railtie"

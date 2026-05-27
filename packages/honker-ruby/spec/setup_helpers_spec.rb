@@ -9,6 +9,7 @@
 
 require "tmpdir"
 require "minitest/autorun"
+require "minitest/mock"
 require "honker"
 
 REPO_ROOT = File.expand_path("../../..", __dir__) unless defined?(REPO_ROOT)

@@ -89,6 +89,7 @@ module Honker
     resolved = ExtensionResolver.new.resolve(extension_path)
     sqlite_conn.enable_load_extension(true)
     sqlite_conn.load_extension(resolved)
+  ensure
     sqlite_conn.enable_load_extension(false)
   end
 
