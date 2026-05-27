@@ -410,6 +410,8 @@ jobs:
           bundle exec ruby -Ilib spec/smoke_spec.rb
           bundle exec ruby -Ilib spec/parity_spec.rb
           bundle exec ruby -Ilib spec/extension_resolution_spec.rb
+          bundle exec ruby -Ilib spec/setup_helpers_spec.rb
+          bundle exec ruby -Ilib spec/railtie_spec.rb
       - name: Elixir
         working-directory: packages/honker-ex
         env:

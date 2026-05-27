@@ -53,7 +53,7 @@ echo "== specs =="
 (
   cd "$RUBY_PKG"
   bundle install --quiet
-  for spec in honker_spec smoke_spec parity_spec extension_resolution_spec; do
+  for spec in honker_spec smoke_spec parity_spec extension_resolution_spec setup_helpers_spec railtie_spec; do
     echo "  -- $spec --"
     bundle exec ruby -Ilib "spec/$spec.rb"
   done

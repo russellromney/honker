@@ -5,4 +5,8 @@ gemspec
 group :development, :test do
   gem "minitest", "~> 5.0"
   gem "rake", "~> 13.0"
+  # Exercises the Railtie in spec/railtie_spec.rb. Not a runtime
+  # dependency — the gem only loads Honker::Railtie when Rails is
+  # already defined in the host application.
+  gem "railties", "~> 7.0", require: false
 end

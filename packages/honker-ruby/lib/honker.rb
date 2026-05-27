@@ -27,6 +27,7 @@ require_relative "honker/transaction"
 require_relative "honker/stream"
 require_relative "honker/scheduler"
 require_relative "honker/lock"
+require_relative "honker/railtie" if defined?(::Rails::Railtie)
 
 module Honker
   # Honker's error class, raised by ExtensionResolver and CoreWatcher.
@@ -73,6 +74,42 @@ module Honker
       else "libhonker_ext.so"
       end
     end
+  end
+
+  # Resolve the bundled (or overridden) extension path without naming
+  # ExtensionResolver — useful for `database.yml` ERB and tooling.
+  def self.extension_path(override = nil)
+    ExtensionResolver.new.resolve(override)
+  end
+
+  # Load the Honker extension onto a raw SQLite3::Database. Encapsulates
+  # the enable_load_extension(true)/load/enable_load_extension(false)
+  # sequence so the toggle-off can't be forgotten.
+  def self.load_extension(sqlite_conn, extension_path: nil)
+    resolved = ExtensionResolver.new.resolve(extension_path)
+    sqlite_conn.enable_load_extension(true)
+    sqlite_conn.load_extension(resolved)
+  ensure
+    sqlite_conn.enable_load_extension(false)
+  end
+
+  # Run honker_bootstrap() on the connection. Idempotent. Separated from
+  # load_extension so production users can opt to bootstrap from a
+  # migration instead of every connect.
+  def self.bootstrap(sqlite_conn)
+    sqlite_conn.execute("SELECT honker_bootstrap()")
+  end
+
+  # Convenience: load the extension then bootstrap. The one-liner most
+  # ORM integrations reach for.
+  def self.setup(sqlite_conn, extension_path: nil, bootstrap: true)
+    load_extension(sqlite_conn, extension_path: extension_path)
+    self.bootstrap(sqlite_conn) if bootstrap
+  end
+
+  # Returns a Proc suitable for Sequel/Rom/Hanami `after_connect:`.
+  def self.sequel_after_connect(extension_path: nil, bootstrap: true)
+    proc { |conn| setup(conn, extension_path: extension_path, bootstrap: bootstrap) }
   end
 
   class CoreWatcher
