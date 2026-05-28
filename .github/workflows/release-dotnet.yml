@@ -30,9 +30,10 @@ jobs:
           - os: ubuntu-24.04-arm
             rid: linux-arm64
             native_name: libhonker_ext.so
-          - os: macos-13
+          - os: macos-latest
             rid: osx-x64
             native_name: libhonker_ext.dylib
+            rust_target: x86_64-apple-darwin
           - os: macos-latest
             rid: osx-arm64
             native_name: libhonker_ext.dylib
@@ -50,10 +51,19 @@ jobs:
 
       - name: Build native extension
         shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
         run: |
-          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+          cargo_args=(--release -p honker-extension --features kernel-watcher,shm-fast-path)
+          target_dir="target/release"
+          if [[ -n "$RUST_TARGET" ]]; then
+            rustup target add "$RUST_TARGET"
+            cargo_args+=(--target "$RUST_TARGET")
+            target_dir="target/$RUST_TARGET/release"
+          fi
+          cargo build "${cargo_args[@]}"
           mkdir -p "native-assets/runtimes/${{ matrix.rid }}/native"
-          cp "target/release/${{ matrix.native_name }}" \
+          cp "$target_dir/${{ matrix.native_name }}" \
             "native-assets/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}"
 
       - name: Upload native asset

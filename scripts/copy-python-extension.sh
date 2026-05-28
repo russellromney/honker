@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC_DIR="$ROOT/target/release"
+if [[ -n "${HONKER_RUST_TARGET:-}" ]]; then
+  SRC_DIR="$ROOT/target/${HONKER_RUST_TARGET}/release"
+else
+  SRC_DIR="$ROOT/target/release"
+fi
 DEST_DIR="$ROOT/packages/honker/python/honker/_lib"
 
 case "$(uname -s)" in

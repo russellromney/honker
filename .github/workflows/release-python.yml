@@ -30,7 +30,8 @@ jobs:
           - platform: linux-arm64
             os: ubuntu-24.04-arm
           - platform: macos-x64
-            os: macos-13
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
           - platform: macos-arm64
             os: macos-latest
           - platform: windows-x64
@@ -51,18 +52,24 @@ jobs:
         shell: bash
         env:
           RUNNER_OS_NAME: ${{ runner.os }}
+          RUST_TARGET: ${{ matrix.rust_target }}
         run: |
-          cargo build --release -p honker-extension
-          scripts/copy-python-extension.sh
+          cargo_args=(--release -p honker-extension)
+          maturin_args=(build --release --manifest-path packages/honker/Cargo.toml --out dist)
+          if [[ -n "$RUST_TARGET" ]]; then
+            rustup target add "$RUST_TARGET"
+            cargo_args+=(--target "$RUST_TARGET")
+            maturin_args+=(--target "$RUST_TARGET")
+          fi
+          cargo build "${cargo_args[@]}"
+          HONKER_RUST_TARGET="$RUST_TARGET" scripts/copy-python-extension.sh
           if [[ "$RUNNER_OS_NAME" == "Windows" ]]; then
             python -m maturin build --release \
               --features bundled-sqlite \
               --manifest-path packages/honker/Cargo.toml \
               --out dist
           else
-            python -m maturin build --release \
-              --manifest-path packages/honker/Cargo.toml \
-              --out dist
+            python -m maturin "${maturin_args[@]}"
           fi
           python scripts/proof/check-python-wheel.py dist/*.whl
 
