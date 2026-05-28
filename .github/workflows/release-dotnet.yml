@@ -1,0 +1,111 @@
+name: Release · NuGet
+
+on:
+  push:
+    tags:
+      - "dotnet-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload built package to NuGet"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native-assets:
+    name: native · ${{ matrix.rid }}
+    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            native_name: libhonker_ext.so
+          - os: ubuntu-24.04-arm
+            rid: linux-arm64
+            native_name: libhonker_ext.so
+          - os: macos-13
+            rid: osx-x64
+            native_name: libhonker_ext.dylib
+          - os: macos-latest
+            rid: osx-arm64
+            native_name: libhonker_ext.dylib
+          - os: windows-latest
+            rid: win-x64
+            native_name: honker_ext.dll
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build native extension
+        shell: bash
+        run: |
+          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+          mkdir -p "native-assets/runtimes/${{ matrix.rid }}/native"
+          cp "target/release/${{ matrix.native_name }}" \
+            "native-assets/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}"
+
+      - name: Upload native asset
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: native-assets/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}
+          if-no-files-found: error
+
+  package:
+    name: nuget package
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    needs: native-assets
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Download native assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: native-*
+          path: packages/honker-dotnet/src/Honker/package-assets
+          merge-multiple: true
+
+      - name: Pack NuGet package
+        shell: bash
+        run: |
+          dotnet pack packages/honker-dotnet/src/Honker/Honker.csproj \
+            -c Release \
+            -o artifacts/honker-dotnet
+          python3 scripts/proof/check-dotnet-nuget.py artifacts/honker-dotnet/*.nupkg
+          packages/honker-dotnet/scripts/smoke-consumer.sh artifacts/honker-dotnet
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: honker-nuget
+          path: artifacts/honker-dotnet/*.nupkg
+          if-no-files-found: error
+
+      - name: Upload package to NuGet
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'dotnet-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+        shell: bash
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          dotnet nuget push artifacts/honker-dotnet/*.nupkg \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate

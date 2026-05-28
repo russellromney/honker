@@ -47,9 +47,10 @@ Native loading:
 - then it looks for the bundled native extension from the NuGet package
   in the app output root or `runtimes/<rid>/native/`
 
-Planned first-release RID coverage:
+Bundled native RID coverage:
 
 - `linux-x64`
+- `linux-arm64`
 - `osx-x64`
 - `osx-arm64`
 - `win-x64`
@@ -70,8 +71,9 @@ dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj
 
 ## Release
 
-CI smoke-tests `dotnet pack` on every supported OS, but package publish
-is intentionally manual.
+`release-dotnet.yml` builds native assets on matching runners, combines
+them into one NuGet package, smoke-tests a consumer app, and publishes
+on `dotnet-v*` tags.
 
 Typical local release flow:
 

@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-05-28 — .NET 0.2.4
+
+- .NET `Honker`: 0.2.4
+- NuGet packages now bundle Honker native extension assets for
+  `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, and `win-x64`.
+- New `Release · NuGet` workflow builds each native asset on a matching
+  runner, combines them into one package, verifies the package contents,
+  smoke-tests a consumer app, and publishes on `dotnet-v*` tags.
+
 ## 2026-05-23 — Ruby 0.3.0
 
 - Ruby `honker`: 0.3.0
