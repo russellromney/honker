@@ -825,8 +825,22 @@ class Database {
 }
 
 module.exports = function buildApi(nativeBinding) {
-  function open(path, maxReaders, watcherBackend) {
-    return new Database(nativeBinding.open(path, maxReaders, watcherBackend));
+  function open(path, maxReaders, watcherBackend, watcherPollIntervalMs) {
+    if (maxReaders && typeof maxReaders === 'object') {
+      const opts = maxReaders;
+      return new Database(nativeBinding.open(
+        path,
+        opts.maxReaders,
+        opts.watcherBackend,
+        opts.watcherPollIntervalMs,
+      ));
+    }
+    return new Database(nativeBinding.open(
+      path,
+      maxReaders,
+      watcherBackend,
+      watcherPollIntervalMs,
+    ));
   }
 
   return {

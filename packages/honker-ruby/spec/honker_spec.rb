@@ -11,6 +11,10 @@ REPO_ROOT = File.expand_path("../../..", __dir__)
 
 def find_extension
   candidates = %w[
+    target/debug/libhonker_ext.dylib
+    target/debug/libhonker_ext.so
+    target/debug/libhonker_extension.dylib
+    target/debug/libhonker_extension.so
     target/release/libhonker_ext.dylib
     target/release/libhonker_ext.so
     target/release/libhonker_extension.dylib
@@ -107,6 +111,22 @@ class HonkerWatcherBackendOptionTest < Minitest::Test
         writer.close
         db.close
       end
+    end
+  end
+
+  def test_custom_watcher_poll_interval_detects_commits
+    require_extension_loading!
+    ext = find_extension
+    skip "honker extension not built — run `cargo build -p honker-extension --release`" unless ext
+
+    Dir.mktmpdir("honker-ruby-watch-interval-") do |dir|
+      path = File.join(dir, "t.db")
+      db = Honker::Database.new(path, extension_path: ext, watcher_poll_interval_ms: 25)
+      writer = Honker::Database.new(path, extension_path: ext)
+      writer.notify("interval", { ok: true })
+      assert db.wait_for_update(2), "custom watcher poll interval did not observe commit"
+      writer.close
+      db.close
     end
   end
 

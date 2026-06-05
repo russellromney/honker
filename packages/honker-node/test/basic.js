@@ -147,6 +147,35 @@ test('updateEvents fires on commit', async () => {
   }
 });
 
+test('custom watcherPollIntervalMs still fires on commit', async () => {
+  const { path: dbPath, cleanup } = tmpdb();
+  let db;
+  try {
+    db = lit.open(dbPath, { watcherPollIntervalMs: 25 });
+    {
+      const tx = db.transaction();
+      tx.execute('CREATE TABLE t (n INTEGER)');
+      tx.commit();
+    }
+    const ev = db.updateEvents();
+    setTimeout(() => {
+      const tx = db.transaction();
+      tx.execute('INSERT INTO t (n) VALUES (1)');
+      tx.commit();
+    }, 50);
+    await Promise.race([
+      ev.next(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('custom watcher interval did not observe commit')), 1000)
+      ),
+    ]);
+    ev.close();
+  } finally {
+    db?.close();
+    cleanup();
+  }
+});
+
 test('updateEvents dropped without close() still releases the watcher thread', async () => {
   // Create+drop many UpdateEvents instances without calling .close() on
   // any of them. Dropping must cascade to the core UpdateWatcher's Drop,

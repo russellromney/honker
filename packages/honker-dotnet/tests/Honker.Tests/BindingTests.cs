@@ -31,6 +31,22 @@ public sealed class BindingTests
         Assert.True(await move);
     }
 
+    [Fact]
+    public async Task OpenCustomUpdatePollIntervalDetectsCommits()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open(updatePollInterval: TimeSpan.FromMilliseconds(25));
+        var listener = db.Listen("interval");
+        await using var enumerator = listener.GetAsyncEnumerator();
+        using var writer = harness.Open();
+        writer.Notify("interval", new { ok = true });
+
+        var move = enumerator.MoveNextAsync().AsTask();
+        var completed = await Task.WhenAny(move, Task.Delay(TimeSpan.FromSeconds(2)));
+        Assert.Same(move, completed);
+        Assert.True(await move);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
@@ -1039,12 +1055,12 @@ public sealed class BindingTests
             return new TestHarness(dir, extensionPath);
         }
 
-        public Database Open(string? watcherBackend = null)
+        public Database Open(string? watcherBackend = null, TimeSpan? updatePollInterval = null)
         {
             return Database.Open(DatabasePath, new OpenOptions
             {
                 ExtensionPath = ExtensionPath,
-                UpdatePollInterval = TimeSpan.FromMilliseconds(5),
+                UpdatePollInterval = updatePollInterval ?? TimeSpan.FromMilliseconds(5),
                 WatcherBackend = watcherBackend,
             });
         }

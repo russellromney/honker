@@ -142,7 +142,7 @@ class Lock;
 class Notification;
 class Subscription;
 
-using watcher_open_fn = void* (*)(const char*, const char*, char*, uintptr_t);
+using watcher_open_fn = void* (*)(const char*, const char*, uint64_t, char*, uintptr_t);
 using watcher_wait_fn = int (*)(void*, uint64_t);
 using watcher_close_fn = void (*)(void*);
 
@@ -157,7 +157,11 @@ inline std::mutex& native_open_mutex() {
 
 class Database {
 public:
-    Database(std::string_view path, std::string_view ext_path, std::string_view watcher_backend = "") {
+    Database(
+        std::string_view path,
+        std::string_view ext_path,
+        std::string_view watcher_backend = "",
+        uint64_t watcher_poll_interval_ms = 1) {
         const std::string p{path};
         const std::string e{ext_path};
         std::lock_guard<std::mutex> open_lock(native_open_mutex());
@@ -167,6 +171,7 @@ public:
         path_ = p;
         ext_path_ = e;
         watcher_backend_ = std::string{watcher_backend};
+        watcher_poll_interval_ms_ = watcher_poll_interval_ms;
         try {
             open_core_watcher();
         } catch (...) {
@@ -181,6 +186,7 @@ public:
         : db_(other.db_), path_(std::move(other.path_)),
           ext_path_(std::move(other.ext_path_)),
           watcher_backend_(std::move(other.watcher_backend_)),
+          watcher_poll_interval_ms_(other.watcher_poll_interval_ms_),
           watcher_lib_(other.watcher_lib_),
           core_watcher_(other.core_watcher_),
           watcher_wait_(other.watcher_wait_),
@@ -200,6 +206,7 @@ public:
             path_ = std::move(other.path_);
             ext_path_ = std::move(other.ext_path_);
             watcher_backend_ = std::move(other.watcher_backend_);
+            watcher_poll_interval_ms_ = other.watcher_poll_interval_ms_;
             watcher_lib_ = other.watcher_lib_;
             core_watcher_ = other.core_watcher_;
             watcher_wait_ = other.watcher_wait_;
@@ -292,6 +299,7 @@ private:
     std::string path_;
     std::string ext_path_;
     std::string watcher_backend_;
+    uint64_t watcher_poll_interval_ms_ = 1;
     void* watcher_lib_ = nullptr;
     void* core_watcher_ = nullptr;
     watcher_wait_fn watcher_wait_ = nullptr;
@@ -1239,7 +1247,7 @@ inline void Database::open_core_watcher() {
         throw Error{"LoadLibrary failed for " + ext_path_};
     }
     auto open_fn = reinterpret_cast<watcher_open_fn>(
-        GetProcAddress(static_cast<HMODULE>(watcher_lib_), "honker_watcher_open"));
+        GetProcAddress(static_cast<HMODULE>(watcher_lib_), "honker_watcher_open_v2"));
     watcher_wait_ = reinterpret_cast<watcher_wait_fn>(
         GetProcAddress(static_cast<HMODULE>(watcher_lib_), "honker_watcher_wait"));
     watcher_close_ = reinterpret_cast<watcher_close_fn>(
@@ -1250,7 +1258,7 @@ inline void Database::open_core_watcher() {
         const char* msg = dlerror();
         throw Error{"dlopen failed for " + ext_path_ + ": " + (msg ? msg : "unknown error")};
     }
-    auto open_fn = reinterpret_cast<watcher_open_fn>(dlsym(watcher_lib_, "honker_watcher_open"));
+    auto open_fn = reinterpret_cast<watcher_open_fn>(dlsym(watcher_lib_, "honker_watcher_open_v2"));
     watcher_wait_ = reinterpret_cast<watcher_wait_fn>(dlsym(watcher_lib_, "honker_watcher_wait"));
     watcher_close_ = reinterpret_cast<watcher_close_fn>(dlsym(watcher_lib_, "honker_watcher_close"));
 #endif
@@ -1258,7 +1266,12 @@ inline void Database::open_core_watcher() {
         close_watcher_lib();
         throw Error{"Honker extension missing core watcher ABI symbols"};
     }
-    core_watcher_ = open_fn(path_.c_str(), watcher_backend_.c_str(), err, sizeof(err));
+    core_watcher_ = open_fn(
+        path_.c_str(),
+        watcher_backend_.c_str(),
+        watcher_poll_interval_ms_,
+        err,
+        sizeof(err));
     if (!core_watcher_) {
         close_watcher_lib();
         throw Error{std::string{"watcher_backend probe failed: "} + err};

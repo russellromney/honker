@@ -44,19 +44,19 @@ Backend contract:
 - no binding may silently fall back to polling for an explicit
   experimental request
 
-| Binding | Backend option | Experimental status |
-| --- | --- | --- |
-| Python | `honker.open(..., watcher_backend=...)` | source builds with matching Cargo features |
-| Node | `open(path, maxReaders?, watcherBackend?)` | source builds with matching Cargo features |
-| Rust wrapper | `OpenOptions::watcher_backend(...)` | matching Cargo features |
-| Go | `OpenWithOptions(..., OpenOptions{WatcherBackend: ...})` | depends on loaded extension features |
-| Bun | `open(..., { watcherBackend })` | depends on loaded extension features |
-| C++ | `Database(path, ext_path, watcher_backend)` | depends on loaded extension features |
-| .NET | `OpenOptions.WatcherBackend` | depends on bundled/loaded extension features |
-| Ruby | `watcher_backend:` | depends on loaded extension features |
-| Elixir | `watcher_backend:` | depends on loaded extension features |
-| JVM | `OpenOptions.watcherBackend(...)` | stable `AUTO`/`PRAGMA_DATA_VERSION`; explicit experimental `MMAP_SHM` and `KERNEL_EVENTS` |
-| Kotlin | JVM `OpenOptions` | wraps JVM behavior |
+| Binding | Backend option | Watcher interval option | Experimental status |
+| --- | --- | --- | --- |
+| Python | `honker.open(..., watcher_backend=...)` | `watcher_poll_interval_ms=` | source builds with matching Cargo features |
+| Node | `open(path, { watcherBackend })` | `watcherPollIntervalMs` | source builds with matching Cargo features |
+| Rust wrapper | `OpenOptions::watcher_backend(...)` | `OpenOptions::watcher_poll_interval(...)` | matching Cargo features |
+| Go | `OpenOptions{WatcherBackend: ...}` | `WatcherPollInterval` | depends on loaded extension features |
+| Bun | `open(..., { watcherBackend })` | `watcherPollIntervalMs` | depends on loaded extension features |
+| C++ | `Database(path, ext_path, watcher_backend)` | fourth constructor arg, milliseconds | depends on loaded extension features |
+| .NET | `OpenOptions.WatcherBackend` | `OpenOptions.UpdatePollInterval` | depends on bundled/loaded extension features |
+| Ruby | `watcher_backend:` | `watcher_poll_interval_ms:` | depends on loaded extension features |
+| Elixir | `watcher_backend:` | `watcher_poll_interval_ms:` | depends on loaded extension features |
+| JVM | `OpenOptions.watcherBackend(...)` | `WatcherOptions.pollInterval(...)` | stable `AUTO`/`PRAGMA_DATA_VERSION`; explicit experimental `MMAP_SHM` and `KERNEL_EVENTS` |
+| Kotlin | JVM `OpenOptions` | JVM `WatcherOptions` | wraps JVM behavior |
 
 ## What CI Proves
 

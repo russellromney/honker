@@ -7,9 +7,14 @@ from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional
 
 
-def _core_open(path, max_readers, watcher_backend=None):
+def _core_open(path, max_readers, watcher_backend=None, watcher_poll_interval_ms=None):
     from honker._honker_native import open as _open
-    return _open(path, max_readers=max_readers, watcher_backend=watcher_backend)
+    return _open(
+        path,
+        max_readers=max_readers,
+        watcher_backend=watcher_backend,
+        watcher_poll_interval_ms=watcher_poll_interval_ms,
+    )
 
 
 async def _raise_if_dead(awaitable):
@@ -1214,6 +1219,7 @@ def open(
     path: str,
     max_readers: int = 8,
     watcher_backend: Optional[str] = None,
+    watcher_poll_interval_ms: Optional[int] = None,
 ) -> Database:
     """Open a Honker database at `path`.
 
@@ -1226,9 +1232,15 @@ def open(
 
     Wheels not built with the requested experimental feature raise a
     `ValueError` instead of silently falling back to polling.
+
+    `watcher_poll_interval_ms` raises the default 1 ms watcher cadence
+    when lower idle CPU matters more than lowest-latency wakeups.
     """
     return Database(_core_open(
-        path, max_readers=max_readers, watcher_backend=watcher_backend
+        path,
+        max_readers=max_readers,
+        watcher_backend=watcher_backend,
+        watcher_poll_interval_ms=watcher_poll_interval_ms,
     ))
 
 

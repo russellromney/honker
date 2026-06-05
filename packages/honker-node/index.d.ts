@@ -73,8 +73,11 @@ export declare class UpdateEvents {
  * - `"kernel"` — kernel filesystem notifications (experimental)
  * - `"shm"` — mmap `-shm` fast path (experimental)
  *
+ * `watcherPollIntervalMs` raises the default 1 ms watcher cadence when
+ * lower idle CPU matters more than lowest-latency wakeups.
+ *
  * Experimental backends require the corresponding Cargo feature. Builds
  * without that feature reject an explicit request instead of silently
  * falling back to polling.
  */
-export declare function open(path: string, maxReaders?: number | undefined | null, watcherBackend?: string | undefined | null): Database
+export declare function open(path: string, maxReaders?: number | undefined | null, watcherBackend?: string | undefined | null, watcherPollIntervalMs?: number | undefined | null): Database

@@ -2,6 +2,10 @@ defmodule HonkerWatcherBackendOptionTest do
   use ExUnit.Case, async: true
 
   @candidates [
+    "target/debug/libhonker_ext.dylib",
+    "target/debug/libhonker_ext.so",
+    "target/debug/libhonker_extension.dylib",
+    "target/debug/libhonker_extension.so",
     "target/release/libhonker_ext.dylib",
     "target/release/libhonker_ext.so",
     "target/release/libhonker_extension.dylib",
@@ -54,6 +58,20 @@ defmodule HonkerWatcherBackendOptionTest do
     end
   end
 
+  test "custom watcher poll interval detects commits" do
+    ext = find_extension() || flunk("honker extension not built")
+    dir = Path.join(System.tmp_dir!(), "honker-ex-watch-interval-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "t.db")
+
+    {:ok, db} = Honker.open(path, extension_path: ext, watcher_poll_interval_ms: 25)
+    {:ok, writer} = Honker.open(path, extension_path: ext)
+    {:ok, _} = Honker.notify(writer, "interval", %{ok: true})
+    assert :changed = Honker.wait_for_update(db, 2_000)
+    Honker.close(writer)
+    Honker.close(db)
+  end
+
   test "accepts polling watcher backend aliases before opening sqlite" do
     for backend <- [nil, "", "poll", "polling"] do
       assert {:error, reason} =
@@ -85,6 +103,10 @@ defmodule HonkerWatcherBackendQueueTest do
   use ExUnit.Case, async: false
 
   @candidates [
+    "target/debug/libhonker_ext.dylib",
+    "target/debug/libhonker_ext.so",
+    "target/debug/libhonker_extension.dylib",
+    "target/debug/libhonker_extension.so",
     "target/release/libhonker_ext.dylib",
     "target/release/libhonker_ext.so",
     "target/release/libhonker_extension.dylib",
@@ -295,6 +317,10 @@ defmodule HonkerTest do
   use ExUnit.Case, async: false
 
   @candidates [
+    "target/debug/libhonker_ext.dylib",
+    "target/debug/libhonker_ext.so",
+    "target/debug/libhonker_extension.dylib",
+    "target/debug/libhonker_extension.so",
     "target/release/libhonker_ext.dylib",
     "target/release/libhonker_ext.so",
     "target/release/libhonker_extension.dylib",

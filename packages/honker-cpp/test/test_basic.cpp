@@ -245,6 +245,18 @@ int main(int argc, char** argv) {
         clean_db(p);
     }
 
+    {
+        const auto p = tmp_db("watch-interval");
+        clean_db(p);
+        honker::Database db{p.string(), ext, "", 25};
+        auto sub = db.listen("interval");
+        honker::Database writer{p.string(), ext};
+        writer.notify("interval", R"({"ok":true})");
+        auto n = sub.recv(std::chrono::seconds(2));
+        assert(n.has_value() && "custom watcher poll interval should observe commit");
+        clean_db(p);
+    }
+
     for (const char* backend : {"", "kernel", "shm"}) {
         const std::string label = backend && *backend ? backend : "default";
 
