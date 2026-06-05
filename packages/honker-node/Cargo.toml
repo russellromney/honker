@@ -26,7 +26,7 @@ shm-fast-path = ["honker-core/shm-fast-path"]
 # inside the main honker repo (whether directly or as a submodule).
 # Standalone hacking on this repo alone requires honker-core on
 # crates.io (future) or a manual path override in .cargo/config.toml.
-honker-core = { path = "../../honker-core", version = "0.2.3" }
+honker-core = { path = "../../honker-core", version = "0.2.4" }
 napi = { version = "3.2", features = ["async", "serde-json", "tokio_rt"] }
 napi-derive = "3.2"
 parking_lot = "0.12.5"
@@ -35,7 +35,7 @@ serde_json = "1.0"
 tokio = { version = "1.52.1", features = ["rt", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
-honker-core = { path = "../../honker-core", version = "0.2.3", features = ["bundled-sqlite"] }
+honker-core = { path = "../../honker-core", version = "0.2.4", features = ["bundled-sqlite"] }
 
 [build-dependencies]
 napi-build = "2.2"
