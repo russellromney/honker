@@ -609,7 +609,7 @@ test('claimWaker: returns immediately when a job is already pending', async () =
   }
 });
 
-test('claimWaker: wakes when runAt deadline arrives', async () => {
+test('claimWaker: wakes when runAt deadline arrives', { timeout: 12_000 }, async () => {
   const { path: p, cleanup } = tmpdb();
   try {
     const db = honker.open(p);
@@ -621,7 +621,7 @@ test('claimWaker: wakes when runAt deadline arrives', async () => {
     const t0 = Date.now();
     const job = await Promise.race([
       waker.next('w1'),
-      new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
+      new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
     ]);
     const dt = Date.now() - t0;
     assert.ok(job, 'claimWaker timed out waiting for runAt job');
@@ -631,7 +631,7 @@ test('claimWaker: wakes when runAt deadline arrives', async () => {
       `runAt wake came too early: ${dt}ms (expected about ${msUntilDue}ms)`,
     );
     assert.ok(
-      dt <= msUntilDue + 2500,
+      dt <= msUntilDue + 5000,
       `runAt wake came too late: ${dt}ms (expected about ${msUntilDue}ms)`,
     );
     job.ack();

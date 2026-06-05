@@ -82,7 +82,10 @@ def test_extension_info_loads_sqlite_extension_when_available(tmp_path):
 
     conn = sqlite3.connect(str(tmp_path / "extension-info.db"))
     conn.enable_load_extension(True)
-    conn.load_extension(path, entrypoint=entrypoint)
+    try:
+        conn.load_extension(path, entrypoint=entrypoint)
+    except TypeError:
+        conn.execute("SELECT load_extension(?, ?)", (path, entrypoint))
     conn.execute("SELECT honker_bootstrap()")
 
 
