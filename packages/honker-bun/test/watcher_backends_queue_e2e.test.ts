@@ -9,6 +9,10 @@ import { open } from "../src/index.ts";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const EXT_CANDIDATES = [
+  "target/debug/libhonker_ext.dylib",
+  "target/debug/libhonker_ext.so",
+  "target/debug/libhonker_extension.dylib",
+  "target/debug/libhonker_extension.so",
   "target/release/libhonker_ext.dylib",
   "target/release/libhonker_ext.so",
   "target/release/libhonker_extension.dylib",

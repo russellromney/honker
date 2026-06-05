@@ -11,6 +11,8 @@ defmodule HonkerSmokeTest do
   alias Exqlite.Sqlite3
 
   @candidates [
+    "target/debug/libhonker_ext.dylib",
+    "target/debug/libhonker_ext.so",
     "target/release/libhonker_ext.dylib",
     "target/release/libhonker_ext.so"
   ]
@@ -33,9 +35,13 @@ defmodule HonkerSmokeTest do
         dir = Path.join(System.tmp_dir!(), "honker-smoke-#{System.unique_integer([:positive])}")
         File.mkdir_p!(dir)
         db_path = Path.join(dir, "t.db")
-        on_exit(fn -> File.rm_rf!(dir) end)
 
         {:ok, db} = Honker.open(db_path, extension_path: ext)
+        on_exit(fn ->
+          Honker.close(db)
+          File.rm_rf!(dir)
+        end)
+
         {:ok, %{db: db}}
     end
   end

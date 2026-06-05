@@ -11,6 +11,10 @@ REPO_ROOT = File.expand_path("../../..", __dir__) unless defined?(REPO_ROOT)
 unless defined?(find_extension)
   def find_extension
     %w[
+      target/debug/libhonker_ext.dylib
+      target/debug/libhonker_ext.so
+      target/debug/libhonker_extension.dylib
+      target/debug/libhonker_extension.so
       target/release/libhonker_ext.dylib
       target/release/libhonker_ext.so
       target/release/libhonker_extension.dylib

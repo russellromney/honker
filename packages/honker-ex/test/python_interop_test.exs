@@ -88,8 +88,13 @@ defmodule HonkerPythonInteropTest do
       dir = Path.join(System.tmp_dir!(), "honker-ex-python-#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
       db_path = Path.join(dir, "elixir-python.db")
-      on_exit(fn -> File.rm_rf!(dir) end)
       {:ok, db} = Honker.open(db_path, extension_path: ext)
+
+      on_exit(fn ->
+        Honker.close(db)
+        File.rm_rf!(dir)
+      end)
+
       {:ok, db: db, db_path: db_path, python: python}
     end
   end

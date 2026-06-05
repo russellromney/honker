@@ -51,6 +51,8 @@ except OSError:
 function findExtension(): string | null {
   const candidates = [
     process.env.HONKER_EXT_PATH,
+    join(REPO_ROOT, "target/debug/libhonker_ext.dylib"),
+    join(REPO_ROOT, "target/debug/libhonker_ext.so"),
     join(REPO_ROOT, "target/release/libhonker_ext.dylib"),
     join(REPO_ROOT, "target/release/libhonker_ext.so"),
   ].filter(Boolean) as string[];

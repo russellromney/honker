@@ -216,6 +216,16 @@ defmodule HonkerWatcherBackendQueueTest do
     Honker.close(db)
   end
 
+  defp enqueue_stops(path, ext, count) do
+    {:ok, db} = Honker.open(path, extension_path: ext)
+
+    for _ <- 1..count do
+      {:ok, _} = Honker.Queue.enqueue(db, "shared", %{"stop" => true}, priority: -1)
+    end
+
+    Honker.close(db)
+  end
+
   defp spawn_writer(path, ext, first, count) do
     Task.async(fn -> run_helper(["writer", path, ext, to_string(first), to_string(count)]) end)
   end
@@ -252,6 +262,7 @@ defmodule HonkerWatcherBackendQueueTest do
           {worker, ready} = spawn_worker(path, ext, backend, "w1", dir)
           wait_ready(ready)
           enqueue_range(path, ext, 0, 25)
+          enqueue_stops(path, ext, 1)
           assert_int_set(Task.await(worker, 30_000), 25)
           close_pin(pin)
         end
@@ -274,6 +285,7 @@ defmodule HonkerWatcherBackendQueueTest do
           workers = for i <- 0..2, do: spawn_worker(path, ext, backend, "w#{i}", dir)
           for {_, ready} <- workers, do: wait_ready(ready)
           enqueue_range(path, ext, 0, 60)
+          enqueue_stops(path, ext, length(workers))
           results = workers |> Enum.flat_map(fn {worker, _} -> Task.await(worker, 30_000) end)
           assert_int_set(results, 60)
           assert Enum.uniq(results) |> length() == 60
@@ -303,6 +315,7 @@ defmodule HonkerWatcherBackendQueueTest do
                 do: spawn_writer(path, ext, offset, 20)
 
           Enum.each(writers, &Task.await(&1, 30_000))
+          enqueue_stops(path, ext, 1)
           assert_int_set(Task.await(worker, 30_000), 60)
           close_pin(pin)
         end
@@ -345,13 +358,19 @@ defmodule HonkerTest do
         dir = Path.join(System.tmp_dir!(), "honker-ex-#{System.unique_integer([:positive])}")
         File.mkdir_p!(dir)
         db_path = Path.join(dir, "t.db")
-        on_exit(fn -> File.rm_rf!(dir) end)
-        {:ok, %{ext: ext, db_path: db_path}}
+        {:ok, db} = Honker.open(db_path, extension_path: ext)
+
+        on_exit(fn ->
+          Honker.close(db)
+          File.rm_rf!(dir)
+        end)
+
+        {:ok, %{db: db, ext: ext, db_path: db_path}}
     end
   end
 
   test "enqueue / claim / ack round-trips", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     {:ok, id} = Honker.Queue.enqueue(db, "emails", %{"to" => "alice@example.com"})
     assert id > 0
 
@@ -365,7 +384,7 @@ defmodule HonkerTest do
   end
 
   test "retry-to-dead after max_attempts", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     db = Honker.configure_queue(db, "retries", max_attempts: 2)
 
     {:ok, _} = Honker.Queue.enqueue(db, "retries", %{"i" => 1})
@@ -390,7 +409,7 @@ defmodule HonkerTest do
   end
 
   test "notify inserts into _honker_notifications", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     {:ok, id} = Honker.notify(db, "orders", %{"id" => 42})
     assert id > 0
 
