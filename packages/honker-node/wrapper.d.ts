@@ -173,7 +173,14 @@ export class Database {
   sweepResults(): number
 }
 
-export function open(path: string, maxReaders?: number | null, watcherBackend?: string | null): Database
+export interface OpenOptions {
+  maxReaders?: number | null
+  watcherBackend?: string | null
+  watcherPollIntervalMs?: number | null
+}
+
+export function open(path: string, options?: OpenOptions): Database
+export function open(path: string, maxReaders?: number | null, watcherBackend?: string | null, watcherPollIntervalMs?: number | null): Database
 
 export const native: any
 export const NativeDatabase: any

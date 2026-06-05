@@ -990,24 +990,14 @@ pub fn rate_limit_try(
         rusqlite::params![per],
         |r| r.get(0),
     )?;
-    let current: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(count), 0) FROM _honker_rate_limits
-             WHERE name = ?1 AND window_start = ?2",
-            rusqlite::params![name, window_start],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if current >= limit {
-        return Ok(0);
-    }
-    conn.execute(
+    let changed = conn.execute(
         "INSERT INTO _honker_rate_limits (name, window_start, count)
          VALUES (?1, ?2, 1)
-         ON CONFLICT(name, window_start) DO UPDATE SET count = count + 1",
-        rusqlite::params![name, window_start],
+         ON CONFLICT(name, window_start) DO UPDATE SET count = count + 1
+         WHERE count < ?3",
+        rusqlite::params![name, window_start, limit],
     )?;
-    Ok(1)
+    Ok(if changed > 0 { 1 } else { 0 })
 }
 
 pub fn rate_limit_sweep(conn: &Connection, older_than_s: i64) -> rusqlite::Result<i64> {
@@ -1269,10 +1259,8 @@ pub fn scheduler_update(
     if !exists {
         return Ok(0);
     }
-    let any_field = cron_expr.is_some()
-        || payload.is_some()
-        || priority.is_some()
-        || expires_s.is_some();
+    let any_field =
+        cron_expr.is_some() || payload.is_some() || priority.is_some() || expires_s.is_some();
     if !any_field {
         // No fields to change. Don't wake the leader for a no-op.
         return Ok(0);
@@ -1316,8 +1304,10 @@ pub fn scheduler_update(
         Ok(())
     })();
     if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT honker_sched_update; \
-                                    RELEASE SAVEPOINT honker_sched_update");
+        let _ = conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT honker_sched_update; \
+                                    RELEASE SAVEPOINT honker_sched_update",
+        );
         result?;
     }
     conn.execute_batch("RELEASE SAVEPOINT honker_sched_update")?;

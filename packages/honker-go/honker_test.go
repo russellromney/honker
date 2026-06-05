@@ -19,6 +19,10 @@ func findExtension(t *testing.T) string {
 	// thisFile = .../packages/honker-go/honker_test.go
 	repo := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
 	candidates := []string{
+		filepath.Join(repo, "target/debug/libhonker_ext.dylib"),
+		filepath.Join(repo, "target/debug/libhonker_ext.so"),
+		filepath.Join(repo, "target/debug/libhonker_extension.dylib"),
+		filepath.Join(repo, "target/debug/libhonker_extension.so"),
 		filepath.Join(repo, "target/release/libhonker_ext.dylib"),
 		filepath.Join(repo, "target/release/libhonker_ext.so"),
 		filepath.Join(repo, "target/release/libhonker_extension.dylib"),
@@ -192,6 +196,34 @@ func TestWatcherBackendOptionsDetectCommits(t *testing.T) {
 				t.Fatalf("watcher backend %q did not observe commit", backend)
 			}
 		})
+	}
+}
+
+func TestWatcherPollIntervalOptionDetectsCommits(t *testing.T) {
+	extPath := findExtension(t)
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	db, err := OpenWithOptions(dbPath, extPath, OpenOptions{WatcherPollInterval: 25 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	subID, updateCh := db.updates.subscribe()
+	defer db.updates.unsubscribe(subID)
+
+	writer, err := Open(dbPath, extPath)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer writer.Close()
+	if _, err := writer.Notify("interval", map[string]any{"ok": true}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+
+	select {
+	case <-updateCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("custom watcher poll interval did not observe commit")
 	}
 }
 

@@ -113,11 +113,11 @@ module Honker
   end
 
   class CoreWatcher
-    def initialize(db_path, extension_path, backend)
+    def initialize(db_path, extension_path, backend, watcher_poll_interval_ms)
       @lib = Fiddle.dlopen(extension_path)
       @open = Fiddle::Function.new(
-        @lib["honker_watcher_open"],
-        [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T],
+        @lib["honker_watcher_open_v2"],
+        [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG_LONG, Fiddle::TYPE_VOIDP, Fiddle::TYPE_SIZE_T],
         Fiddle::TYPE_VOIDP,
       )
       @wait = Fiddle::Function.new(
@@ -131,7 +131,13 @@ module Honker
         Fiddle::TYPE_VOID,
       )
       err = "\0" * 1024
-      @handle = @open.call(db_path.to_s, backend.to_s, err, err.bytesize)
+      @handle = @open.call(
+        db_path.to_s,
+        backend.to_s,
+        watcher_poll_interval_ms || 1,
+        err,
+        err.bytesize,
+      )
       return unless @handle.to_i.zero?
 
       raise ArgumentError, err.delete_suffix("\0").split("\0", 2).first
@@ -171,9 +177,13 @@ module Honker
     attr_reader :db
 
     def initialize(path, extension_path: nil, watcher_backend: nil,
+                   watcher_poll_interval_ms: nil,
                    extension_resolver: ExtensionResolver.new)
       unless watcher_backend.nil? || watcher_backend.is_a?(String)
         raise ArgumentError, "unknown watcher backend"
+      end
+      unless watcher_poll_interval_ms.nil? || watcher_poll_interval_ms.to_i.positive?
+        raise ArgumentError, "watcher_poll_interval_ms must be positive"
       end
 
       resolved_extension = extension_resolver.resolve(extension_path)
@@ -186,7 +196,7 @@ module Honker
       @db.enable_load_extension(false)
       @db.execute_batch(DEFAULT_PRAGMAS)
       @db.execute("SELECT honker_bootstrap()")
-      @watcher = CoreWatcher.new(path, resolved_extension, watcher_backend)
+      @watcher = CoreWatcher.new(path, resolved_extension, watcher_backend, watcher_poll_interval_ms)
     end
 
     def close

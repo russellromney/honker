@@ -31,6 +31,7 @@ package honker
 #include <dlfcn.h>
 
 typedef void* (*honker_watcher_open_fn)(const char*, const char*, char*, uintptr_t);
+typedef void* (*honker_watcher_open_v2_fn)(const char*, const char*, uint64_t, char*, uintptr_t);
 typedef int (*honker_watcher_wait_fn)(void*, uint64_t);
 typedef void (*honker_watcher_close_fn)(void*);
 
@@ -63,6 +64,10 @@ static void* honker_dl_sym(void* lib, const char* name, char* err, uintptr_t err
 
 static void* honker_call_watcher_open(void* fn, const char* path, const char* backend, char* err, uintptr_t err_len) {
 	return ((honker_watcher_open_fn)fn)(path, backend, err, err_len);
+}
+
+static void* honker_call_watcher_open_v2(void* fn, const char* path, const char* backend, uint64_t poll_interval_ms, char* err, uintptr_t err_len) {
+	return ((honker_watcher_open_v2_fn)fn)(path, backend, poll_interval_ms, err, err_len);
 }
 
 static int honker_call_watcher_wait(void* fn, void* watcher, uint64_t timeout_ms) {
@@ -108,6 +113,9 @@ type OpenOptions struct {
 	// aliases match the core contract exactly: "", "poll", "polling",
 	// "kernel", "kernel-watcher", "shm", and "shm-fast-path".
 	WatcherBackend string
+	// WatcherPollInterval sets the shared update watcher's polling
+	// cadence. The default is 1 ms.
+	WatcherPollInterval time.Duration
 }
 
 // driverCounter generates a unique sql.Register name per Open() so
@@ -198,7 +206,7 @@ func OpenWithOptions(path string, extensionPath string, opts OpenOptions) (*Data
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 	d := &Database{db: sqlDB, dbPath: path}
-	d.updates, err = newUpdateWatcher(extensionPath, path, opts.WatcherBackend)
+	d.updates, err = newUpdateWatcher(extensionPath, path, opts.WatcherBackend, opts.WatcherPollInterval)
 	if err != nil {
 		sqlDB.Close()
 		return nil, fmt.Errorf("update watcher: %w", err)
@@ -247,12 +255,12 @@ type updateWatcher struct {
 	closeFn  unsafe.Pointer
 }
 
-func newUpdateWatcher(extensionPath string, dbPath string, backend string) (*updateWatcher, error) {
+func newUpdateWatcher(extensionPath string, dbPath string, backend string, pollInterval time.Duration) (*updateWatcher, error) {
 	lib, openFn, waitFn, closeFn, err := loadCoreWatcherABI(extensionPath)
 	if err != nil {
 		return nil, err
 	}
-	watcher, err := openCoreWatcher(openFn, dbPath, backend)
+	watcher, err := openCoreWatcher(openFn, dbPath, backend, pollInterval)
 	if err != nil {
 		C.dlclose(lib)
 		return nil, err
@@ -349,7 +357,7 @@ func loadCoreWatcherABI(extensionPath string) (lib unsafe.Pointer, openFn unsafe
 		}
 	}()
 
-	openFn, err = lookupCoreWatcherSymbol(lib, "honker_watcher_open")
+	openFn, err = lookupCoreWatcherSymbol(lib, "honker_watcher_open_v2")
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -375,16 +383,24 @@ func lookupCoreWatcherSymbol(lib unsafe.Pointer, name string) (unsafe.Pointer, e
 	return sym, nil
 }
 
-func openCoreWatcher(openFn unsafe.Pointer, dbPath string, backend string) (unsafe.Pointer, error) {
+func openCoreWatcher(openFn unsafe.Pointer, dbPath string, backend string, pollInterval time.Duration) (unsafe.Pointer, error) {
 	cPath := C.CString(dbPath)
 	defer C.free(unsafe.Pointer(cPath))
 	cBackend := C.CString(backend)
 	defer C.free(unsafe.Pointer(cBackend))
+	if pollInterval == 0 {
+		pollInterval = time.Millisecond
+	}
+	if pollInterval < 0 {
+		return nil, fmt.Errorf("watcher poll interval must be positive")
+	}
+	pollIntervalMs := uint64((pollInterval + time.Millisecond - 1) / time.Millisecond)
 	errBuf := make([]byte, 1024)
-	watcher := C.honker_call_watcher_open(
+	watcher := C.honker_call_watcher_open_v2(
 		openFn,
 		cPath,
 		cBackend,
+		C.uint64_t(pollIntervalMs),
 		(*C.char)(unsafe.Pointer(&errBuf[0])),
 		C.uintptr_t(len(errBuf)),
 	)

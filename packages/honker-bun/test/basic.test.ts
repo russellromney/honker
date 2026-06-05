@@ -8,6 +8,10 @@ import { open } from "../src/index.ts";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const EXT_CANDIDATES = [
+  "target/debug/libhonker_ext.dylib",
+  "target/debug/libhonker_ext.so",
+  "target/debug/libhonker_extension.dylib",
+  "target/debug/libhonker_extension.so",
   "target/release/libhonker_ext.dylib",
   "target/release/libhonker_ext.so",
   "target/release/libhonker_extension.dylib",
@@ -104,6 +108,31 @@ describe("honker-bun watcher backend option", () => {
         db.close();
         rmSync(dir, { recursive: true, force: true });
       }
+    }
+  });
+
+  test("custom watcherPollIntervalMs detects commits", async () => {
+    if (!extPath) return;
+    const dir = mkdtempSync(join(tmpdir(), "honker-bun-watch-interval-"));
+    const dbPath = join(dir, "t.db");
+    let db: ReturnType<typeof open> | null = null;
+    let writer: ReturnType<typeof open> | null = null;
+    try {
+      db = open(dbPath, extPath, { watcherPollIntervalMs: 25 });
+      const updates = db.updateEvents();
+      writer = open(dbPath, extPath);
+      writer.notify("interval", { ok: true });
+      await Promise.race([
+        updates.next(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("custom watcher interval did not observe commit")), 1000),
+        ),
+      ]);
+      updates.close();
+    } finally {
+      writer?.close();
+      db?.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

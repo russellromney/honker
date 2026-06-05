@@ -65,7 +65,18 @@ impl OpenOptions {
     pub fn watcher_backend(mut self, backend: impl AsRef<str>) -> Result<Self> {
         let backend =
             honker_core::WatcherBackend::parse(Some(backend.as_ref())).map_err(Error::Core)?;
-        self.watcher_config = WatcherConfig { backend };
+        self.watcher_config.backend = backend;
+        Ok(self)
+    }
+
+    /// Set the shared update watcher's polling cadence. The default is
+    /// 1 ms. Raise this when lower idle CPU matters more than the
+    /// lowest-latency cross-process wakeups.
+    pub fn watcher_poll_interval(mut self, interval: Duration) -> Result<Self> {
+        self.watcher_config = self
+            .watcher_config
+            .with_poll_interval(interval)
+            .map_err(Error::Core)?;
         Ok(self)
     }
 }

@@ -581,6 +581,26 @@ fn update_events_wake_on_commit() {
     assert_eq!(got, Some(()), "should wake within 2s of the commit");
 }
 
+#[test]
+fn custom_watcher_poll_interval_wakes_on_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = OpenOptions::default()
+        .watcher_poll_interval(Duration::from_millis(25))
+        .unwrap();
+    let db = Database::open_with_options(tmp.path().join("t.db"), opts).unwrap();
+
+    let events = db.update_events();
+
+    let db2 = db.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        db2.notify("anything", &json!({})).unwrap();
+    });
+
+    let got = events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(got, Some(()), "should wake with custom poll interval");
+}
+
 fn open_backend_or_skip(path: &Path, backend: Option<&str>) -> Option<Database> {
     match backend {
         Some(name) => match OpenOptions::default().watcher_backend(name) {

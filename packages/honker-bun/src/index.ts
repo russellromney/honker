@@ -100,6 +100,11 @@ export interface OpenOptions {
    * when the extension was not built with the matching feature.
    */
   watcherBackend?: string | null;
+  /**
+   * Shared update watcher cadence in milliseconds. Default: 1.
+   * Raise it when lower idle CPU matters more than lowest-latency wakeups.
+   */
+  watcherPollIntervalMs?: number | null;
 }
 
 export interface ScheduledTask {
@@ -192,10 +197,15 @@ class CoreWatcher {
   private readonly handle: unknown;
   private closed = false;
 
-  constructor(dbPath: string, extensionPath: string, watcherBackend?: string | null) {
+  constructor(
+    dbPath: string,
+    extensionPath: string,
+    watcherBackend?: string | null,
+    watcherPollIntervalMs?: number | null,
+  ) {
     this.lib = dlopen(extensionPath, {
-      honker_watcher_open: {
-        args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64],
+      honker_watcher_open_v2: {
+        args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.u64],
         returns: FFIType.ptr,
       },
       honker_watcher_wait: {
@@ -210,9 +220,14 @@ class CoreWatcher {
     const error = Buffer.alloc(1024);
     const dbPathBytes = cString(dbPath);
     const backendBytes = cString(watcherBackend ?? "");
-    this.handle = this.lib.symbols.honker_watcher_open(
+    const pollIntervalMs = watcherPollIntervalMs ?? 1;
+    if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+      throw new Error("watcherPollIntervalMs must be positive");
+    }
+    this.handle = this.lib.symbols.honker_watcher_open_v2(
       dbPathBytes,
       backendBytes,
+      BigInt(Math.ceil(pollIntervalMs)),
       error,
       BigInt(error.length),
     );
@@ -262,8 +277,14 @@ export class Database {
     dbPath: string,
     extensionPath: string,
     watcherBackend?: string | null,
+    watcherPollIntervalMs?: number | null,
   ) {
-    this._watcher = new CoreWatcher(dbPath, extensionPath, watcherBackend);
+    this._watcher = new CoreWatcher(
+      dbPath,
+      extensionPath,
+      watcherBackend,
+      watcherPollIntervalMs,
+    );
   }
 
   /** Get a handle to a named queue. */
@@ -423,7 +444,13 @@ export function open(
   raw.loadExtension(extensionPath);
   raw.exec(DEFAULT_PRAGMAS);
   raw.exec("SELECT honker_bootstrap()");
-  return new Database(raw, path, extensionPath, opts.watcherBackend);
+  return new Database(
+    raw,
+    path,
+    extensionPath,
+    opts.watcherBackend,
+    opts.watcherPollIntervalMs,
+  );
 }
 
 // ---------------------------------------------------------------------

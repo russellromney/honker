@@ -2,6 +2,10 @@ defmodule PhaseMantleTest do
   use ExUnit.Case, async: false
 
   @candidates [
+    "target/debug/libhonker_ext.dylib",
+    "target/debug/libhonker_ext.so",
+    "target/debug/libhonker_extension.dylib",
+    "target/debug/libhonker_extension.so",
     "target/release/libhonker_ext.dylib",
     "target/release/libhonker_ext.so",
     "target/release/libhonker_extension.dylib",
@@ -26,13 +30,19 @@ defmodule PhaseMantleTest do
         dir = Path.join(System.tmp_dir!(), "honker-mantle-#{System.unique_integer([:positive])}")
         File.mkdir_p!(dir)
         db_path = Path.join(dir, "t.db")
-        on_exit(fn -> File.rm_rf!(dir) end)
-        {:ok, %{ext: ext, db_path: db_path}}
+        {:ok, db} = Honker.open(db_path, extension_path: ext)
+
+        on_exit(fn ->
+          Honker.close(db)
+          File.rm_rf!(dir)
+        end)
+
+        {:ok, %{db: db, ext: ext, db_path: db_path}}
     end
   end
 
   test "schedule list round-trips fields", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     :ok =
       Honker.Scheduler.add(db,
         name: "recap",
@@ -60,7 +70,7 @@ defmodule PhaseMantleTest do
   end
 
   test "pause / resume idempotent", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     :ok =
       Honker.Scheduler.add(db,
         name: "a",
@@ -83,7 +93,7 @@ defmodule PhaseMantleTest do
   end
 
   test "update mutates fields, no-op on empty, recomputes next_fire_at on cron change", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     :ok =
       Honker.Scheduler.add(db,
         name: "t",
@@ -110,7 +120,7 @@ defmodule PhaseMantleTest do
   end
 
   test "queue cancel + get_job", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     {:ok, id} = Honker.Queue.enqueue(db, "emails", %{"to" => "alice@example.com"})
 
     {:ok, row} = Honker.Queue.get_job(db, id)
@@ -125,7 +135,7 @@ defmodule PhaseMantleTest do
   end
 
   test "cancel of processing invalidates ack", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     {:ok, id} = Honker.Queue.enqueue(db, "emails", %{"to" => "x"})
     {:ok, job} = Honker.Queue.claim_one(db, "emails", "worker-1")
     assert job.id == id
@@ -135,7 +145,7 @@ defmodule PhaseMantleTest do
   end
 
   test "paused schedule does not emit on tick", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     :ok =
       Honker.Scheduler.add(db,
         name: "due",
@@ -156,7 +166,7 @@ defmodule PhaseMantleTest do
   end
 
   test "get_job misses after ack (separate from cancel)", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     {:ok, id} = Honker.Queue.enqueue(db, "emails", %{"to" => "x"})
     {:ok, job} = Honker.Queue.claim_one(db, "emails", "worker-1")
     assert {:ok, true} = Honker.Job.ack(db, job)
@@ -164,7 +174,7 @@ defmodule PhaseMantleTest do
   end
 
   test "update payload null vs omitted distinction", ctx do
-    {:ok, db} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+    db = ctx.db
     :ok =
       Honker.Scheduler.add(db,
         name: "t",

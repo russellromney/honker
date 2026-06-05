@@ -24,7 +24,7 @@
 //!     acquire, non-blocking try_acquire, and release.
 //!   - [`Readers`] — bounded pool of reader connections that open
 //!     lazily up to a max.
-//!   - [`UpdateWatcher`] — 1 ms PRAGMA-polling thread that fires a
+//!   - [`UpdateWatcher`] — PRAGMA-polling thread that fires a
 //!     callback on every database commit. Uses `PRAGMA data_version`
 //!     for precise change detection, with a periodic stat identity check
 //!     to detect file replacement. Bindings wrap this to surface wake
@@ -59,13 +59,13 @@ use std::time::{Duration, Instant};
 
 /// Which backend drives the update-detection loop.
 ///
-/// `Polling` is the default: 1 ms `PRAGMA data_version` loop, proven
+/// `Polling` is the default: `PRAGMA data_version` loop, proven
 /// correct across all platforms. The optional backends are **experimental**
 /// — they must first prove equivalence to the polling path before
 /// being relied on for correctness.
 #[derive(Debug, Clone, Default)]
 pub enum WatcherBackend {
-    /// Default: 1 ms `PRAGMA data_version` polling loop.
+    /// Default: `PRAGMA data_version` polling loop.
     #[default]
     Polling,
     /// OS kernel filesystem notifications (experimental).
@@ -89,11 +89,40 @@ pub enum WatcherBackend {
     ShmFastPath,
 }
 
+pub const DEFAULT_WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
 /// Configuration passed to [`UpdateWatcher::spawn_with_config`] and
 /// [`SharedUpdateWatcher::new_with_config`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WatcherConfig {
     pub backend: WatcherBackend,
+    pub poll_interval: Duration,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            backend: WatcherBackend::default(),
+            poll_interval: DEFAULT_WATCHER_POLL_INTERVAL,
+        }
+    }
+}
+
+impl WatcherConfig {
+    pub fn with_backend(backend: WatcherBackend) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Result<Self, String> {
+        if poll_interval.is_zero() {
+            return Err("watcher poll interval must be positive".to_string());
+        }
+        self.poll_interval = poll_interval;
+        Ok(self)
+    }
 }
 
 impl WatcherBackend {
@@ -680,9 +709,9 @@ fn is_transient_lock_error(e: &rusqlite::Error) -> bool {
 ///
 /// Three-layer defensive architecture:
 ///
-/// 1. **Fast path (every 1 ms):** `PRAGMA data_version`. Compare the
+/// 1. **Fast path:** `PRAGMA data_version`. Compare the
 ///    integer to last seen value. Notify on change. (~3.5 µs/call.)
-/// 2. **Error recovery (every 1 ms on failure):** If the query fails,
+/// 2. **Error recovery:** If the query fails,
 ///    reconnect the SQLite connection and force one wake.
 /// 3. **Identity check (about every 100 ms):** `stat(db_path)` to compare
 ///    `(dev, ino)`. If the file was replaced, panic with a clear
@@ -692,6 +721,7 @@ pub(crate) fn run_poll_loop<F>(
     on_change: F,
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::SyncSender<()>,
+    poll_interval: Duration,
 ) where
     F: Fn(),
 {
@@ -724,7 +754,7 @@ pub(crate) fn run_poll_loop<F>(
     drop(ready);
 
     while !stop.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(poll_interval);
 
         // Path 1: PRAGMA data_version (fast path)
         if let Some(ref c) = conn {
@@ -836,7 +866,9 @@ impl UpdateWatcher {
         let handle = std::thread::Builder::new()
             .name("honker-update-poll".into())
             .spawn(move || match config.backend {
-                WatcherBackend::Polling => run_poll_loop(db_path, on_change, stop_t, ready_tx),
+                WatcherBackend::Polling => {
+                    run_poll_loop(db_path, on_change, stop_t, ready_tx, config.poll_interval)
+                }
                 #[cfg(feature = "kernel-watcher")]
                 WatcherBackend::KernelWatch => {
                     kernel_watcher::run_kernel_watch_loop(db_path, on_change, stop_t, ready_tx);
@@ -2329,6 +2361,7 @@ while True:
             },
             WatcherConfig {
                 backend: WatcherBackend::KernelWatch,
+                ..WatcherConfig::default()
             },
         );
 
@@ -2407,6 +2440,7 @@ while True:
             },
             WatcherConfig {
                 backend: WatcherBackend::ShmFastPath,
+                ..WatcherConfig::default()
             },
         );
 
@@ -2487,7 +2521,7 @@ while True:
             move || {
                 count_t.fetch_add(1, AO::Relaxed);
             },
-            WatcherConfig { backend },
+            WatcherConfig::with_backend(backend),
         );
 
         // Drain init wakes (covers shm + kernel setup) before baseline.
@@ -2704,7 +2738,7 @@ while True:
                     .expect("wake_times mutex poisoned")
                     .push(std::time::Instant::now());
             },
-            WatcherConfig { backend },
+            WatcherConfig::with_backend(backend),
         );
 
         // Drain initialization wakes.
@@ -2768,7 +2802,10 @@ while True:
         ignore = "notify/kqueue can drop the watcher thread under CI load; functional kernel watcher tests still run"
     )]
     #[cfg(feature = "kernel-watcher")]
-    #[cfg_attr(target_os = "macos", ignore = "kqueue under CI load may deliver zero wakes")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "kqueue under CI load may deliver zero wakes"
+    )]
     fn kernel_watcher_wake_latency_is_event_driven() {
         let tmp = std::env::temp_dir().join(format!(
             "honker-kw-lat-{}-{}",
@@ -2872,6 +2909,7 @@ while True:
             || {},
             WatcherConfig {
                 backend: WatcherBackend::KernelWatch,
+                ..WatcherConfig::default()
             },
         );
 
@@ -2929,6 +2967,14 @@ while True:
             WatcherBackend::parse(Some("polling")),
             Ok(WatcherBackend::Polling)
         ));
+    }
+
+    #[test]
+    fn watcher_config_rejects_zero_poll_interval() {
+        let err = WatcherConfig::default()
+            .with_poll_interval(Duration::from_millis(0))
+            .unwrap_err();
+        assert_eq!(err, "watcher poll interval must be positive");
     }
 
     #[test]
@@ -3062,8 +3108,11 @@ while True:
             f.write_all(&buf).unwrap();
         }
 
-        let watcher =
-            UpdateWatcher::spawn_with_config(tmp.clone(), || {}, WatcherConfig { backend });
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            || {},
+            WatcherConfig::with_backend(backend),
+        );
         // Generous initial wait so the watcher has snapshotted the
         // initial inode under CI scheduling pressure.
         std::thread::sleep(Duration::from_millis(300));

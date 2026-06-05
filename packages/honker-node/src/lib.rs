@@ -41,9 +41,16 @@ fn napi_err(e: impl std::fmt::Display) -> napi::Error {
     napi::Error::new(napi::Status::GenericFailure, e.to_string())
 }
 
-fn parse_watcher_backend(backend: Option<String>) -> Result<WatcherConfig> {
+fn parse_watcher_config(
+    backend: Option<String>,
+    watcher_poll_interval_ms: Option<u32>,
+) -> Result<WatcherConfig> {
     honker_core::WatcherBackend::parse(backend.as_deref())
-        .map(|backend| WatcherConfig { backend })
+        .map(WatcherConfig::with_backend)
+        .and_then(|config| match watcher_poll_interval_ms {
+            Some(ms) => config.with_poll_interval(std::time::Duration::from_millis(ms as u64)),
+            None => Ok(config),
+        })
         .map_err(napi_err)
 }
 
@@ -435,6 +442,9 @@ impl UpdateEvents {
 /// - `"kernel"` — kernel filesystem notifications (experimental)
 /// - `"shm"` — mmap `-shm` fast path (experimental)
 ///
+/// `watcherPollIntervalMs` raises the default 1 ms watcher cadence when
+/// lower idle CPU matters more than lowest-latency wakeups.
+///
 /// Experimental backends require the corresponding Cargo feature. Builds
 /// without that feature reject an explicit request instead of silently
 /// falling back to polling.
@@ -443,9 +453,10 @@ pub fn open(
     path: String,
     max_readers: Option<u32>,
     watcher_backend: Option<String>,
+    watcher_poll_interval_ms: Option<u32>,
 ) -> Result<Database> {
     let max_readers = max_readers.unwrap_or(8).max(1) as usize;
-    let watcher_config = parse_watcher_backend(watcher_backend)?;
+    let watcher_config = parse_watcher_config(watcher_backend, watcher_poll_interval_ms)?;
     let writer_conn = open_conn(&path, true).map_err(napi_err)?;
     // Register every honker_* SQL scalar on the writer connection so
     // Node callers get the full queue / scheduler / stream surface

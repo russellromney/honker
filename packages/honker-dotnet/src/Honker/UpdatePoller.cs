@@ -5,9 +5,10 @@ namespace Honker;
 
 internal sealed class UpdatePoller : IDisposable
 {
-    private delegate IntPtr WatcherOpen(
+    private delegate IntPtr WatcherOpenV2(
         [MarshalAs(UnmanagedType.LPUTF8Str)] string dbPath,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string? backend,
+        ulong watcherPollIntervalMs,
         byte[] error,
         UIntPtr errorLen);
 
@@ -20,13 +21,17 @@ internal sealed class UpdatePoller : IDisposable
     private readonly WatcherClose _close;
     private bool _disposed;
 
-    public UpdatePoller(string dbPath, string extensionPath, string? watcherBackend)
+    public UpdatePoller(string dbPath, string extensionPath, string? watcherBackend, TimeSpan updatePollInterval)
     {
+        if (updatePollInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentException("UpdatePollInterval must be positive", nameof(updatePollInterval));
+        }
         _library = NativeLibrary.Load(extensionPath);
         try
         {
-            var open = Marshal.GetDelegateForFunctionPointer<WatcherOpen>(
-                NativeLibrary.GetExport(_library, "honker_watcher_open")
+            var open = Marshal.GetDelegateForFunctionPointer<WatcherOpenV2>(
+                NativeLibrary.GetExport(_library, "honker_watcher_open_v2")
             );
             _wait = Marshal.GetDelegateForFunctionPointer<WatcherWait>(
                 NativeLibrary.GetExport(_library, "honker_watcher_wait")
@@ -36,7 +41,8 @@ internal sealed class UpdatePoller : IDisposable
             );
 
             var error = new byte[1024];
-            _watcher = open(dbPath, watcherBackend, error, (UIntPtr)error.Length);
+            var pollIntervalMs = Math.Max(1UL, (ulong)Math.Ceiling(updatePollInterval.TotalMilliseconds));
+            _watcher = open(dbPath, watcherBackend, pollIntervalMs, error, (UIntPtr)error.Length);
             if (_watcher == IntPtr.Zero)
             {
                 throw new InvalidOperationException(DecodeError(error));

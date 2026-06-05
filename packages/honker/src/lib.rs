@@ -22,9 +22,16 @@ fn core_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-fn parse_watcher_backend(backend: Option<String>) -> PyResult<WatcherConfig> {
+fn parse_watcher_config(
+    backend: Option<String>,
+    watcher_poll_interval_ms: Option<u64>,
+) -> PyResult<WatcherConfig> {
     honker_core::WatcherBackend::parse(backend.as_deref())
-        .map(|backend| WatcherConfig { backend })
+        .map(WatcherConfig::with_backend)
+        .and_then(|config| match watcher_poll_interval_ms {
+            Some(ms) => config.with_poll_interval(std::time::Duration::from_millis(ms)),
+            None => Ok(config),
+        })
         .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
@@ -172,13 +179,14 @@ struct Database {
 #[pymethods]
 impl Database {
     #[new]
-    #[pyo3(signature = (path, max_readers=8, watcher_backend=None))]
+    #[pyo3(signature = (path, max_readers=8, watcher_backend=None, watcher_poll_interval_ms=None))]
     fn new(
         path: String,
         max_readers: usize,
         watcher_backend: Option<String>,
+        watcher_poll_interval_ms: Option<u64>,
     ) -> PyResult<Self> {
-        let watcher_config = parse_watcher_backend(watcher_backend)?;
+        let watcher_config = parse_watcher_config(watcher_backend, watcher_poll_interval_ms)?;
         // Writer conn registers the notify() SQL function + ensures
         // _honker_notifications exists. Readers just SELECT.
         let writer_conn = open_conn(&path, true).map_err(core_err)?;
@@ -650,13 +658,14 @@ impl UpdateEvents {
 // ---------------------------------------------------------------------
 
 #[pyfunction]
-#[pyo3(signature = (path, max_readers=8, watcher_backend=None))]
+#[pyo3(signature = (path, max_readers=8, watcher_backend=None, watcher_poll_interval_ms=None))]
 fn open(
     path: String,
     max_readers: usize,
     watcher_backend: Option<String>,
+    watcher_poll_interval_ms: Option<u64>,
 ) -> PyResult<Database> {
-    Database::new(path, max_readers, watcher_backend)
+    Database::new(path, max_readers, watcher_backend, watcher_poll_interval_ms)
 }
 
 /// Compute the next unix timestamp strictly after `from_unix` that

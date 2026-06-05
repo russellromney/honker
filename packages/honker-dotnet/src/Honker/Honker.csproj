@@ -7,7 +7,7 @@
     <RootNamespace>Honker</RootNamespace>
     <IsPackable>true</IsPackable>
     <PackageId>Honker</PackageId>
-    <Version>0.2.4</Version>
+    <Version>0.2.5</Version>
     <Authors>Russell Romney</Authors>
     <Description>SQLite queue, notify/listen, streams, scheduler, and outbox bindings for .NET via the Honker loadable extension.</Description>
     <PackageTags>sqlite;queue;pubsub;notify;listen;stream;outbox;scheduler</PackageTags>

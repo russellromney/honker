@@ -61,10 +61,14 @@ defmodule Honker do
   Honker extension. It accepts the same aliases as the other bindings:
   `nil`, `""`, `"poll"`, `"polling"`, `"kernel"`, `"kernel-watcher"`,
   `"shm"`, and `"shm-fast-path"`.
+
+  `:watcher_poll_interval_ms` raises the default 1 ms update watcher
+  cadence when lower idle CPU matters more than lowest-latency wakeups.
   """
   def open(path, opts) do
     extension_path = Keyword.fetch!(opts, :extension_path)
     backend = watcher_backend_param(Keyword.get(opts, :watcher_backend))
+    watcher_poll_interval_ms = Keyword.get(opts, :watcher_poll_interval_ms, 1)
 
     with {:ok, conn} <- Sqlite3.open(path),
          :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout = 5000;"),
@@ -74,7 +78,11 @@ defmodule Honker do
          :ok <- Sqlite3.execute(conn, @default_pragmas),
          :ok <- run_bare(conn, "SELECT honker_bootstrap()", []),
          {:ok, [watcher_id]} <-
-           query_first(conn, "SELECT honker_update_watcher_open(?1, ?2)", [path, backend]) do
+           query_first(conn, "SELECT honker_update_watcher_open(?1, ?2, ?3)", [
+             path,
+             backend,
+             watcher_poll_interval_ms
+           ]) do
       {:ok, %Database{conn: conn, path: path, watcher_id: watcher_id}}
     end
   end

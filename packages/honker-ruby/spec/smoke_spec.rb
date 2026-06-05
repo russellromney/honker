@@ -15,6 +15,8 @@ REPO_ROOT = File.expand_path("../../..", __dir__) unless defined?(REPO_ROOT)
 
 def find_ext
   %w[
+    target/debug/libhonker_ext.dylib
+    target/debug/libhonker_ext.so
     target/release/libhonker_ext.dylib
     target/release/libhonker_ext.so
   ].each do |rel|

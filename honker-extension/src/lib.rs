@@ -69,12 +69,17 @@ static NEXT_SQL_WATCHER_ID: AtomicU64 = AtomicU64::new(1);
 fn open_watcher_handle(
     db_path: &str,
     backend: Option<&str>,
+    watcher_poll_interval_ms: Option<u64>,
 ) -> std::result::Result<HonkerWatcherHandle, String> {
     let backend = honker_core::WatcherBackend::parse(backend.filter(|s| !s.is_empty()))?;
     backend.probe(PathBuf::from(db_path).as_path())?;
+    let mut config = honker_core::WatcherConfig::with_backend(backend);
+    if let Some(ms) = watcher_poll_interval_ms {
+        config = config.with_poll_interval(Duration::from_millis(ms))?;
+    }
     let shared = Arc::new(honker_core::SharedUpdateWatcher::new_with_config(
         PathBuf::from(db_path),
-        honker_core::WatcherConfig { backend },
+        config,
     ));
     let (sub_id, rx) = shared.subscribe();
     Ok(HonkerWatcherHandle { shared, sub_id, rx })
@@ -88,9 +93,27 @@ fn attach_watcher_sql_functions(conn: &Connection) -> Result<()> {
         |ctx| {
             let db_path: String = ctx.get(0)?;
             let backend: Option<String> = ctx.get(1)?;
-            let handle = open_watcher_handle(&db_path, backend.as_deref()).map_err(|e| {
+            let handle = open_watcher_handle(&db_path, backend.as_deref(), None).map_err(|e| {
                 rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(e)))
             })?;
+            let id = NEXT_SQL_WATCHER_ID.fetch_add(1, Ordering::Relaxed);
+            SQL_WATCHERS.lock().unwrap().insert(id, handle);
+            Ok(id as i64)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_update_watcher_open",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let db_path: String = ctx.get(0)?;
+            let backend: Option<String> = ctx.get(1)?;
+            let poll_interval_ms: Option<i64> = ctx.get(2)?;
+            let poll_interval_ms = poll_interval_ms.map(|ms| ms.max(0) as u64);
+            let handle = open_watcher_handle(&db_path, backend.as_deref(), poll_interval_ms)
+                .map_err(|e| {
+                    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(e)))
+                })?;
             let id = NEXT_SQL_WATCHER_ID.fetch_add(1, Ordering::Relaxed);
             SQL_WATCHERS.lock().unwrap().insert(id, handle);
             Ok(id as i64)
@@ -266,7 +289,46 @@ pub unsafe extern "C" fn honker_watcher_open(
             .to_str()
             .map_err(|e| format!("invalid db_path UTF-8: {e}"))?;
         let backend = unsafe { cstr_to_string(backend) }?;
-        let handle = open_watcher_handle(path, backend.as_deref())?;
+        let handle = open_watcher_handle(path, backend.as_deref(), None)?;
+        Ok(Box::into_raw(Box::new(handle)))
+    })) {
+        Ok(Ok(ptr)) => ptr,
+        Ok(Err(err)) => {
+            unsafe { write_error(err_buf, err_buf_len, &err) };
+            ptr::null_mut()
+        }
+        Err(payload) => {
+            let err = panic_error(payload).to_string();
+            unsafe { write_error(err_buf, err_buf_len, &err) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Open a core-backed update watcher over `db_path` with options.
+///
+/// `watcher_poll_interval_ms` must be positive. Use `honker_watcher_open`
+/// for the default 1 ms cadence.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated strings when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn honker_watcher_open_v2(
+    db_path: *const c_char,
+    backend: *const c_char,
+    watcher_poll_interval_ms: u64,
+    err_buf: *mut c_char,
+    err_buf_len: usize,
+) -> *mut HonkerWatcherHandle {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if db_path.is_null() {
+            return Err("db_path is null".to_string());
+        }
+        let path = unsafe { CStr::from_ptr(db_path) }
+            .to_str()
+            .map_err(|e| format!("invalid db_path UTF-8: {e}"))?;
+        let backend = unsafe { cstr_to_string(backend) }?;
+        let handle = open_watcher_handle(path, backend.as_deref(), Some(watcher_poll_interval_ms))?;
         Ok(Box::into_raw(Box::new(handle)))
     })) {
         Ok(Ok(ptr)) => ptr,

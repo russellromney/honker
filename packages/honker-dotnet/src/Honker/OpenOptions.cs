@@ -5,7 +5,7 @@ namespace Honker;
 public sealed class OpenOptions
 {
     public string? ExtensionPath { get; init; }
-    public TimeSpan UpdatePollInterval { get; init; } = TimeSpan.FromMilliseconds(5);
+    public TimeSpan UpdatePollInterval { get; init; } = TimeSpan.FromMilliseconds(1);
     /// <summary>
     /// Update-detection backend implemented by honker-core through the
     /// loaded Honker extension. Accepted aliases match the core contract:
