@@ -639,6 +639,92 @@ adoption.
 - No marketing/positioning change. Just close the specific gaps the
   HN audience pointed at.
 
+## Phase Robinson — Native Turso Engine Backend
+
+> After: 1.0 release prep · gated on upstream Turso
+
+Jackie Robinson crossed into a league that wasn't open to him. This
+phase gets honker running on **Turso** (the Rust rewrite of SQLite, the
+engine [pgmicro](https://github.com/glommer/pgmicro) is built on), which
+exposes none of the primitives honker relies on. Origin: a thread with
+@glcst (Turso CEO) asking to integrate honker natively and expose
+`LISTEN`/`NOTIFY`/`pg_notify()` through pgmicro —
+https://x.com/LeMikaelF/status/2059589419447750957.
+
+Tracking issue: #59. Upstream Turso issue:
+[tursodatabase/turso#7397](https://github.com/tursodatabase/turso/issues/7397).
+
+### State (do not lose this thread)
+
+- **Upstream is the gate and will take time.** Turso has no
+  `PRAGMA data_version`, no `.so` loadable extensions, and no
+  `update_hook`/`commit_hook`. honker's three SQLite wake paths
+  (data_version polling, extension load, shm fast-path) are all dead on
+  the rewrite — Turso's WAL index is a Turso-specific `-tshm` format, not
+  SQLite's `-shm`.
+- **Replacement found + proven.** The WAL's shared `max_frame` counter is
+  the `data_version` analog. The public `Connection::wal_state().max_frame`
+  reads the **wrong** counter (a per-connection local mirror that never
+  refreshes cross-process for an idle reader). A cross-process spike
+  confirmed it: 0 wakes via `wal_state()`, 20/20 wakes via the
+  shared-authority value (`Wal::get_max_frame_in_wal()`).
+- **~26-line additive patch** exposing `Connection::wal_max_frame_in_wal()`
+  is written and working on a Turso fork; PR is held pending maintainer
+  confirmation in #7397 (also asked whether they'd prefer a real push
+  commit-hook instead of poll).
+- **Multi-process is opt-in on Turso**:
+  `DatabaseOpts::new().with_multiprocess_wal(true)` — default open takes an
+  exclusive file lock. `TursoEngine` must set this.
+
+### Scope
+
+- [ ] **`Engine` seam** — abstract honker-core off the concrete rusqlite
+  `Connection`. `honker_ops.rs` takes `&dyn Engine`. The whole
+  engine difference collapses into `Engine::commit_version()`:
+  SQLite reads `PRAGMA data_version`, Turso reads `wal_max_frame_in_wal()`.
+  This is the main internal refactor and is **independent of upstream** —
+  can start now.
+- [ ] `SqliteEngine` — today's rusqlite path behind the new trait; serves
+  SQLite **and libSQL** (a free third target — real `.so` + data_version).
+- [ ] `TursoEngine` — native `turso` crate. Opens with
+  `with_multiprocess_wal(true)`; wake via `wal_max_frame_in_wal()`. Async
+  is contained: it owns its IoWorker thread and `block_on`s internally,
+  exposing the same blocking `Engine` API. honker-core and every binding
+  stay sync.
+- [ ] `run_poll_loop` reads `engine.commit_version()` instead of issuing
+  `PRAGMA data_version` directly.
+- [ ] Binding `open()` gains an `engine=` selector (mirrors
+  `watcher_backend=`); default `sqlite`.
+- [ ] *(later, separate)* Turso-native extension surface via
+  `register_extension!` for the "any Turso client / ORM-owned connection"
+  story. `notify()` can't be a stateless scalar there (no DB handle) — it
+  becomes a virtual table (vtabs get `Arc<Connection>`). Not needed for the
+  honker-core-driven first cut.
+
+### Acceptance
+
+- [ ] Cross-process wake suite passes under `TursoEngine` (writer process
+  commits, reader process wakes) — the same proof shape honker requires of
+  every backend.
+- [ ] Queue claim/ack and notify/listen round-trip on Turso in WAL mode.
+- [ ] SQLite path is byte-for-byte unchanged behavior behind the new trait
+  (existing tests pass without modification).
+- [ ] Release-build wake latency on Turso measured and documented vs the
+  ~1–2 ms SQLite baseline (spike saw ~9–10 ms debug; needs real numbers).
+
+### Non-goals
+
+- **MVCC / concurrent-writes mode.** honker-on-Turso starts in WAL
+  (non-MVCC). `max_frame`/CDC live in WAL mode; the single-writer claim/ack
+  model is unchanged. Concurrent-write support is a separate phase that
+  would need a different wake primitive (a commit broadcast).
+- **CDC as the wake source.** `turso_cdc` is poll-only, per-connection
+  opt-in, and off under MVCC — can't passively observe arbitrary app
+  commits. Possibly a typed change-feed feature later; not the wake path.
+- **Forking Turso.** The only upstream need is the small additive accessor
+  (and ideally, later, a push commit-hook). Both are public-API-shaped and
+  upstreamable; honker does not vendor a patched engine.
+
 ## Release Automation
 
 
