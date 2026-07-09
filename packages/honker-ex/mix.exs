@@ -23,7 +23,8 @@ defmodule Honker.MixProject do
   defp deps do
     [
       {:exqlite, "~> 0.24"},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end
 

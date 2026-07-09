@@ -40,12 +40,14 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        with:
-          targets: ${{ matrix.rust_target }}
+      - name: Set up Rust
+        run: |
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
+          package-manager-cache: false
 
       - name: Build native package
         working-directory: packages/honker-node
@@ -78,6 +80,7 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       - name: Download native artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
@@ -91,18 +94,21 @@ jobs:
         run: |
           npm install
           npm exec -- napi artifacts --output-dir . --npm-dir npm
-          npm exec -- napi pre-publish --npm-dir npm
           for dir in npm/*; do
             test -f "$dir"/honker.*.node
           done
           mkdir -p "$RUNNER_TEMP/node-consumer"
           npm pack --pack-destination "$RUNNER_TEMP/node-consumer"
           for dir in npm/*; do
-            npm pack "$dir" --pack-destination "$RUNNER_TEMP/node-consumer"
+            npm pack "./$dir" --pack-destination "$RUNNER_TEMP/node-consumer"
           done
           cd "$RUNNER_TEMP/node-consumer"
           npm init -y >/dev/null
-          npm install ./*.tgz >/dev/null
+          root_tgz=$(find . -maxdepth 1 -name 'russellthehippo-honker-node-[0-9]*.tgz' -print -quit)
+          platform_tgz=$(find . -maxdepth 1 -name 'russellthehippo-honker-node-linux-x64-gnu-*.tgz' -print -quit)
+          test -n "$root_tgz"
+          test -n "$platform_tgz"
+          npm install "$root_tgz" "$platform_tgz" >/dev/null
           node - <<'JS'
           const assert = require('node:assert/strict');
           const fs = require('node:fs');
@@ -140,6 +146,6 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for dir in npm/*; do
-            npm publish "$dir" --access public --ignore-scripts
+            npm publish "./$dir" --access public --ignore-scripts
           done
           npm publish --access public --ignore-scripts
