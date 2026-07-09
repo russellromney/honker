@@ -20,6 +20,7 @@
 
 use rusqlite::Connection;
 use rusqlite::functions::FunctionFlags;
+use serde_json::{Value, json};
 
 /// Wrap a Displayable error for SQLite scalar-function returns.
 fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
@@ -571,22 +572,21 @@ pub fn claim_batch(
             row.get::<_, i64>(5)?,
         ))
     })?;
-    let mut out = String::from("[");
-    let mut first = true;
+    let mut out = Vec::new();
     for row in rows {
         let (id, q, payload, w, attempts, claim_expires_at) = row?;
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        out.push_str(&format!(
-            "{{\"id\":{},\"queue\":{},\"payload\":{},\"worker_id\":{},\"attempts\":{},\"claim_expires_at\":{}}}",
-            id, json_str(&q), json_str(&payload), json_str(&w),
-            attempts, claim_expires_at,
-        ));
+        // payload stays a JSON string (double-encoded on the wire) so
+        // every binding's existing parse path keeps working.
+        out.push(json!({
+            "id": id,
+            "queue": q,
+            "payload": payload,
+            "worker_id": w,
+            "attempts": attempts,
+            "claim_expires_at": claim_expires_at,
+        }));
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
@@ -912,32 +912,21 @@ pub fn get_job(conn: &Connection, job_id: i64) -> rusqlite::Result<String> {
     else {
         return Ok(String::new());
     };
-    let opt_str = |v: &Option<String>| match v {
-        Some(s) => json_str(s),
-        None => "null".into(),
-    };
-    let opt_i = |v: Option<i64>| match v {
-        Some(n) => n.to_string(),
-        None => "null".into(),
-    };
-    Ok(format!(
-        "{{\"id\":{},\"queue\":{},\"payload\":{},\"state\":{},\
-         \"priority\":{},\"run_at\":{},\"worker_id\":{},\
-         \"claim_expires_at\":{},\"attempts\":{},\"max_attempts\":{},\
-         \"created_at\":{},\"expires_at\":{}}}",
-        id,
-        json_str(&queue),
-        json_str(&payload),
-        json_str(&state),
-        priority,
-        run_at,
-        opt_str(&worker_id),
-        opt_i(claim_expires_at),
-        attempts,
-        max_attempts,
-        created_at,
-        opt_i(expires_at),
-    ))
+    Ok(json!({
+        "id": id,
+        "queue": queue,
+        "payload": payload,
+        "state": state,
+        "priority": priority,
+        "run_at": run_at,
+        "worker_id": worker_id,
+        "claim_expires_at": claim_expires_at,
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    })
+    .to_string())
 }
 
 /// Extend the current claim by `extend_s` seconds. Returns 1 if the
@@ -1219,8 +1208,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
         })?
         .collect::<Result<Vec<_>, _>>()?
     };
-    let mut out = String::from("[");
-    let mut first = true;
+    let mut out = Vec::new();
     for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at) in tasks {
         let mut fires_this_task: i64 = 0;
         while next_fire_at <= now_unix {
@@ -1238,17 +1226,12 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 conn, &queue, &payload, None, None, priority, 3, /* max_attempts default */
                 expires_s,
             )?;
-            if !first {
-                out.push(',');
-            }
-            first = false;
-            out.push_str(&format!(
-                "{{\"name\":{},\"queue\":{},\"fire_at\":{},\"job_id\":{}}}",
-                json_str(&name),
-                json_str(&queue),
-                next_fire_at,
-                job_id,
-            ));
+            out.push(json!({
+                "name": name,
+                "queue": queue,
+                "fire_at": next_fire_at,
+                "job_id": job_id,
+            }));
             fires_this_task += 1;
             // Advance to the next boundary strictly after this one.
             next_fire_at =
@@ -1261,8 +1244,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
             rusqlite::params![name, next_fire_at],
         )?;
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 pub fn scheduler_soonest(conn: &Connection) -> rusqlite::Result<i64> {
@@ -1324,32 +1306,20 @@ pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut out = String::from("[");
-    for (i, (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, enabled)) in
-        rows.iter().enumerate()
-    {
-        if i > 0 {
-            out.push(',');
-        }
-        let expires_repr = match expires_s {
-            Some(v) => v.to_string(),
-            None => "null".into(),
-        };
-        out.push_str(&format!(
-            "{{\"name\":{},\"queue\":{},\"cron_expr\":{},\"payload\":{},\
-             \"priority\":{},\"expires_s\":{},\"next_fire_at\":{},\"enabled\":{}}}",
-            json_str(name),
-            json_str(queue),
-            json_str(cron_expr),
-            json_str(payload),
-            priority,
-            expires_repr,
-            next_fire_at,
-            if *enabled != 0 { "true" } else { "false" },
-        ));
+    let mut out = Vec::new();
+    for (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, enabled) in rows {
+        out.push(json!({
+            "name": name,
+            "queue": queue,
+            "cron_expr": cron_expr,
+            "payload": payload,
+            "priority": priority,
+            "expires_s": expires_s,
+            "next_fire_at": next_fire_at,
+            "enabled": enabled != 0,
+        }));
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 /// Mutate one or more fields of a registered schedule. Pass `None` for
@@ -1535,29 +1505,18 @@ pub fn stream_read_since(
             r.get::<_, i64>(4)?,
         ))
     })?;
-    let mut out = String::from("[");
-    let mut first = true;
+    let mut out = Vec::new();
     for row in rows {
         let (off, top, key, payload, created_at) = row?;
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        let key_tok = match key {
-            Some(s) => json_str(&s),
-            None => "null".to_string(),
-        };
-        out.push_str(&format!(
-            "{{\"offset\":{},\"topic\":{},\"key\":{},\"payload\":{},\"created_at\":{}}}",
-            off,
-            json_str(&top),
-            key_tok,
-            json_str(&payload),
-            created_at,
-        ));
+        out.push(json!({
+            "offset": off,
+            "topic": top,
+            "key": key,
+            "payload": payload,
+            "created_at": created_at,
+        }));
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 pub fn stream_save_offset(
@@ -1597,25 +1556,4 @@ fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
 }
 
-/// Escape a string for inclusion as a JSON string literal. Used by
-/// `claim_batch` to build its JSON array return value without
-/// pulling in serde_json just for one site.
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
+

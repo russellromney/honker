@@ -1186,12 +1186,19 @@ class Database:
         max_attempts = int(max_attempts)
         existing = self._queues.get(name)
         if existing is not None:
-            # Same options → memoized instance. Conflicting options used
-            # to be silently ignored (first caller won), which hid
-            # misconfigured multi-module setups.
+            # Same options → memoized instance. Conflicting *explicit*
+            # options raise. Callers that only pass the name (defaults)
+            # — e.g. run_workers looking up a queue already configured
+            # elsewhere — reuse the memoized instance.
+            using_defaults = (
+                visibility_timeout_s == 300 and max_attempts == 3
+            )
             if (
-                existing.visibility_timeout_s != visibility_timeout_s
-                or existing.max_attempts != max_attempts
+                not using_defaults
+                and (
+                    existing.visibility_timeout_s != visibility_timeout_s
+                    or existing.max_attempts != max_attempts
+                )
             ):
                 raise ValueError(
                     f"queue {name!r} already opened with "

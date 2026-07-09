@@ -117,3 +117,16 @@ def test_queue_conflicting_options_raises(db_path):
         db.queue("emails", visibility_timeout_s=60, max_attempts=3)
     with pytest.raises(ValueError, match="already opened"):
         db.queue("emails", visibility_timeout_s=300, max_attempts=10)
+
+
+def test_queue_default_reentry_reuses_custom_options(db_path):
+    """run_workers calls db.queue(name) with defaults after the app
+    opened the queue with custom max_attempts. That must reuse the
+    memoized instance, not raise.
+    """
+    db = honker.open(db_path)
+    q1 = db.queue("emails", visibility_timeout_s=120, max_attempts=7)
+    q2 = db.queue("emails")  # defaults
+    assert q1 is q2
+    assert q2.max_attempts == 7
+    assert q2.visibility_timeout_s == 120
