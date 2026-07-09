@@ -17,7 +17,6 @@ defmodule Honker.Lock do
   owner has stolen the lock — stop doing the work the lock guards.
   """
 
-  alias Exqlite.Sqlite3
   alias Honker.Database
 
   @enforce_keys [:name, :owner]
