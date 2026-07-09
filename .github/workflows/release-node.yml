@@ -1,16 +1,10 @@
-name: Release · npm Node
+name: Proof · npm Node package
 
 on:
   push:
     tags:
       - "node-v*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Upload built packages to npm"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -79,7 +73,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
       - name: Download native artifacts
@@ -138,14 +131,3 @@ jobs:
             packages/honker-node/*.tgz
             packages/honker-node/npm/*/*.tgz
           if-no-files-found: warn
-
-      - name: Publish packages to npm
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'node-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-        working-directory: packages/honker-node
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          for dir in npm/*; do
-            npm publish "./$dir" --access public --ignore-scripts
-          done
-          npm publish --access public --ignore-scripts

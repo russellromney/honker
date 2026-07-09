@@ -1,16 +1,10 @@
-name: Release · Hex
+name: Proof · Hex package
 
 on:
   push:
     tags:
       - "ex-v*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Upload package to Hex"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -63,10 +57,3 @@ jobs:
           name: honker-hex
           path: packages/honker-ex/honker-*.tar
           if-no-files-found: error
-
-      - name: Publish package to Hex
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'ex-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-        working-directory: packages/honker-ex
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-        run: mix hex.publish --yes

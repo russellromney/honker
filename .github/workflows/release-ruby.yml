@@ -1,16 +1,10 @@
-name: Release · RubyGems
+name: Proof · RubyGems package
 
 on:
   push:
     tags:
       - "rb-v*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Upload built gems to RubyGems"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -60,13 +54,6 @@ jobs:
           gem install "$RUNNER_TEMP/honker.gem"
           ruby scripts/proof/ruby-gem-smoke.rb
 
-      - name: Upload gem to RubyGems
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'rb-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-        shell: bash
-        env:
-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
-        run: gem push "$RUNNER_TEMP/honker.gem"
-
   generic-gem:
     name: ruby gem · generic
     timeout-minutes: 20
@@ -94,10 +81,3 @@ jobs:
         run: |
           gem install "$RUNNER_TEMP/honker.gem"
           ruby scripts/proof/ruby-gem-smoke.rb
-
-      - name: Upload gem to RubyGems
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'rb-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-        shell: bash
-        env:
-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
-        run: gem push "$RUNNER_TEMP/honker.gem"

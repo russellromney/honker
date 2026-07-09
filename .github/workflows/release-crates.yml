@@ -1,16 +1,12 @@
-name: Release · crates.io
+name: Proof · crates.io package
 
-# Publishes honker-core + honker-extension to crates.io when a tag
-# matching `core-v*` or `ext-v*` is pushed. Keeps crate versions
-# independent so we can ship a point release of one without the other.
+# Proves honker-core + honker-extension release packaging when a tag
+# matching `core-v*` or `ext-v*` is pushed. Publishing is done locally.
 #
 # Usage:
 #   git tag core-v0.1.1 && git push origin core-v0.1.1
 #   git tag ext-v0.1.1  && git push origin ext-v0.1.1
 #
-# Requires repo secret CARGO_REGISTRY_TOKEN (crates.io API token with
-# publish scope for the honker-* crates).
-
 on:
   push:
     tags:
@@ -29,21 +25,13 @@ on:
 # Source-tree hash pinning lives per-job (hashFiles() can't run at
 # workflow level before checkout). See ci.yml for context.
 
-# Drop the default-write GITHUB_TOKEN — this workflow publishes via
-# CARGO_REGISTRY_TOKEN (env var below), not the GitHub token. Pure
-# `contents: read` is enough for checkout.
 permissions:
   contents: read
 
 jobs:
-  publish:
+  package-proof:
     runs-on: ubuntu-latest
     steps:
-      # Actions are pinned to commit SHAs — this workflow has the
-      # crates.io publish token in scope. A compromised tag (the
-      # tj-actions/changed-files class of attack) on any of these
-      # actions would otherwise be able to exfiltrate the token.
-      # Bump the SHAs intentionally; Dependabot will open PRs.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           # Don't leave the GITHUB_TOKEN in `.git/config` for later
@@ -81,9 +69,7 @@ jobs:
       - name: Verify test suite before publish
         run: cargo test -p honker-core --release --lib
 
-      - name: Publish to crates.io
+      - name: Package crate
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           CRATE: ${{ steps.crate.outputs.name }}
-        run: |
-          cargo publish -p "$CRATE"
+        run: cargo package -p "$CRATE"

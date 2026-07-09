@@ -1,16 +1,10 @@
-name: Release · NuGet
+name: Proof · NuGet package
 
 on:
   push:
     tags:
       - "dotnet-v*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Upload built package to NuGet"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -109,14 +103,3 @@ jobs:
           name: honker-nuget
           path: artifacts/honker-dotnet/*.nupkg
           if-no-files-found: error
-
-      - name: Upload package to NuGet
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'dotnet-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-        shell: bash
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          dotnet nuget push artifacts/honker-dotnet/*.nupkg \
-            --source https://api.nuget.org/v3/index.json \
-            --api-key "$NUGET_API_KEY" \
-            --skip-duplicate

@@ -1,16 +1,10 @@
-name: Release · npm Bun
+name: Proof · npm Bun package
 
 on:
   push:
     tags:
       - "bun-v*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Upload package to npm"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -38,7 +32,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
       - name: Build extension and Python interop package
@@ -66,10 +59,3 @@ jobs:
           name: honker-bun-npm
           path: ${{ runner.temp }}/*.tgz
           if-no-files-found: error
-
-      - name: Publish package to npm
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'bun-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-        working-directory: packages/honker-bun
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --ignore-scripts
