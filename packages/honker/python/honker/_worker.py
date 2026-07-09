@@ -83,9 +83,9 @@ async def run_task(
         delay = _compute_delay(retry_delay, backoff, job.attempts)
         _retry_or_fail(job, retries, delay, "handler timeout")
     except Retryable as r:
-        # Handler explicitly asked for a retry with a caller-chosen
-        # delay. Don't apply the default backoff formula.
-        job.retry(delay_s=r.delay_s, error=str(r))
+        # Handler-chosen delay, but still respect the attempt budget
+        # so Retryable cannot infinite-loop past retries=.
+        _retry_or_fail(job, retries, r.delay_s, str(r))
     except Exception as e:
         err = f"{e}\n{traceback.format_exc()}"
         delay = _compute_delay(retry_delay, backoff, job.attempts)

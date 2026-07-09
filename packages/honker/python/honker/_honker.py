@@ -259,6 +259,7 @@ class Queue:
         delay: Optional[float] = None,
         priority: int = 0,
         expires: Optional[float] = None,
+        max_attempts: Optional[int] = None,
     ) -> int:
         """Insert one job row. Returns the inserted `id` (primary key
         in `_honker_live`). Delegates to `honker_enqueue`, which handles
@@ -274,6 +275,10 @@ class Queue:
         `expires`: seconds from now. Claim path filters expired rows;
         `queue.sweep_expired()` moves them into `_honker_dead`.
 
+        `max_attempts`: per-job attempt budget. Defaults to the queue's
+        `max_attempts`. Decorated tasks pass `@task(retries=N)` here so
+        the SQL claim/retry path and the worker path share one budget.
+
         For bulk inserts with one commit + one cross-process wake,
         pass a shared `tx`:
 
@@ -286,10 +291,13 @@ class Queue:
         run_at_val = int(run_at) if run_at is not None else None
         delay_val = int(delay) if delay is not None else None
         expires_val = int(expires) if expires is not None else None
+        attempts_val = (
+            int(max_attempts) if max_attempts is not None else self.max_attempts
+        )
         sql = "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?) AS id"
         params = [
             self.name, payload_str, run_at_val, delay_val,
-            int(priority), self.max_attempts, expires_val,
+            int(priority), attempts_val, expires_val,
         ]
         if tx is not None:
             rows = tx.query(sql, params)

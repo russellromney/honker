@@ -209,6 +209,61 @@ async def test_failed_task_retries_then_dead_letters(db_path):
     assert "nope" in dead[0]["last_error"]
 
 
+async def test_task_retries_cap_independent_of_queue_max_attempts(db_path):
+    """@task(retries=N) must bound attempts even when the queue's
+    max_attempts is much larger. Regression: _run_one used to always
+    call job.retry() and ignore TaskSpec.retries, so only the row's
+    max_attempts (queue default) gated dead-lettering.
+    """
+    db = honker.open(db_path)
+    # Queue allows 10 attempts; task says 2. Worker must stop at 2.
+    q = db.queue("default", max_attempts=10)
+
+    @q.task(retries=2, retry_delay_s=0)
+    def always_fails():
+        raise RuntimeError("cap-me")
+
+    r = always_fails()
+
+    # Enqueue must pin max_attempts on the row to retries=.
+    row = db.query(
+        "SELECT max_attempts FROM _honker_live WHERE id=?", [r.id]
+    )[0]
+    assert row["max_attempts"] == 2, (
+        f"decorated enqueue should set max_attempts=retries; got {row}"
+    )
+
+    stop = asyncio.Event()
+    run = asyncio.create_task(
+        db.run_workers(queue="default", concurrency=1, stop_event=stop),
+    )
+
+    deadline = asyncio.get_event_loop().time() + 5.0
+    while asyncio.get_event_loop().time() < deadline:
+        dead = db.query(
+            "SELECT attempts, last_error FROM _honker_dead WHERE id=?",
+            [r.id],
+        )
+        if dead:
+            break
+        await asyncio.sleep(0.05)
+
+    stop.set()
+    await asyncio.wait_for(run, timeout=3.0)
+
+    dead = db.query(
+        "SELECT attempts, last_error FROM _honker_dead WHERE id=?",
+        [r.id],
+    )
+    assert len(dead) == 1
+    assert dead[0]["attempts"] == 2
+    assert "cap-me" in dead[0]["last_error"]
+    live = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_live WHERE id=?", [r.id]
+    )[0]["c"]
+    assert live == 0
+
+
 async def test_unknown_task_goes_to_dead_letter(db_path):
     """Worker sees a job with a task name it doesn't know about
     (e.g. someone deployed a rename without updating the worker).

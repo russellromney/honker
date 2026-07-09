@@ -209,6 +209,10 @@ class _TaskWrapper:
             envelope,
             priority=self.spec.priority,
             expires=self.spec.expires_s,
+            # Pin the row's max_attempts to the decorator's retries so
+            # honker_retry / reclaim dead-letter share the same budget
+            # as the worker-side retries= check.
+            max_attempts=self.spec.retries,
         )
         return TaskResult(self._queue.db, self._queue, job_id)
 
@@ -323,7 +327,9 @@ class UnknownTaskError(Exception):
 async def _run_one(job: "Job", spec: TaskSpec) -> None:
     """Core worker-side dispatch: extract args, call the function,
     save the result (if configured), ack on success. On failure,
-    bump retry with the task's configured delay.
+    honor `spec.retries` the same way `honker._worker.run_task` does
+    — fail to dead when attempts are exhausted, else retry with the
+    task's configured delay.
 
     Sync tasks are dispatched onto a background thread via
     `asyncio.to_thread` so a blocking def doesn't freeze the event
@@ -332,6 +338,7 @@ async def _run_one(job: "Job", spec: TaskSpec) -> None:
     `asyncio.wait_for`.
     """
     from ._honker import Retryable  # lazy cycle break
+    from ._worker import _retry_or_fail  # shared retry/fail policy
 
     payload = job.payload
     envelope = payload.get(_ENVELOPE) if isinstance(payload, dict) else None
@@ -360,18 +367,24 @@ async def _run_one(job: "Job", spec: TaskSpec) -> None:
         else:
             result = await coro
     except Retryable as e:
-        job.retry(delay_s=e.delay_s, error=str(e))
+        # Explicit handler-chosen delay. Still respect the attempt
+        # budget so Retryable cannot infinite-loop past retries=.
+        _retry_or_fail(job, spec.retries, e.delay_s, str(e))
         return
     except asyncio.TimeoutError:
-        job.retry(
-            delay_s=spec.retry_delay_s,
-            error=f"timeout after {spec.timeout_s}s",
+        _retry_or_fail(
+            job,
+            spec.retries,
+            int(spec.retry_delay_s),
+            f"timeout after {spec.timeout_s}s",
         )
         return
     except Exception as e:
-        job.retry(
-            delay_s=spec.retry_delay_s,
-            error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+        _retry_or_fail(
+            job,
+            spec.retries,
+            int(spec.retry_delay_s),
+            f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
         )
         return
 
