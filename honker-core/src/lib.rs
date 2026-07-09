@@ -567,14 +567,28 @@ impl Readers {
                 *out += 1;
                 drop(out);
                 drop(pool);
-                let conn = open_conn(&self.path, false)?;
-                // Re-check: if close() raced us, drop the brand-new
-                // connection instead of handing it out.
-                if self.closed.load(Ordering::Acquire) {
-                    drop(conn);
-                    return Err(closed_err());
+                match open_conn(&self.path, false) {
+                    Ok(conn) => {
+                        // Re-check: if close() raced us, drop the
+                        // brand-new connection instead of handing it
+                        // out. Release the capacity slot so a later
+                        // open after a failed race doesn't think the
+                        // pool is full forever.
+                        if self.closed.load(Ordering::Acquire) {
+                            *self.outstanding.lock() -= 1;
+                            drop(conn);
+                            return Err(closed_err());
+                        }
+                        return Ok(conn);
+                    }
+                    Err(e) => {
+                        // Open failed — free the slot we reserved or
+                        // every transient open failure permanently
+                        // shrinks max_readers until the pool is dead.
+                        *self.outstanding.lock() -= 1;
+                        return Err(e);
+                    }
                 }
-                return Ok(conn);
             }
             drop(out);
             self.available.wait(&mut pool);
@@ -3170,6 +3184,27 @@ while True:
             result.is_err(),
             "expected probe to fail for inaccessible dir, got Ok"
         );
+    }
+
+    #[test]
+    fn readers_open_failure_does_not_leak_capacity() {
+        // Path under a missing directory — open_conn fails every time.
+        // Without the outstanding decrement on open failure, two
+        // failures with max=2 permanently fill the counter and the
+        // third acquire blocks forever on the condvar.
+        let r = Arc::new(Readers::new(
+            "/this/parent/does/not/exist/honker-readers-leak.db".into(),
+            2,
+        ));
+        for i in 0..5 {
+            let r = r.clone();
+            let handle = std::thread::spawn(move || r.acquire());
+            let result = handle.join().expect("acquire thread panicked");
+            assert!(
+                result.is_err(),
+                "attempt {i}: expected open failure, got Ok"
+            );
+        }
     }
 
     #[test]
