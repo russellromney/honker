@@ -275,7 +275,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // as the desired value (which may be NULL = "clear"); when 0 we
     // leave expires_s untouched. SQL has no good way to distinguish
     // "user passed NULL" from "user did not specify" otherwise. Same
-    // pattern for max_attempts so old 6-arg raw callers stay compatible.
+    // pattern for max_attempts so old 6-arg raw callers stay compatible;
+    // explicit NULL resets max_attempts to the scheduler default (3).
     conn.create_scalar_function(
         "honker_scheduler_update",
         6,
@@ -325,7 +326,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
                 None
             };
             let max_attempts = if touch_max_attempts != 0 {
-                max_attempts_arg
+                Some(max_attempts_arg)
             } else {
                 None
             };
@@ -1443,7 +1444,7 @@ pub fn scheduler_update(
     payload: Option<&str>,
     priority: Option<i64>,
     expires_s: Option<Option<i64>>,
-    max_attempts: Option<i64>,
+    max_attempts: Option<Option<i64>>,
 ) -> rusqlite::Result<i64> {
     // Verify exists first so we can return 0 cleanly without dynamic SQL gymnastics.
     let exists: bool = conn
@@ -1495,6 +1496,7 @@ pub fn scheduler_update(
             )?;
         }
         if let Some(m) = max_attempts {
+            let m = m.unwrap_or(3);
             let m = if m < 1 { 1 } else { m };
             conn.execute(
                 "UPDATE _honker_scheduler_tasks SET max_attempts = ?2 WHERE name = ?1",

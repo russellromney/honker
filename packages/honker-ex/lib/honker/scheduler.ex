@@ -162,7 +162,7 @@ defmodule Honker.Scheduler do
   Mutate fields in place. `opts` is a keyword list with any of:
   `cron:` / `schedule:`, `payload:`, `priority:`, `expires_s:`,
   `max_attempts:`. Omit a key to leave its field alone. `payload: nil`
-  writes JSON null.
+  writes JSON null; `max_attempts: nil` resets to default 3.
   Cron change recomputes `next_fire_at` from now. Returns
   `{:ok, true}` iff a row was updated.
   """

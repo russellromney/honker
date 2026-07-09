@@ -115,7 +115,8 @@ module Honker
 
     # Mutate fields in place. Pass only the kwargs you want changed
     # (omitting a kwarg leaves the field alone). `payload: nil`
-    # writes JSON null. Cron change recomputes next_fire_at from now.
+    # writes JSON null; `max_attempts: nil` resets to default 3.
+    # Cron change recomputes next_fire_at from now.
     # Returns true iff a row was updated.
     def update(name, schedule: UNSET, cron: UNSET, payload: UNSET, priority: UNSET, expires_s: UNSET, max_attempts: UNSET)
       expr = nil

@@ -332,6 +332,25 @@ def test_scheduler_update_max_attempts_applies_to_future_fires(db_path):
     assert int(job["max_attempts"]) == 2
 
 
+def test_scheduler_update_max_attempts_null_resets_to_default(db_path):
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(
+        name="t",
+        queue="custom",
+        schedule=every_s(1),
+        payload={"x": 1},
+        max_attempts=5,
+    )
+
+    assert sched.update("t", max_attempts=None) is True
+    row = db.query(
+        "SELECT max_attempts FROM _honker_scheduler_tasks WHERE name='t'"
+    )[0]
+    assert int(row["max_attempts"]) == 3
+
+
 def test_scheduler_tick_caps_catchup_storm(db_path):
     """A long outage on a high-frequency schedule must not enqueue
     unbounded jobs in one tick. Cap is 64; remaining boundaries are

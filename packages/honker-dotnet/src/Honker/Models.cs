@@ -87,6 +87,7 @@ public sealed class ScheduleUpdate
     public ScheduleUpdate WithPayload(object? payload) { Payload = payload; HasPayload = true; return this; }
     public ScheduleUpdate WithPriority(long? priority) { Priority = priority; HasPriority = true; return this; }
     public ScheduleUpdate WithExpiresSeconds(long? value) { ExpiresSeconds = value; HasExpires = true; return this; }
+    /// <summary>Set the attempt budget for future fired jobs. Passing null resets to default 3.</summary>
     public ScheduleUpdate WithMaxAttempts(int? value) { MaxAttempts = value; HasMaxAttempts = true; return this; }
 }
 

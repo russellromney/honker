@@ -251,8 +251,9 @@ class Scheduler:
         True iff a row was updated (False if name doesn't exist).
 
         `payload=None` means "set to JSON null". To leave payload
-        unchanged, omit the kwarg. Same for `expires` and
-        `max_attempts`."""
+        unchanged, omit the kwarg. `expires=None` clears expiry;
+        `max_attempts=None` resets the attempt budget to the scheduler
+        default (3)."""
         cron_expr = schedule.expr if schedule is not None else None
         payload_arg = json.dumps(payload) if payload is not _UNSET else None
         expires_arg = (
