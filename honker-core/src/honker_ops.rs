@@ -1142,11 +1142,20 @@ fn scheduler_wake(_conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Max fires enqueued for a single schedule row in one
+/// `scheduler_tick` call. After a long outage an `@every 1s` task
+/// would otherwise enqueue tens of thousands of jobs in one writer
+/// transaction. Once the cap is hit we jump `next_fire_at` to the
+/// next boundary after `now_unix` and stop catching up intermediate
+/// boundaries. Operators who need every missed fire should run the
+/// scheduler continuously or raise the cap in a future release.
+pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
+
 /// For each registered task whose `next_fire_at <= now_unix`,
 /// enqueue the payload into its queue and advance `next_fire_at`
 /// to the next boundary. Keeps advancing within one tick while
 /// boundaries remain in the past (catches up after a scheduler
-/// outage) — same semantics as the previous Python `_fire_due`.
+/// outage), up to [`SCHEDULER_MAX_CATCHUP_FIRES`] per task.
 /// Returns a JSON array of `{name, queue, fire_at, job_id}` fires.
 pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<String> {
     #[allow(clippy::type_complexity)]
@@ -1172,7 +1181,16 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
     let mut out = String::from("[");
     let mut first = true;
     for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at) in tasks {
+        let mut fires_this_task: i64 = 0;
         while next_fire_at <= now_unix {
+            if fires_this_task >= SCHEDULER_MAX_CATCHUP_FIRES {
+                // Skip the remaining backlog. Resume from the next
+                // boundary strictly after now so we don't immediately
+                // re-enter the catch-up loop on the next tick.
+                next_fire_at =
+                    super::cron::next_after_unix(&cron_expr, now_unix).map_err(to_sql_err)?;
+                break;
+            }
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
             let job_id = enqueue(
@@ -1190,6 +1208,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 next_fire_at,
                 job_id,
             ));
+            fires_this_task += 1;
             // Advance to the next boundary strictly after this one.
             next_fire_at =
                 super::cron::next_after_unix(&cron_expr, next_fire_at).map_err(to_sql_err)?;

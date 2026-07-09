@@ -223,9 +223,8 @@ def test_scheduler_tick_skips_already_fired(db_path):
 
 def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
     """If the scheduler was down for multiple boundaries, tick walks
-    forward firing each one. Current behavior is to catch up
-    unbounded — fine for low-frequency schedules; for noisy ones
-    callers can use `expires` to drop stale catch-up jobs.
+    forward firing each one (within the catch-up cap). For noisy
+    schedules callers can use `expires` to drop stale catch-up jobs.
     """
     db = honker.open(db_path)
     db.queue("catchup-q")
@@ -260,6 +259,43 @@ def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
         "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='h'"
     )[0]
     assert int(row["next_fire_at"]) == orig_next + 3600
+
+
+def test_scheduler_tick_caps_catchup_storm(db_path):
+    """A long outage on a high-frequency schedule must not enqueue
+    unbounded jobs in one tick. Cap is 64; remaining boundaries are
+    skipped and next_fire_at jumps past now.
+    """
+    db = honker.open(db_path)
+    db.queue("storm-q")
+    sched = Scheduler(db)
+    sched.add(
+        name="every-sec",
+        queue="storm-q",
+        schedule=every_s(1),
+    )
+    row = db.query(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='every-sec'"
+    )[0]
+    orig = int(row["next_fire_at"])
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at=? WHERE name='every-sec'",
+            [orig - 1000],
+        )
+    now = orig
+    with db.transaction() as tx:
+        result = tx.query("SELECT honker_scheduler_tick(?) AS j", [now])
+    fires = json.loads(result[0]["j"])
+    assert len(fires) == 64, f"expected cap of 64 fires, got {len(fires)}"
+    live = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_live WHERE queue='storm-q'"
+    )[0]["c"]
+    assert live == 64
+    row = db.query(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='every-sec'"
+    )[0]
+    assert int(row["next_fire_at"]) > now
 
 
 def test_scheduler_tick_racing_writers_produce_no_duplicates(db_path):
