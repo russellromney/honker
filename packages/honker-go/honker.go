@@ -1441,30 +1441,18 @@ func (l *Lock) Release() error {
 }
 
 // Heartbeat extends the lock's TTL. Returns true if we still own it.
-// Uses a direct UPDATE because honker_lock_acquire uses INSERT OR
-// IGNORE and won't extend an existing row.
+// Uses honker_lock_renew — honker_lock_acquire uses INSERT OR IGNORE
+// and won't extend an existing row.
 func (l *Lock) Heartbeat(ttlSec int64) (bool, error) {
-	tx, err := l.db.db.Begin()
+	var n int64
+	err := l.db.db.QueryRow(
+		"SELECT honker_lock_renew(?, ?, ?)",
+		l.name, l.owner, ttlSec,
+	).Scan(&n)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(
-		"UPDATE _honker_locks SET expires_at = unixepoch() + ? WHERE name = ? AND owner = ?",
-		ttlSec, l.name, l.owner,
-	)
-	if err != nil {
-		return false, err
-	}
-	var changes int64
-	if err := tx.QueryRow("SELECT changes()").Scan(&changes); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return changes > 0, nil
+	return n > 0, nil
 }
 
 func (l *Lock) finalize() {

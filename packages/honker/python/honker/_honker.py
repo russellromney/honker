@@ -964,6 +964,21 @@ class _Lock:
             self.acquired = True
         return self
 
+    def renew(self, ttl: Optional[int] = None) -> bool:
+        """Extend `expires_at` for this owner. Returns True iff we still
+        hold the lock. False means the TTL elapsed and another owner
+        acquired it (or the row was released).
+        """
+        if not self.acquired:
+            return False
+        ttl_s = int(ttl) if ttl is not None else self.ttl
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_lock_renew(?, ?, ?) AS r",
+                [self.name, self.owner, ttl_s],
+            )
+        return bool(rows[0]["r"])
+
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         if self.acquired:
             with self.db.transaction() as tx:

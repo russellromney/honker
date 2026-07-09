@@ -191,10 +191,9 @@ module Honker
         # its `ensure` before re-raising.
         tick
         if monotonic_now - last_heartbeat >= HEARTBEAT_S
-          still_ours = lock_try_acquire(LEADER_LOCK, owner, LOCK_TTL_S)
+          still_ours = lock_renew(LEADER_LOCK, owner, LOCK_TTL_S)
           # IMPORTANT: if refresh failed, a new leader has the lock.
-          # Break out of the leader loop so we don't double-fire. This
-          # is the bug the Rust binding fixed; don't reintroduce it.
+          # Break out of the leader loop so we don't double-fire.
           return unless still_ours
 
           last_heartbeat = monotonic_now
@@ -235,6 +234,13 @@ module Honker
     def lock_try_acquire(name, owner, ttl_s)
       @db.db.get_first_row(
         "SELECT honker_lock_acquire(?, ?, ?)",
+        [name, owner, ttl_s],
+      )[0] == 1
+    end
+
+    def lock_renew(name, owner, ttl_s)
+      @db.db.get_first_row(
+        "SELECT honker_lock_renew(?, ?, ?)",
         [name, owner, ttl_s],
       )[0] == 1
     end

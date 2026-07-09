@@ -341,13 +341,10 @@ class Scheduler:
                 pass
             with self.db.transaction() as tx:
                 rows = tx.query(
-                    "UPDATE _honker_locks "
-                    "SET expires_at = unixepoch() + ? "
-                    "WHERE name = ? AND owner = ? "
-                    "RETURNING 1 AS ok",
-                    [self.lock_ttl, self.lock_name, owner],
+                    "SELECT honker_lock_renew(?, ?, ?) AS r",
+                    [self.lock_name, owner, self.lock_ttl],
                 )
-            if not rows:
+            if not rows or not rows[0]["r"]:
                 # Lost leadership. Signal the main loop to stop before
                 # the next honker_scheduler_tick.
                 stop_event.set()

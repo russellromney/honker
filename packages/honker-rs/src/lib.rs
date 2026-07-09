@@ -1533,9 +1533,14 @@ impl Scheduler {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             self.tick()?;
             if last_heartbeat.elapsed() >= heartbeat {
-                let still_ours =
-                    lock_try_acquire(&self.inner, "honker-scheduler", owner, lock_ttl)?;
-                if !still_ours {
+                let still_ours: i64 = self.inner.with_conn(|c| {
+                    c.query_row(
+                        "SELECT honker_lock_renew(?1, ?2, ?3)",
+                        params!["honker-scheduler", owner, lock_ttl],
+                        |r| r.get(0),
+                    )
+                })?;
+                if still_ours == 0 {
                     // Lost the lock (TTL expired, new leader). Drop
                     // out of the leader loop so we don't double-fire
                     // alongside whoever has it now.
@@ -1658,8 +1663,18 @@ impl Lock {
     /// `Ok(false)` if the lock was stolen (TTL expired and someone
     /// else acquired it). Check the return value — holding the `Lock`
     /// value alone does not guarantee you still own the lock.
+    ///
+    /// Uses `honker_lock_renew` — `honker_lock_acquire` does not
+    /// refresh `expires_at` for an existing (name, owner) row.
     pub fn heartbeat(&self, ttl_s: i64) -> Result<bool> {
-        lock_try_acquire(&self.inner, &self.name, &self.owner, ttl_s)
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_lock_renew(?1, ?2, ?3)",
+                params![self.name, self.owner, ttl_s],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n > 0)
     }
 }
 

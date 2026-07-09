@@ -1334,17 +1334,12 @@ export class Lock {
    * directly, matching the Elixir binding.
    */
   heartbeat(ttlS: number): boolean {
-    const stmt = this.db.raw.query<
-      unknown,
-      [number, string, string]
-    >(
-      "UPDATE _honker_locks SET expires_at = unixepoch() + ? " +
-        "WHERE name = ? AND owner = ?",
-    );
-    stmt.run(ttlS, this.name, this.owner);
-    return this.db.raw.query<{ c: number }, []>(
-      "SELECT changes() AS c",
-    ).get()!.c > 0;
+    // honker_lock_renew refreshes expires_at for this owner only.
+    // honker_lock_acquire uses INSERT OR IGNORE and does not extend TTL.
+    const row = this.db.raw.query<{ r: number }, [string, string, number]>(
+      "SELECT honker_lock_renew(?, ?, ?) AS r",
+    ).get(this.name, this.owner, ttlS);
+    return (row?.r ?? 0) > 0;
   }
 }
 

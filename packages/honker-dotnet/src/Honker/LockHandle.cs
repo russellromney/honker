@@ -18,8 +18,10 @@ public sealed class LockHandle : IDisposable
 
     public bool Heartbeat(int ttlSeconds)
     {
+        // honker_lock_acquire uses INSERT OR IGNORE and does not
+        // refresh expires_at for an existing owner. Use renew.
         return _database.ExecuteScalarInt64(
-            "SELECT honker_lock_acquire(@p0, @p1, @p2)",
+            "SELECT honker_lock_renew(@p0, @p1, @p2)",
             null,
             Name,
             Owner,

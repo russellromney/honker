@@ -102,6 +102,23 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // honker_lock_renew(name, owner, ttl_s) -> 1 if this owner still
+    // holds the lock and expires_at was extended, 0 otherwise.
+    // Distinct from honker_lock_acquire: INSERT OR IGNORE does not
+    // refresh expires_at for an existing (name, owner) row.
+    conn.create_scalar_function(
+        "honker_lock_renew",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let owner: String = ctx.get(1)?;
+            let ttl: i64 = ctx.get(2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            lock_renew(&db, &name, &owner, ttl).map_err(to_sql_err)
+        },
+    )?;
+
     conn.create_scalar_function(
         "honker_rate_limit_try",
         3,
@@ -1028,6 +1045,30 @@ pub fn lock_release(conn: &Connection, name: &str, owner: &str) -> rusqlite::Res
         rusqlite::params![name, owner],
     )?;
     Ok(deleted as i64)
+}
+
+/// Extend `expires_at` for a lock held by `owner`. Returns 1 if the
+/// row was updated, 0 if the lock is missing or held by someone else.
+///
+/// `honker_lock_acquire` uses `INSERT OR IGNORE` and does **not**
+/// refresh TTL on same-owner re-acquire — callers that need renewal
+/// (scheduler leaders, long critical sections) must use this.
+pub fn lock_renew(
+    conn: &Connection,
+    name: &str,
+    owner: &str,
+    ttl_s: i64,
+) -> rusqlite::Result<i64> {
+    if ttl_s <= 0 {
+        return Err(to_sql_err("ttl_s must be positive"));
+    }
+    let updated = conn.execute(
+        "UPDATE _honker_locks
+         SET expires_at = unixepoch() + ?3
+         WHERE name = ?1 AND owner = ?2",
+        rusqlite::params![name, owner, ttl_s],
+    )?;
+    Ok(if updated > 0 { 1 } else { 0 })
 }
 
 // ---------------------------------------------------------------------

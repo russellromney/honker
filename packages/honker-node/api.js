@@ -133,8 +133,10 @@ class Lock {
   }
 
   heartbeat(ttlS) {
+    // honker_lock_acquire uses INSERT OR IGNORE and does not refresh
+    // expires_at for an existing owner. Use honker_lock_renew.
     return (
-      this._db._callScalar('SELECT honker_lock_acquire(?, ?, ?)', [
+      this._db._callScalar('SELECT honker_lock_renew(?, ?, ?)', [
         this.name,
         this.owner,
         ttlS,
