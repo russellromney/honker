@@ -1,6 +1,6 @@
 [package]
 name = "honker-py"
-version = "0.1.2"
+version = "0.4.0"
 edition = "2024"
 description = "PyO3 bindings for honker — the Rust cdylib behind the `honker` PyPI package. Not published to crates.io; built by maturin."
 license = "MIT OR Apache-2.0"
@@ -27,10 +27,10 @@ kernel-watcher = ["honker-core/kernel-watcher"]
 shm-fast-path = ["honker-core/shm-fast-path"]
 
 [dependencies]
-honker-core = { path = "../../honker-core", version = "0.2.5" }
+honker-core = { path = "../../honker-core", version = "0.4.0" }
 parking_lot = "0.12.5"
 pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py311"] }
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
 
 [target.'cfg(windows)'.dependencies]
-honker-core = { path = "../../honker-core", version = "0.2.5", features = ["bundled-sqlite"] }
+honker-core = { path = "../../honker-core", version = "0.4.0", features = ["bundled-sqlite"] }

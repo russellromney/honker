@@ -3,32 +3,36 @@ name: Proof · registry install gauntlet
 on:
   workflow_dispatch:
     inputs:
+      honker_version:
+        description: "Shared Honker package version to install; per-binding inputs override this"
+        required: false
+        default: ""
       python_version:
-        description: "PyPI honker version to install; empty means latest"
+        description: "PyPI honker version to install; empty uses honker_version/latest"
         required: false
         default: ""
       node_version:
-        description: "npm @russellthehippo/honker-node version to install; empty means latest"
+        description: "npm @russellthehippo/honker-node version to install; empty uses honker_version/latest"
         required: false
         default: ""
       bun_version:
-        description: "npm @russellthehippo/honker-bun version to install; empty means latest"
+        description: "npm @russellthehippo/honker-bun version to install; empty uses honker_version/latest"
         required: false
         default: ""
       ruby_version:
-        description: "RubyGems honker version to install; empty means latest"
+        description: "RubyGems honker version to install; empty uses honker_version/latest"
         required: false
         default: ""
       dotnet_version:
-        description: "NuGet Honker version to install; empty means latest"
+        description: "NuGet Honker version to install; empty uses honker_version/latest"
         required: false
         default: ""
       elixir_version:
-        description: "Hex honker version to install; empty means latest matching ~> 0.1"
+        description: "Hex honker version to install; empty uses honker_version/latest"
         required: false
         default: ""
       rust_version:
-        description: "crates.io honker version to install; empty means latest"
+        description: "crates.io honker version to install; empty uses honker_version/latest"
         required: false
         default: ""
       go_ref:
@@ -99,13 +103,13 @@ jobs:
       - name: Run registry/source install gauntlet
         env:
           PYTHON_VERSION: "3.14"
-          HONKER_PY_VERSION: ${{ inputs.python_version || '' }}
-          HONKER_NODE_VERSION: ${{ inputs.node_version || '' }}
-          HONKER_BUN_VERSION: ${{ inputs.bun_version || '' }}
-          HONKER_RUBY_VERSION: ${{ inputs.ruby_version || '' }}
-          HONKER_DOTNET_VERSION: ${{ inputs.dotnet_version || '' }}
-          HONKER_ELIXIR_VERSION: ${{ inputs.elixir_version || '' }}
-          HONKER_RUST_VERSION: ${{ inputs.rust_version || '' }}
+          HONKER_PY_VERSION: ${{ inputs.python_version || inputs.honker_version || '' }}
+          HONKER_NODE_VERSION: ${{ inputs.node_version || inputs.honker_version || '' }}
+          HONKER_BUN_VERSION: ${{ inputs.bun_version || inputs.honker_version || '' }}
+          HONKER_RUBY_VERSION: ${{ inputs.ruby_version || inputs.honker_version || '' }}
+          HONKER_DOTNET_VERSION: ${{ inputs.dotnet_version || inputs.honker_version || '' }}
+          HONKER_ELIXIR_VERSION: ${{ inputs.elixir_version || inputs.honker_version || '' }}
+          HONKER_RUST_VERSION: ${{ inputs.rust_version || inputs.honker_version || '' }}
           HONKER_GO_REF: ${{ inputs.go_ref || 'latest' }}
           HONKER_CPP_REF: ${{ inputs.cpp_ref || 'main' }}
         run: bash scripts/proof/registry-install-gauntlet.sh

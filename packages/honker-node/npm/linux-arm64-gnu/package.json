@@ -1,6 +1,6 @@
 {
   "name": "@russellthehippo/honker-node-linux-arm64-gnu",
-  "version": "0.3.6",
+  "version": "0.4.0",
   "cpu": [
     "arm64"
   ],

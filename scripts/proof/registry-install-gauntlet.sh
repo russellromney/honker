@@ -362,7 +362,7 @@ defmodule HonkerGauntlet.MixProject do
   end
   def application, do: [extra_applications: [:logger]]
   defp deps do
-    [{:honker, "${HONKER_ELIXIR_VERSION:+== }${HONKER_ELIXIR_VERSION:-~> 0.1}"}]
+    [{:honker, "${HONKER_ELIXIR_VERSION:+== }${HONKER_ELIXIR_VERSION:->= 0.0.0}"}]
   end
 end
 MIX

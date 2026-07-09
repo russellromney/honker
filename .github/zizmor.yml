@@ -28,3 +28,4 @@ rules:
       # setup-node does not restore package-manager caches here, and this
       # workflow only builds proof artifacts. Publishing remains local.
       - release-node.yml
+      - release-bun.yml

@@ -54,6 +54,13 @@ jobs:
           gem install "$RUNNER_TEMP/honker.gem"
           ruby scripts/proof/ruby-gem-smoke.rb
 
+      - name: Upload platform gem artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: honker-ruby-${{ matrix.gem_platform }}
+          path: ${{ runner.temp }}/honker.gem
+          if-no-files-found: error
+
   generic-gem:
     name: ruby gem · generic
     timeout-minutes: 20
@@ -81,3 +88,10 @@ jobs:
         run: |
           gem install "$RUNNER_TEMP/honker.gem"
           ruby scripts/proof/ruby-gem-smoke.rb
+
+      - name: Upload generic gem artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: honker-ruby-generic
+          path: ${{ runner.temp }}/honker.gem
+          if-no-files-found: error
