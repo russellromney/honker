@@ -3,6 +3,7 @@
 
 use honker::{Database, EnqueueOpts, QueueOpts, ScheduleUpdate, ScheduledTask};
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn open_db() -> (tempfile::TempDir, Database) {
     let tmp = tempfile::tempdir().unwrap();
@@ -156,13 +157,16 @@ fn update_mutates_fields_and_recomputes_next_fire_at() {
     assert_eq!(payload["v"], 99);
     assert_eq!(row.priority, 5);
 
-    let before = row.next_fire_at;
+    let update_started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     assert!(
         sched
             .update(
                 "t",
                 ScheduleUpdate {
-                    cron_expr: Some("*/5 * * * *".into()),
+                    cron_expr: Some("@every 1s".into()),
                     ..Default::default()
                 },
             )
@@ -174,8 +178,9 @@ fn update_mutates_fields_and_recomputes_next_fire_at() {
         .into_iter()
         .find(|r| r.name == "t")
         .unwrap();
-    assert_eq!(row.cron_expr, "*/5 * * * *");
-    assert_ne!(row.next_fire_at, before);
+    assert_eq!(row.cron_expr, "@every 1s");
+    assert!(row.next_fire_at >= update_started + 1);
+    assert!(row.next_fire_at <= update_started + 5);
 
     assert!(
         !sched
