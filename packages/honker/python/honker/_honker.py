@@ -6,6 +6,16 @@ import uuid
 from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional
 
+# Queue / outbox defaults. Sentinels distinguish "caller omitted the
+# option" (pure lookup of a memoized instance) from "caller passed the
+# numeric default explicitly" (must match existing options).
+DEFAULT_VISIBILITY_TIMEOUT_S = 300
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_OUTBOX_MAX_ATTEMPTS = 5
+DEFAULT_OUTBOX_BASE_BACKOFF_S = 5
+DEFAULT_OUTBOX_VISIBILITY_TIMEOUT_S = 60
+_UNSET = object()
+
 
 def _core_open(path, max_readers, watcher_backend=None, watcher_poll_interval_ms=None):
     from honker._honker_native import open as _open
@@ -930,6 +940,13 @@ class LockHeld(Exception):
     """
 
 
+class LeadershipLost(Exception):
+    """Raised by `Scheduler.run()` when the leader lock was stolen
+    (TTL elapsed and another process acquired it). Distinct from a
+    clean stop via `stop_event` or an empty schedule table.
+    """
+
+
 class _Lock:
     """Context manager returned by `Database.lock(name, ttl=60)`.
 
@@ -1157,13 +1174,19 @@ class Database:
     def queue(
         self,
         name: str,
-        visibility_timeout_s: int = 300,
-        max_attempts: int = 3,
+        visibility_timeout_s=_UNSET,
+        max_attempts=_UNSET,
     ) -> Queue:
-        """Get (or lazily create) the queue named `name`.
+        """Return a memoized Queue for `name`.
 
-        Handles are cached per name, so repeated calls are cheap and return
-        the same object.
+        Options apply only on first open. Subsequent calls:
+
+          * `db.queue(name)` with no options — pure lookup of the
+            existing instance (used by `run_workers`).
+          * Same options as first open — return the memoized instance.
+          * Different options — raise `ValueError`. Explicit defaults
+            (e.g. `max_attempts=3`) still count as specified options
+            and must match; they are not treated as lookup.
 
         IMPORTANT — construct outside an open transaction. The *first* call
         for a given name initializes the queue's schema in its own
@@ -1182,37 +1205,39 @@ class Database:
         (Re-fetching an already-constructed name inside a transaction is fine —
         only first construction runs the schema init.)
         """
-        visibility_timeout_s = int(visibility_timeout_s)
-        max_attempts = int(max_attempts)
         existing = self._queues.get(name)
+        lookup_only = (
+            visibility_timeout_s is _UNSET and max_attempts is _UNSET
+        )
+        vt = (
+            DEFAULT_VISIBILITY_TIMEOUT_S
+            if visibility_timeout_s is _UNSET
+            else int(visibility_timeout_s)
+        )
+        ma = (
+            DEFAULT_MAX_ATTEMPTS
+            if max_attempts is _UNSET
+            else int(max_attempts)
+        )
         if existing is not None:
-            # Same options → memoized instance. Conflicting *explicit*
-            # options raise. Callers that only pass the name (defaults)
-            # — e.g. run_workers looking up a queue already configured
-            # elsewhere — reuse the memoized instance.
-            using_defaults = (
-                visibility_timeout_s == 300 and max_attempts == 3
-            )
+            if lookup_only:
+                return existing
             if (
-                not using_defaults
-                and (
-                    existing.visibility_timeout_s != visibility_timeout_s
-                    or existing.max_attempts != max_attempts
-                )
+                existing.visibility_timeout_s != vt
+                or existing.max_attempts != ma
             ):
                 raise ValueError(
                     f"queue {name!r} already opened with "
                     f"visibility_timeout_s={existing.visibility_timeout_s}, "
                     f"max_attempts={existing.max_attempts}; "
-                    f"got visibility_timeout_s={visibility_timeout_s}, "
-                    f"max_attempts={max_attempts}"
+                    f"got visibility_timeout_s={vt}, max_attempts={ma}"
                 )
             return existing
         q = Queue(
             self,
             name,
-            visibility_timeout_s=visibility_timeout_s,
-            max_attempts=max_attempts,
+            visibility_timeout_s=vt,
+            max_attempts=ma,
         )
         self._queues[name] = q
         return q
@@ -1237,25 +1262,27 @@ class Database:
         self,
         name: str,
         delivery: Callable,
-        max_attempts: int = 5,
-        base_backoff_s: int = 5,
-        visibility_timeout_s: int = 60,
+        max_attempts: int = DEFAULT_OUTBOX_MAX_ATTEMPTS,
+        base_backoff_s: int = DEFAULT_OUTBOX_BASE_BACKOFF_S,
+        visibility_timeout_s: int = DEFAULT_OUTBOX_VISIBILITY_TIMEOUT_S,
     ) -> Outbox:
         max_attempts = int(max_attempts)
         base_backoff_s = int(base_backoff_s)
         visibility_timeout_s = int(visibility_timeout_s)
+        if not callable(delivery):
+            raise TypeError("delivery must be callable")
         existing = self._outboxes.get(name)
         if existing is not None:
             if (
                 existing.max_attempts != max_attempts
                 or existing.base_backoff_s != base_backoff_s
                 or existing._queue.visibility_timeout_s != visibility_timeout_s
+                or existing.delivery is not delivery
             ):
                 raise ValueError(
-                    f"outbox {name!r} already opened with different options"
+                    f"outbox {name!r} already opened with different options "
+                    f"or a different delivery callable"
                 )
-            # delivery callable is not compared — rebinding the handler
-            # on a live outbox is not supported; use a new name.
             return existing
         o = Outbox(
             self,

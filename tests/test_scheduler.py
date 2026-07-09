@@ -261,6 +261,36 @@ def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
     assert int(row["next_fire_at"]) == orig_next + 3600
 
 
+def test_scheduler_register_uses_queue_max_attempts(db_path):
+    """Jobs fired by the scheduler inherit the target queue's
+    max_attempts instead of a hardcoded 3.
+    """
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(
+        name="t",
+        queue="custom",
+        schedule=every_s(1),
+        payload={"x": 1},
+    )
+    row = db.query(
+        "SELECT max_attempts FROM _honker_scheduler_tasks WHERE name='t'"
+    )[0]
+    assert int(row["max_attempts"]) == 7
+    # Force due and tick.
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at = unixepoch() - 1 "
+            "WHERE name='t'"
+        )
+        tx.query("SELECT honker_scheduler_tick(unixepoch())")
+    job = db.query(
+        "SELECT max_attempts FROM _honker_live WHERE queue='custom'"
+    )[0]
+    assert int(job["max_attempts"]) == 7
+
+
 def test_scheduler_tick_caps_catchup_storm(db_path):
     """A long outage on a high-frequency schedule must not enqueue
     unbounded jobs in one tick. Cap is 64; remaining boundaries are
@@ -295,7 +325,13 @@ def test_scheduler_tick_caps_catchup_storm(db_path):
     row = db.query(
         "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='every-sec'"
     )[0]
-    assert int(row["next_fire_at"]) > now
+    next_at = int(row["next_fire_at"])
+    assert next_at > now
+    # Intermediate boundaries between the 64th fire and next_at are
+    # intentionally never enqueued (catch-up skip semantics).
+    fire_ats = sorted(int(f["fire_at"]) for f in fires)
+    assert fire_ats[-1] == orig - 1000 + 63
+    assert next_at == now + 1  # @every 1s: next_after(now)
 
 
 def test_scheduler_tick_racing_writers_produce_no_duplicates(db_path):
@@ -594,9 +630,10 @@ async def test_scheduler_heartbeat_scoped_to_owner_exits_on_lock_steal(db_path):
             [sched.lock_name],
         )
 
-    # Old leader's next heartbeat must notice 0 rows updated and set
-    # stop_event, causing run() to return without us calling stop.
-    await asyncio.wait_for(run_task, timeout=3.0)
+    # Old leader's next tick/heartbeat must notice renew failure and
+    # raise LeadershipLost (not a silent return).
+    with pytest.raises(honker.LeadershipLost, match="lost"):
+        await asyncio.wait_for(run_task, timeout=3.0)
 
     # Thief still holds the lock — old leader must not have released
     # the thief's row (release is owner-scoped) or extended it under

@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## Unreleased — correctness priority fixes
+
+Core (all bindings via `honker_*` SQL / shared extension):
+
+- **Claim/reclaim honors `max_attempts`.** Exhausted reclaimable jobs
+  move to `_honker_dead` with `last_error='max attempts exceeded'`
+  instead of being reclaimed forever after a worker dies without
+  `retry()`/`ack()`.
+- **No synthetic wake rows** on enqueue, retry, stream publish, or
+  scheduler register. Workers wake on `PRAGMA data_version` from the
+  real table write. `notify()` still writes `_honker_notifications`
+  for real pub/sub. Do **not** `listen('honker:<queue>')` expecting
+  enqueue traffic — use `queue.claim` / `update_events`.
+- **`honker_lock_renew(name, owner, ttl_s)`** refreshes lock TTL for
+  the current owner. `honker_lock_acquire` never did; heartbeats that
+  called acquire were no-ops for TTL. Bindings use renew for lock /
+  scheduler heartbeats.
+- **Job heartbeat** requires a still-valid `claim_expires_at` so a
+  late heartbeat cannot steal a job back after visibility timeout.
+- **Scheduler catch-up cap:** at most 64 fires per task per
+  `honker_scheduler_tick`. Further missed boundaries are **skipped**
+  (`next_fire_at` jumps past now). Run the scheduler continuously if
+  every missed fire must land.
+- **Scheduler tasks store `max_attempts`** (default 3; 7-arg
+  `honker_scheduler_register`). Tick uses that budget instead of a
+  hardcoded 3.
+- **JSON returns** from claim/get_job/scheduler/stream built with
+  `serde_json` (wire shape for string payloads unchanged).
+
+Python:
+
+- `@task(retries=N)` pins row `max_attempts` and is honored by
+  `run_workers` via shared `_worker.run_task`.
+- `db.queue(name)` with **no** options is pure lookup; explicit
+  conflicting options raise. `Scheduler.run` raises
+  `LeadershipLost` when the leader lock is stolen; ownership is
+  re-checked every tick.
+
 ## 2026-05-28 — .NET 0.2.4
 
 - .NET `Honker`: 0.2.4

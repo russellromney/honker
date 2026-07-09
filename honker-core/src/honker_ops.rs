@@ -146,6 +146,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 
     // honker_scheduler_register(name, queue, cron_expr, payload_json,
     //                       priority, expires_s_or_null) -> 1.
+    // Optional 7th arg max_attempts (default 3) pins the attempt budget
+    // on every job the scheduler enqueues for this task.
     // Upserts the task row. `next_fire_at` is recomputed as the next
     // cron boundary strictly after `unixepoch()`. Calling twice with
     // the same name replaces the first registration entirely.
@@ -162,7 +164,33 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let expires_s: Option<i64> = ctx.get(5)?;
             let db = unsafe { ctx.get_connection() }?;
             scheduler_register(
-                &db, &name, &queue, &cron_expr, &payload, priority, expires_s,
+                &db, &name, &queue, &cron_expr, &payload, priority, expires_s, 3,
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_scheduler_register",
+        7,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let queue: String = ctx.get(1)?;
+            let cron_expr: String = ctx.get(2)?;
+            let payload: String = ctx.get(3)?;
+            let priority: i64 = ctx.get(4)?;
+            let expires_s: Option<i64> = ctx.get(5)?;
+            let max_attempts: i64 = ctx.get(6)?;
+            let db = unsafe { ctx.get_connection() }?;
+            scheduler_register(
+                &db,
+                &name,
+                &queue,
+                &cron_expr,
+                &payload,
+                priority,
+                expires_s,
+                max_attempts,
             )
             .map_err(to_sql_err)
         },
@@ -938,10 +966,14 @@ pub fn heartbeat(
     worker_id: &str,
     extend_s: i64,
 ) -> rusqlite::Result<i64> {
+    // Require a still-valid claim. Without `claim_expires_at >= now`,
+    // a late heartbeat after visibility timeout can steal the job
+    // back from a reclaimer (dual execution).
     let updated = conn.execute(
         "UPDATE _honker_live
          SET claim_expires_at = unixepoch() + ?3
-         WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'",
+         WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
+           AND claim_expires_at >= unixepoch()",
         rusqlite::params![job_id, worker_id, extend_s],
     )?;
     Ok(updated as i64)
@@ -1104,7 +1136,8 @@ pub fn rate_limit_sweep(conn: &Connection, older_than_s: i64) -> rusqlite::Resul
 /// Register (or re-register) a periodic task. `next_fire_at` is
 /// computed as the next cron boundary strictly after
 /// `unixepoch()`. Calling twice with the same name replaces the
-/// first registration entirely.
+/// first registration entirely. `max_attempts` is stored on the task
+/// row and applied to every job `scheduler_tick` enqueues for it.
 pub fn scheduler_register(
     conn: &Connection,
     name: &str,
@@ -1113,20 +1146,23 @@ pub fn scheduler_register(
     payload: &str,
     priority: i64,
     expires_s: Option<i64>,
+    max_attempts: i64,
 ) -> rusqlite::Result<i64> {
+    let max_attempts = if max_attempts < 1 { 1 } else { max_attempts };
     let now = now_unix(conn)?;
     let next_fire_at = super::cron::next_after_unix(cron_expr, now).map_err(to_sql_err)?;
     conn.execute(
         "INSERT INTO _honker_scheduler_tasks
-           (name, queue, cron_expr, payload, priority, expires_s, next_fire_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, max_attempts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(name) DO UPDATE SET
            queue = excluded.queue,
            cron_expr = excluded.cron_expr,
            payload = excluded.payload,
            priority = excluded.priority,
            expires_s = excluded.expires_s,
-           next_fire_at = excluded.next_fire_at",
+           next_fire_at = excluded.next_fire_at,
+           max_attempts = excluded.max_attempts",
         rusqlite::params![
             name,
             queue,
@@ -1134,7 +1170,8 @@ pub fn scheduler_register(
             payload,
             priority,
             expires_s,
-            next_fire_at
+            next_fire_at,
+            max_attempts
         ],
     )?;
     // Wake any sleeping scheduler leader so it re-computes
@@ -1142,6 +1179,9 @@ pub fn scheduler_register(
     // this, a leader that went to sleep for an hour before a newly-
     // registered 1-minute-from-now task existed would oversleep past
     // its first fire.
+    //
+    // Wake is the register/update write itself advancing data_version
+    // on commit — see scheduler_wake.
     scheduler_wake(conn)?;
     Ok(1)
 }
@@ -1175,10 +1215,14 @@ fn scheduler_wake(_conn: &Connection) -> rusqlite::Result<()> {
 /// Max fires enqueued for a single schedule row in one
 /// `scheduler_tick` call. After a long outage an `@every 1s` task
 /// would otherwise enqueue tens of thousands of jobs in one writer
-/// transaction. Once the cap is hit we jump `next_fire_at` to the
-/// next boundary after `now_unix` and stop catching up intermediate
-/// boundaries. Operators who need every missed fire should run the
-/// scheduler continuously or raise the cap in a future release.
+/// transaction.
+///
+/// **Semantics (intentional):** once the cap is hit, remaining missed
+/// boundaries for that task are **skipped** — `next_fire_at` jumps to
+/// the next boundary strictly after `now_unix`. Those intermediate
+/// fires are never enqueued. Run the scheduler continuously, use
+/// coarser schedules, or raise this constant if every missed fire
+/// must be delivered.
 pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 
 /// For each registered task whose `next_fire_at <= now_unix`,
@@ -1189,9 +1233,10 @@ pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 /// Returns a JSON array of `{name, queue, fire_at, job_id}` fires.
 pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<String> {
     #[allow(clippy::type_complexity)]
-    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64)> = {
+    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64, i64)> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT name, queue, cron_expr, payload, priority, expires_s, next_fire_at
+            "SELECT name, queue, cron_expr, payload, priority, expires_s,
+                    next_fire_at, COALESCE(max_attempts, 3)
              FROM _honker_scheduler_tasks
              WHERE next_fire_at <= ?1 AND enabled = 1",
         )?;
@@ -1204,26 +1249,46 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 r.get::<_, i64>(4)?,
                 r.get::<_, Option<i64>>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?
     };
     let mut out = Vec::new();
-    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at) in tasks {
+    for (
+        name,
+        queue,
+        cron_expr,
+        payload,
+        priority,
+        expires_s,
+        mut next_fire_at,
+        max_attempts,
+    ) in tasks
+    {
         let mut fires_this_task: i64 = 0;
         while next_fire_at <= now_unix {
             if fires_this_task >= SCHEDULER_MAX_CATCHUP_FIRES {
                 // Skip the remaining backlog. Resume from the next
                 // boundary strictly after now so we don't immediately
                 // re-enter the catch-up loop on the next tick.
+                // Intermediate boundaries are intentionally never
+                // enqueued (see SCHEDULER_MAX_CATCHUP_FIRES docs).
                 next_fire_at =
                     super::cron::next_after_unix(&cron_expr, now_unix).map_err(to_sql_err)?;
                 break;
             }
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
+            // max_attempts comes from the schedule row, not a constant.
             let job_id = enqueue(
-                conn, &queue, &payload, None, None, priority, 3, /* max_attempts default */
+                conn,
+                &queue,
+                &payload,
+                None,
+                None,
+                priority,
+                max_attempts,
                 expires_s,
             )?;
             out.push(json!({
@@ -1284,15 +1349,15 @@ pub fn scheduler_resume(conn: &Connection, name: &str) -> rusqlite::Result<i64> 
 
 /// Return all registered schedules as a JSON array. Each row:
 /// `{name, queue, cron_expr, payload, priority, expires_s,
-///   next_fire_at, enabled}`.
+///   next_fire_at, enabled, max_attempts}`.
 pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
     let mut stmt = conn.prepare(
         "SELECT name, queue, cron_expr, payload, priority, expires_s,
-                next_fire_at, enabled
+                next_fire_at, enabled, COALESCE(max_attempts, 3)
            FROM _honker_scheduler_tasks
            ORDER BY name",
     )?;
-    let rows: Vec<(String, String, String, String, i64, Option<i64>, i64, i64)> = stmt
+    let rows: Vec<(String, String, String, String, i64, Option<i64>, i64, i64, i64)> = stmt
         .query_map([], |r| {
             Ok((
                 r.get(0)?,
@@ -1303,11 +1368,23 @@ pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut out = Vec::new();
-    for (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, enabled) in rows {
+    for (
+        name,
+        queue,
+        cron_expr,
+        payload,
+        priority,
+        expires_s,
+        next_fire_at,
+        enabled,
+        max_attempts,
+    ) in rows
+    {
         out.push(json!({
             "name": name,
             "queue": queue,
@@ -1317,6 +1394,7 @@ pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
             "expires_s": expires_s,
             "next_fire_at": next_fire_at,
             "enabled": enabled != 0,
+            "max_attempts": max_attempts,
         }));
     }
     Ok(Value::Array(out).to_string())

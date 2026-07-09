@@ -53,6 +53,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from honker import _honker_native
+from honker._honker import LeadershipLost
 
 _UNSET = object()
 
@@ -173,9 +174,13 @@ class Scheduler:
           `queue.sweep_expired()` moves expired rows into
           `_honker_dead`.
         """
+        # max_attempts defaults to the target queue's max_attempts so
+        # scheduler-enqueued jobs share the same attempt budget as
+        # normal work on that queue.
+        q = self.db.queue(queue)
         with self.db.transaction() as tx:
             tx.query(
-                "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
+                "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
                 [
                     name,
                     queue,
@@ -183,6 +188,7 @@ class Scheduler:
                     json.dumps(payload),
                     int(priority),
                     int(expires) if expires is not None else None,
+                    int(q.max_attempts),
                 ],
             )
         self._registered.add(name)
@@ -302,36 +308,56 @@ class Scheduler:
                 )
 
         # Hold the lock handle so we know our owner token. Heartbeats
-        # must UPDATE by (name, owner) — name-only refresh would extend
+        # must renew by (name, owner) — name-only refresh would extend
         # a *successor* leader's row after our TTL elapsed, and we'd
         # keep ticking as a dual leader.
         lock = self.db.lock(self.lock_name, ttl=self.lock_ttl)
+        lost = asyncio.Event()
         with lock:
             hb = asyncio.create_task(
-                self._heartbeat_loop(stop_event, lock.owner)
+                self._heartbeat_loop(stop_event, lost, lock.owner)
             )
             try:
-                await self._main_loop(stop_event)
+                await self._main_loop(stop_event, lost, lock.owner)
             finally:
                 hb.cancel()
                 try:
                     await hb
                 except asyncio.CancelledError:
                     pass
+            if lost.is_set():
+                # Leadership stolen; distinct from clean stop_event exit
+                # (caller-set stop_event alone never sets `lost`).
+                raise LeadershipLost(
+                    f"scheduler lock {self.lock_name!r} lost "
+                    f"(owner={lock.owner!r}); another leader took over"
+                )
+
+    def _renew_leadership(self, owner: str) -> bool:
+        """Extend the leader lock for `owner`. Returns False if stolen."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_lock_renew(?, ?, ?) AS r",
+                [self.lock_name, owner, self.lock_ttl],
+            )
+        return bool(rows and rows[0]["r"])
 
     async def _heartbeat_loop(
-        self, stop_event: asyncio.Event, owner: str
+        self,
+        stop_event: asyncio.Event,
+        lost: asyncio.Event,
+        owner: str,
     ) -> None:
         """Refresh the leader lock's `expires_at` every
         `heartbeat_interval` seconds so the TTL doesn't elapse during
         long sleeps between cron boundaries.
 
-        Scoped to `(name, owner)`. If the UPDATE touches 0 rows we
-        lost the lock (TTL elapsed, another process acquired it) —
-        set `stop_event` so `_main_loop` exits before the next tick
-        and we cannot double-fire alongside the new leader.
+        Scoped to `(name, owner)`. If renew fails we lost the lock —
+        set `lost` + `stop_event` so `_main_loop` exits before another
+        tick. Ownership is also checked every tick (see `_main_loop`)
+        so dual-fire is bounded by tick cadence, not only heartbeat.
         """
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not lost.is_set():
             try:
                 await asyncio.wait_for(
                     stop_event.wait(), timeout=self.heartbeat_interval
@@ -339,27 +365,29 @@ class Scheduler:
                 return  # stop_event set
             except asyncio.TimeoutError:
                 pass
-            with self.db.transaction() as tx:
-                rows = tx.query(
-                    "SELECT honker_lock_renew(?, ?, ?) AS r",
-                    [self.lock_name, owner, self.lock_ttl],
-                )
-            if not rows or not rows[0]["r"]:
-                # Lost leadership. Signal the main loop to stop before
-                # the next honker_scheduler_tick.
+            if not self._renew_leadership(owner):
+                lost.set()
                 stop_event.set()
                 return
 
-    async def _main_loop(self, stop_event: asyncio.Event) -> None:
+    async def _main_loop(
+        self,
+        stop_event: asyncio.Event,
+        lost: asyncio.Event,
+        owner: str,
+    ) -> None:
         # Subscribe to WAL eagerly so a register/unregister landing
-        # during the tick transaction is buffered. `honker_scheduler_
-        # register` and `_unregister` emit a wake on the
-        # 'honker:scheduler' channel precisely to kick us out of a
-        # sleep — otherwise we'd oversleep past a freshly-registered
-        # task whose next_fire_at is earlier than the previously
-        # computed soonest.
+        # during the tick transaction is buffered. Schedule mutations
+        # advance data_version on commit so we re-evaluate soonest.
         updates = self.db.update_events()
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not lost.is_set():
+            # Prove we still own the lock before every fire. Shrinks
+            # the dual-leader window after a steal to one loop
+            # iteration instead of up to heartbeat_interval.
+            if not self._renew_leadership(owner):
+                lost.set()
+                stop_event.set()
+                return
             now = int(time.time())
             # tick + soonest share a writer transaction: honker_* scalars
             # are registered on the writer slot only (one copy, lowest
@@ -376,8 +404,8 @@ class Scheduler:
                 return
             sleep_s = max(0.1, soonest - time.time())
             # Race three wake sources against the timer:
-            #   - stop_event   → caller asked us to shut down
-            #   - update tick     → a register/unregister (or any other
+            #   - stop_event   → caller asked us to shut down / lost lock
+            #   - update tick  → a register/unregister (or any other
             #                    commit) happened; re-evaluate soonest
             #   - timeout      → the originally-computed soonest fired
             # Any of the three just falls through to the top of the loop.
@@ -393,10 +421,6 @@ class Scheduler:
                 for t in (stop_task, update_task):
                     if not t.done():
                         t.cancel()
-                # Surface task exceptions (other than CancelledError)
-                # so a broken update iterator doesn't silently hang the
-                # scheduler. Done tasks that we didn't await would
-                # otherwise warn at GC.
                 for t in (stop_task, update_task):
                     try:
                         await t

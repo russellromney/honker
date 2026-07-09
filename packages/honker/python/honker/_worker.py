@@ -81,7 +81,14 @@ async def run_task(
         raise
     except asyncio.TimeoutError:
         delay = _compute_delay(retry_delay, backoff, job.attempts)
-        _retry_or_fail(job, retries, delay, "handler timeout")
+        # Include the configured timeout so dead-letter rows are
+        # diagnosable (matches decorated-task timeout wording).
+        msg = (
+            f"timeout after {timeout}s"
+            if timeout is not None
+            else "handler timeout"
+        )
+        _retry_or_fail(job, retries, delay, msg)
     except Retryable as r:
         # Handler-chosen delay, but still respect the attempt budget
         # so Retryable cannot infinite-loop past retries=.

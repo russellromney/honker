@@ -347,7 +347,8 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       priority INTEGER NOT NULL DEFAULT 0,
       expires_s INTEGER,
       next_fire_at INTEGER NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1
+      enabled INTEGER NOT NULL DEFAULT 1,
+      max_attempts INTEGER NOT NULL DEFAULT 3
     );
     CREATE TABLE IF NOT EXISTS _honker_results (
       job_id INTEGER PRIMARY KEY,
@@ -404,6 +405,23 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
             Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {
                 // Lost the race; the other process added it. Fine.
             }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Migration: max_attempts on scheduler tasks (per-fire job budget).
+    let has_max_attempts: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM pragma_table_info('_honker_scheduler_tasks') WHERE name='max_attempts'",
+        )?;
+        stmt.query_row([], |_| Ok(true)).unwrap_or(false)
+    };
+    if !has_max_attempts {
+        match conn.execute(
+            "ALTER TABLE _honker_scheduler_tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -2308,6 +2326,7 @@ while True:
                 "expires_s",
                 "next_fire_at",
                 "enabled",
+                "max_attempts",
             ],
         );
         let res_cols: Vec<String> = conn
