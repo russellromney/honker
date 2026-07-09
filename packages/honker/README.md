@@ -84,15 +84,17 @@ or `every_s`), not a raw string. Supported schedule expressions:
 
 - 5-field cron: `crontab("0 3 * * *")`
 - 6-field cron: `crontab("*/2 * * * * *")`
-- interval: `every_s(1)` (equivalently `crontab("@every 1s")`)
+- interval: `every_s(1)` (use `every_s`, not `crontab("@every …")`)
 
 ## Notes
 
 - `claim()` wakes on database updates and on due deadlines like `run_at`.
 - `schedule` is the canonical recurring-schedule name.
 - `cron` still works as a compatibility alias in older call sites.
-- Construct `db.queue(name)` handles **outside** an open `db.transaction()` (the
-  first call for a name runs its own schema-init transaction — a nested one
-  deadlocks). Create the handle first, then pass `tx=` to `enqueue`.
+- Construct `db.queue(name)` handles **outside** an open `db.transaction()`.
+  First open for a name runs schema init in its own write transaction; doing
+  that inside an outer `transaction()` raises `RuntimeError` (would otherwise
+  deadlock the single writer). Create the handle first, then pass `tx=` to
+  `enqueue`.
 
 For streams, notify/listen, tasks, SQL extension usage, and full scheduler docs, see the main repo and docs site.

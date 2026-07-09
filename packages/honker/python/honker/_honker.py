@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import time
 import traceback
 import uuid
@@ -227,11 +228,18 @@ class Queue:
         # on column counts. View + schema-version cleanup are
         # Python-binding-specific and stay here.
         #
-        # NOTE: this opens its own transaction, so a Queue must not be
-        # constructed while a caller's `db.transaction()` is already open —
-        # the nested BEGIN deadlocks the single write connection. See the
-        # warning in `Database.queue`. Construct queues outside the
-        # transaction and pass `tx=` to `enqueue`.
+        # Schema init opens its own write transaction. The writer is a
+        # single connection slot: nested transaction() on the same thread
+        # waits forever for a slot the outer `with` still holds. Fail fast
+        # instead of hanging (see Database.queue). Construct queues
+        # outside the transaction and pass tx= to enqueue.
+        if getattr(self.db, "_tx_depth", 0) > 0:
+            raise RuntimeError(
+                f"cannot construct Queue {self.name!r} while a "
+                "db.transaction() is open: schema init needs its own write "
+                "transaction and would deadlock the single writer. "
+                "Construct the queue first, then pass tx= to enqueue."
+            )
         with self.db.transaction() as tx:
             tx.bootstrap_honker_schema()
             # Inspection view: UNION live + dead with a synthetic `state`.
@@ -1007,6 +1015,56 @@ class _Lock:
         return False  # don't suppress exceptions from the with-body
 
 
+class _TxDepthGuard:
+    """Tracks open `Database.transaction()` blocks for reentrancy checks.
+
+    The native writer is a single connection slot. Nested
+    `transaction()` on the *same thread* deadlocks (outer holds the
+    slot; inner waits for it forever). Depth is **per-thread** so
+    another thread waiting for the writer still blocks correctly until
+    the holder releases — only same-thread re-entry fails fast.
+
+    Queue schema init opens its own transaction, so first-time
+    `db.queue(name)` inside an open outer tx on this thread would hang;
+    that path raises with a queue-specific message before entering.
+
+    Bootstrap in `Database.__init__` uses `_inner.transaction()`
+    directly and does not bump depth — correct, since no user outer tx
+    is open.
+    """
+
+    __slots__ = ("_db", "_inner", "_entered")
+
+    def __init__(self, db: "Database", inner):
+        self._db = db
+        self._inner = inner
+        self._entered = False
+
+    def __enter__(self):
+        # Same-thread re-entry would deadlock on the writer slot.
+        # Cross-thread wait (depth 0 here, another thread holds the
+        # slot) is fine — native acquire blocks until free.
+        if self._db._tx_depth > 0:
+            raise RuntimeError(
+                "nested db.transaction() is not supported: the writer is "
+                "a single connection slot and re-entry deadlocks on this "
+                "thread. Keep one open transaction and pass tx= to "
+                "enqueue/publish/..."
+            )
+        tx = self._inner.__enter__()
+        self._db._tx_local.depth = self._db._tx_depth + 1
+        self._entered = True
+        return tx
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return self._inner.__exit__(exc_type, exc, tb)
+        finally:
+            if self._entered:
+                self._db._tx_local.depth = max(0, self._db._tx_depth - 1)
+                self._entered = False
+
+
 class Database:
     """Wrapper over the honker Database that adds queue/stream/outbox."""
 
@@ -1015,14 +1073,22 @@ class Database:
         self._queues: dict = {}
         self._streams: dict = {}
         self._outboxes: dict = {}
+        # Per-thread nesting depth of `self.transaction()` (not
+        # `_inner.transaction()`). See `_TxDepthGuard`.
+        self._tx_local = threading.local()
         # Bootstrap the shared honker schema up-front so features
         # like db.lock() (which doesn't touch Queue or Stream) find
         # their tables on first use.
         with self._inner.transaction() as tx:
             tx.bootstrap_honker_schema()
 
+    @property
+    def _tx_depth(self) -> int:
+        """Open `self.transaction()` count on *this* thread only."""
+        return int(getattr(self._tx_local, "depth", 0) or 0)
+
     def transaction(self):
-        return self._inner.transaction()
+        return _TxDepthGuard(self, self._inner.transaction())
 
     def listen(self, channel: str, fallback_poll_s: Optional[float] = 15.0):
         return Listener(self, channel, fallback_poll_s=fallback_poll_s)
@@ -1191,11 +1257,10 @@ class Database:
         IMPORTANT — construct outside an open transaction. The *first* call
         for a given name initializes the queue's schema in its own
         transaction. Calling it for a brand-new name while a
-        ``with db.transaction()`` block is already open deadlocks: the nested
-        ``BEGIN`` blocks on the single write connection the outer transaction
-        holds, and the wait happens in the native extension (holding the GIL),
-        so it can't be interrupted. Create the handle first, then pass
-        ``tx=`` to :meth:`Queue.enqueue` inside the transaction::
+        ``with db.transaction()`` block is already open raises
+        ``RuntimeError`` (it would otherwise deadlock the single writer).
+        Create the handle first, then pass ``tx=`` to
+        :meth:`Queue.enqueue` inside the transaction::
 
             emails = db.queue("emails")          # construct up front
             with db.transaction() as tx:
