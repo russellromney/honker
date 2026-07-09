@@ -766,18 +766,18 @@ func (q *Queue) AckBatch(ids []int64, workerID string) (int64, error) {
 // JobRow is one job row read by Queue.GetJob. Pure data, no claim
 // semantics.
 type JobRow struct {
-	ID              int64   `json:"id"`
-	Queue           string  `json:"queue"`
-	Payload         string  `json:"payload"`
-	State           string  `json:"state"`
-	Priority        int64   `json:"priority"`
-	RunAt           int64   `json:"run_at"`
-	WorkerID        *string `json:"worker_id"`
-	ClaimExpiresAt  *int64  `json:"claim_expires_at"`
-	Attempts        int64   `json:"attempts"`
-	MaxAttempts     int64   `json:"max_attempts"`
-	CreatedAt       int64   `json:"created_at"`
-	ExpiresAt       *int64  `json:"expires_at"`
+	ID             int64   `json:"id"`
+	Queue          string  `json:"queue"`
+	Payload        string  `json:"payload"`
+	State          string  `json:"state"`
+	Priority       int64   `json:"priority"`
+	RunAt          int64   `json:"run_at"`
+	WorkerID       *string `json:"worker_id"`
+	ClaimExpiresAt *int64  `json:"claim_expires_at"`
+	Attempts       int64   `json:"attempts"`
+	MaxAttempts    int64   `json:"max_attempts"`
+	CreatedAt      int64   `json:"created_at"`
+	ExpiresAt      *int64  `json:"expires_at"`
 }
 
 // Cancel removes a pending or processing row by id. Returns true iff
@@ -1103,6 +1103,8 @@ type ScheduledTask struct {
 	Payload  any
 	Priority int64
 	ExpiresS *int64
+	// MaxAttempts is the attempt budget for each fired job. Defaults to 3.
+	MaxAttempts int64
 }
 
 // ScheduledFire is one firing of a scheduled task.
@@ -1123,10 +1125,14 @@ func (s *Scheduler) Add(task ScheduledTask) error {
 	if expr == "" {
 		expr = task.Cron
 	}
+	maxAttempts := task.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
 	_, err = s.db.db.Exec(
-		"SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
+		"SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
 		task.Name, task.Queue, expr, string(payloadJSON),
-		task.Priority, task.ExpiresS,
+		task.Priority, task.ExpiresS, maxAttempts,
 	)
 	return err
 }
@@ -1189,14 +1195,14 @@ func (s *Scheduler) Resume(name string) (bool, error) {
 
 // ScheduleRow is one entry returned by Scheduler.List().
 type ScheduleRow struct {
-	Name        string `json:"name"`
-	Queue       string `json:"queue"`
-	CronExpr    string `json:"cron_expr"`
-	Payload     string `json:"payload"`
-	Priority    int64  `json:"priority"`
-	ExpiresS    *int64 `json:"expires_s"`
-	NextFireAt  int64  `json:"next_fire_at"`
-	Enabled     bool   `json:"enabled"`
+	Name       string `json:"name"`
+	Queue      string `json:"queue"`
+	CronExpr   string `json:"cron_expr"`
+	Payload    string `json:"payload"`
+	Priority   int64  `json:"priority"`
+	ExpiresS   *int64 `json:"expires_s"`
+	NextFireAt int64  `json:"next_fire_at"`
+	Enabled    bool   `json:"enabled"`
 }
 
 // List returns every registered schedule with current state.

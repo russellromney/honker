@@ -22,7 +22,8 @@ public sealed record ScheduledTask(
     string? Schedule = null,
     string? Cron = null,
     long Priority = 0,
-    long? ExpiresSeconds = null
+    long? ExpiresSeconds = null,
+    int MaxAttempts = 3
 );
 
 public sealed record ScheduledFire(
@@ -58,6 +59,9 @@ public sealed record ScheduleRow
 
     [System.Text.Json.Serialization.JsonPropertyName("enabled")]
     public bool Enabled { get; init; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("max_attempts")]
+    public long MaxAttempts { get; init; }
 }
 
 /// <summary>

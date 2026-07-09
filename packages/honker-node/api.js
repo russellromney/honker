@@ -606,16 +606,17 @@ class Scheduler {
     this._db = db;
   }
 
-  add({ name, queue, schedule = null, cron = null, payload, priority = 0, expiresS = null }) {
+  add({ name, queue, schedule = null, cron = null, payload, priority = 0, expiresS = null, maxAttempts = 3 }) {
     const expr = schedule ?? cron;
     if (!expr) throw new Error('must provide schedule or cron');
-    this._db._callScalar('SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)', [
+    this._db._callScalar('SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)', [
       name,
       queue,
       expr,
       jsonText(payload),
       priority,
       expiresS,
+      maxAttempts,
     ]);
   }
 

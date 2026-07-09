@@ -270,6 +270,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "rusqlite",
+ "serde_json",
  "thiserror",
 ]
 

@@ -22,14 +22,15 @@ public sealed class Scheduler
         }
 
         _database.ExecuteScalar(
-            "SELECT honker_scheduler_register(@p0, @p1, @p2, @p3, @p4, @p5)",
+            "SELECT honker_scheduler_register(@p0, @p1, @p2, @p3, @p4, @p5, @p6)",
             transaction,
             task.Name,
             task.Queue,
             expr,
             JsonSerializer.Serialize(task.Payload),
             task.Priority,
-            task.ExpiresSeconds
+            task.ExpiresSeconds,
+            task.MaxAttempts
         );
         _registered.Add(task.Name);
     }

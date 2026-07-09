@@ -424,9 +424,10 @@ export fn honker_cpp_scheduler_register(
     payload_z: [*:0]const u8,
     priority: i64,
     expires_sec: i64,
+    max_attempts: i64,
 ) callconv(.c) i64 {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6)";
+    const sql = "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6, ?7)";
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
     defer _ = c.sqlite3_finalize(stmt);
 
@@ -440,6 +441,7 @@ export fn honker_cpp_scheduler_register(
     } else {
         _ = c.sqlite3_bind_int64(stmt, 6, expires_sec);
     }
+    _ = c.sqlite3_bind_int64(stmt, 7, max_attempts);
 
     return step_scalar_int64(stmt);
 }

@@ -117,6 +117,7 @@ export interface ScheduledTask {
   payload: unknown;
   priority?: number;
   expiresS?: number | null;
+  maxAttempts?: number;
 }
 
 export interface ScheduledFire {
@@ -1106,9 +1107,9 @@ export class Scheduler {
     this.db.raw
       .query<
         { v: number },
-        [string, string, string, string, number, number | null]
+        [string, string, string, string, number, number | null, number]
       >(
-        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?) AS v",
+        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?) AS v",
       )
       .get(
         task.name,
@@ -1117,6 +1118,7 @@ export class Scheduler {
         payloadJson,
         task.priority ?? 0,
         task.expiresS ?? null,
+        task.maxAttempts ?? 3,
       );
     this.db._markUpdated();
   }

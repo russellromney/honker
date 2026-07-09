@@ -141,6 +141,54 @@ async def test_worker_runs_async_task(db_path):
     await asyncio.wait_for(run, timeout=3.0)
 
 
+async def test_result_save_failure_does_not_retry_successful_task(db_path, monkeypatch):
+    db = honker.open(db_path)
+    q = db.queue("default", max_attempts=3)
+    calls = []
+
+    @q.task()
+    def side_effect():
+        calls.append("ran")
+        return {"not": "saved"}
+
+    original_save_result = q.save_result
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("result store down")
+
+    monkeypatch.setattr(q, "save_result", boom)
+    r = side_effect()
+
+    stop = asyncio.Event()
+    run = asyncio.create_task(
+        db.run_workers(queue="default", concurrency=1, stop_event=stop),
+    )
+
+    deadline = asyncio.get_event_loop().time() + 3.0
+    while asyncio.get_event_loop().time() < deadline:
+        live = db.query(
+            "SELECT COUNT(*) AS c FROM _honker_live WHERE id=?", [r.id]
+        )[0]["c"]
+        if live == 0:
+            break
+        await asyncio.sleep(0.05)
+
+    stop.set()
+    await asyncio.wait_for(run, timeout=3.0)
+    monkeypatch.setattr(q, "save_result", original_save_result)
+
+    assert calls == ["ran"]
+    assert db.query(
+        "SELECT COUNT(*) AS c FROM _honker_live WHERE id=?", [r.id]
+    )[0]["c"] == 0
+    assert db.query(
+        "SELECT COUNT(*) AS c FROM _honker_dead WHERE id=?", [r.id]
+    )[0]["c"] == 0
+    assert db.query(
+        "SELECT COUNT(*) AS c FROM _honker_results WHERE job_id=?", [r.id]
+    )[0]["c"] == 0
+
+
 async def test_store_result_false_skips_save(db_path):
     db = honker.open(db_path)
     q = db.queue("default")

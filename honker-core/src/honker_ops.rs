@@ -107,18 +107,13 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // holds the lock and expires_at was extended, 0 otherwise.
     // Distinct from honker_lock_acquire: INSERT OR IGNORE does not
     // refresh expires_at for an existing (name, owner) row.
-    conn.create_scalar_function(
-        "honker_lock_renew",
-        3,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let name: String = ctx.get(0)?;
-            let owner: String = ctx.get(1)?;
-            let ttl: i64 = ctx.get(2)?;
-            let db = unsafe { ctx.get_connection() }?;
-            lock_renew(&db, &name, &owner, ttl).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_lock_renew", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let name: String = ctx.get(0)?;
+        let owner: String = ctx.get(1)?;
+        let ttl: i64 = ctx.get(2)?;
+        let db = unsafe { ctx.get_connection() }?;
+        lock_renew(&db, &name, &owner, ttl).map_err(to_sql_err)
+    })?;
 
     conn.create_scalar_function(
         "honker_rate_limit_try",
@@ -1074,12 +1069,7 @@ pub fn lock_release(conn: &Connection, name: &str, owner: &str) -> rusqlite::Res
 /// `honker_lock_acquire` uses `INSERT OR IGNORE` and does **not**
 /// refresh TTL on same-owner re-acquire — callers that need renewal
 /// (scheduler leaders, long critical sections) must use this.
-pub fn lock_renew(
-    conn: &Connection,
-    name: &str,
-    owner: &str,
-    ttl_s: i64,
-) -> rusqlite::Result<i64> {
+pub fn lock_renew(conn: &Connection, name: &str, owner: &str, ttl_s: i64) -> rusqlite::Result<i64> {
     if ttl_s <= 0 {
         return Err(to_sql_err("ttl_s must be positive"));
     }
@@ -1255,16 +1245,8 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
         .collect::<Result<Vec<_>, _>>()?
     };
     let mut out = Vec::new();
-    for (
-        name,
-        queue,
-        cron_expr,
-        payload,
-        priority,
-        expires_s,
-        mut next_fire_at,
-        max_attempts,
-    ) in tasks
+    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at, max_attempts) in
+        tasks
     {
         let mut fires_this_task: i64 = 0;
         while next_fire_at <= now_unix {
@@ -1357,7 +1339,17 @@ pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
            FROM _honker_scheduler_tasks
            ORDER BY name",
     )?;
-    let rows: Vec<(String, String, String, String, i64, Option<i64>, i64, i64, i64)> = stmt
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+    )> = stmt
         .query_map([], |r| {
             Ok((
                 r.get(0)?,
@@ -1633,5 +1625,3 @@ pub fn stream_get_offset(conn: &Connection, consumer: &str, topic: &str) -> rusq
 fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
 }
-
-

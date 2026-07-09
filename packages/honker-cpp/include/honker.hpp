@@ -76,7 +76,8 @@ extern "C" {
 
     int64_t honker_cpp_scheduler_register(
         sqlite3* db, const char* name, const char* queue, const char* cron,
-        const char* payload_json, int64_t priority, int64_t expires_sec);
+        const char* payload_json, int64_t priority, int64_t expires_sec,
+        int64_t max_attempts);
     int64_t honker_cpp_scheduler_unregister(sqlite3* db, const char* name);
     char*   honker_cpp_scheduler_tick(sqlite3* db, int64_t now_unix);
     int64_t honker_cpp_scheduler_soonest(sqlite3* db);
@@ -833,14 +834,15 @@ class Scheduler {
 public:
     void add(std::string_view name, std::string_view queue, std::string_view schedule_expr,
              std::string_view payload_json, int64_t priority = 0,
-             std::optional<int64_t> expires_sec = std::nullopt) {
+             std::optional<int64_t> expires_sec = std::nullopt,
+             int64_t max_attempts = 3) {
         const std::string n{name};
         const std::string q{queue};
         const std::string c{schedule_expr};
         const std::string p{payload_json};
         const auto rc = honker_cpp_scheduler_register(
             db_->raw(), n.c_str(), q.c_str(), c.c_str(), p.c_str(), priority,
-            expires_sec.value_or(0));
+            expires_sec.value_or(0), max_attempts);
         if (rc < 0) throw Error{"scheduler_register failed: SQL error"};
         db_->mark_updated();
     }

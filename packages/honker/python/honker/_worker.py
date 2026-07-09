@@ -73,7 +73,13 @@ async def run_task(
             # should wrap it themselves or switch to async.
             result = handler(job.payload)
         if save_result:
-            job.queue.save_result(job.id, result, ttl=result_ttl)
+            try:
+                job.queue.save_result(job.id, result, ttl=result_ttl)
+            except Exception:
+                # The handler already succeeded. Do not retry it and
+                # duplicate side effects just because result persistence
+                # failed or the return value was not JSON-serializable.
+                traceback.print_exc()
         job.ack()
     except asyncio.CancelledError:
         # Let the worker-loop unwind. Don't ack / retry — the job's

@@ -43,13 +43,13 @@ module Honker
     #
     # Idempotent by `name`; registering the same name twice replaces
     # the previous row.
-    def add(name:, queue:, cron: nil, schedule: nil, payload:, priority: 0, expires_s: nil)
+    def add(name:, queue:, cron: nil, schedule: nil, payload:, priority: 0, expires_s: nil, max_attempts: 3)
       expr = schedule || cron
       raise ArgumentError, "must provide cron: or schedule:" if expr.nil? || expr.empty?
 
       @db.db.get_first_row(
-        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
-        [name, queue, expr, JSON.dump(payload), priority, expires_s],
+        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
+        [name, queue, expr, JSON.dump(payload), priority, expires_s, max_attempts],
       )
       @db.mark_updated
       nil

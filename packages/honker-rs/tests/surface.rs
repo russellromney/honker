@@ -298,6 +298,7 @@ fn scheduler_register_and_tick() {
             payload: json!({"k": "v"}),
             priority: 0,
             expires_s: None,
+            max_attempts: None,
         })
         .unwrap();
 
@@ -550,6 +551,7 @@ fn scheduler_accepts_every_second_expression() {
             payload: json!({"ok": true}),
             priority: 0,
             expires_s: None,
+            max_attempts: None,
         })
         .unwrap();
 

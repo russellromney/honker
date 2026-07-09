@@ -630,11 +630,9 @@ impl Queue {
     /// cancellation to running handlers.
     pub fn cancel(&self, job_id: i64) -> Result<bool> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_cancel(?1)",
-                params![job_id],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT honker_cancel(?1)", params![job_id], |r| {
+                r.get::<_, i64>(0)
+            })
         })? > 0)
     }
 
@@ -1325,6 +1323,7 @@ pub struct ScheduledTask {
     pub payload: serde_json::Value,
     pub priority: i64,
     pub expires_s: Option<i64>,
+    pub max_attempts: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1347,6 +1346,7 @@ pub struct ScheduleRow {
     pub expires_s: Option<i64>,
     pub next_fire_at: i64,
     pub enabled: bool,
+    pub max_attempts: i64,
 }
 
 /// Optional fields for `Scheduler::update()`. `None` means "leave
@@ -1372,7 +1372,7 @@ impl Scheduler {
         let payload_json = serde_json::to_string(&task.payload)?;
         self.inner.with_conn(|c| {
             c.query_row(
-                "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6)",
+                "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     task.name,
                     task.queue,
@@ -1380,6 +1380,7 @@ impl Scheduler {
                     payload_json,
                     task.priority,
                     task.expires_s,
+                    task.max_attempts.unwrap_or(3),
                 ],
                 |_| Ok(()),
             )
@@ -1423,30 +1424,26 @@ impl Scheduler {
     /// Idempotent on already-paused (returns false).
     pub fn pause(&self, name: &str) -> Result<bool> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_scheduler_pause(?1)",
-                params![name],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT honker_scheduler_pause(?1)", params![name], |r| {
+                r.get::<_, i64>(0)
+            })
         })? > 0)
     }
 
     /// Resume a paused schedule. Returns true if a row was resumed.
     pub fn resume(&self, name: &str) -> Result<bool> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_scheduler_resume(?1)",
-                params![name],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT honker_scheduler_resume(?1)", params![name], |r| {
+                r.get::<_, i64>(0)
+            })
         })? > 0)
     }
 
     /// List every registered schedule with current state.
     pub fn list(&self) -> Result<Vec<ScheduleRow>> {
-        let json: String = self.inner.with_conn(|c| {
-            c.query_row("SELECT honker_scheduler_list()", [], |r| r.get(0))
-        })?;
+        let json: String = self
+            .inner
+            .with_conn(|c| c.query_row("SELECT honker_scheduler_list()", [], |r| r.get(0)))?;
         Ok(serde_json::from_str(&json)?)
     }
 

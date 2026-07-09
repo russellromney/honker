@@ -1329,8 +1329,14 @@ mod tests {
         assert_eq!(dead, 0);
         assert_eq!(stream_rows as usize, total_jobs);
         assert_eq!(notes as usize, total_jobs);
-        assert_eq!(enqueue_wakes, 0, "enqueue must not write wake notifications");
-        assert_eq!(stream_wakes, 0, "stream_publish must not write wake notifications");
+        assert_eq!(
+            enqueue_wakes, 0,
+            "enqueue must not write wake notifications"
+        );
+        assert_eq!(
+            stream_wakes, 0,
+            "stream_publish must not write wake notifications"
+        );
         assert_eq!(integrity, "ok");
 
         drop(conn);
@@ -3243,11 +3249,9 @@ while True:
 
         // Claim 1 → attempts=1. Expire visibility.
         let claimed1: String = conn
-            .query_row(
-                "SELECT honker_claim_batch('q', 'w1', 1, 30)",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT honker_claim_batch('q', 'w1', 1, 30)", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(claimed1.contains(&format!("\"id\":{job_id}")));
         conn.execute(
@@ -3258,11 +3262,9 @@ while True:
 
         // Claim 2 (reclaim) → attempts=2. Expire again.
         let claimed2: String = conn
-            .query_row(
-                "SELECT honker_claim_batch('q', 'w2', 1, 30)",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT honker_claim_batch('q', 'w2', 1, 30)", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(claimed2.contains(&format!("\"id\":{job_id}")));
         conn.execute(
@@ -3273,11 +3275,9 @@ while True:
 
         // Claim 3: exhausted → empty claim, row in dead.
         let claimed3: String = conn
-            .query_row(
-                "SELECT honker_claim_batch('q', 'w3', 1, 30)",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT honker_claim_batch('q', 'w3', 1, 30)", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(claimed3, "[]");
 

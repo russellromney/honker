@@ -39,6 +39,7 @@ defmodule Honker.Scheduler do
     * `:priority`   — integer (default 0)
     * `:expires_s`  — seconds; the fired job expires this many seconds
                       after its scheduled fire time. Default `nil`.
+    * `:max_attempts` — attempt budget for each fired job. Default `3`.
   """
   def add(%Database{conn: conn}, opts) do
     name = Keyword.fetch!(opts, :name)
@@ -48,13 +49,14 @@ defmodule Honker.Scheduler do
     payload = Keyword.fetch!(opts, :payload)
     priority = Keyword.get(opts, :priority, 0)
     expires_s = Keyword.get(opts, :expires_s)
+    max_attempts = Keyword.get(opts, :max_attempts, 3)
 
     payload_json = Jason.encode!(payload)
 
     case Honker.query_first(
            conn,
-           "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6)",
-           [name, queue, schedule, payload_json, priority, expires_s]
+           "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+           [name, queue, schedule, payload_json, priority, expires_s, max_attempts]
          ) do
       {:ok, [_]} ->
         Honker.mark_updated(conn)
