@@ -30,7 +30,9 @@ for artifact in "$@"; do
       ;;
     *.darwin-*.node)
       file "$artifact" | grep -q 'Mach-O 64-bit'
-      otool -hv "$artifact" >/dev/null
+      if command -v otool >/dev/null 2>&1; then
+        otool -hv "$artifact" >/dev/null
+      fi
       ;;
     *)
       file "$artifact" >/dev/null
