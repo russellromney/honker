@@ -1,6 +1,6 @@
 {
   "name": "@russellthehippo/honker-node-darwin-arm64",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "cpu": [
     "arm64"
   ],
