@@ -457,6 +457,60 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 // Claim / ack
 // ---------------------------------------------------------------------
 
+/// Move claimable rows that have already exhausted `max_attempts` into
+/// `_honker_dead`. Without this, a worker that dies after the last
+/// allowed claim leaves the row reclaimable forever — every reclaim
+/// would bump `attempts` past `max_attempts` with no dead-letter path
+/// (dead-letter previously only ran inside `retry()`).
+///
+/// "Claimable" here matches the reclaim predicate: pending+due or
+/// processing with an expired visibility timeout. In-flight claims
+/// that still hold a valid timeout are left alone so the holder can
+/// still ack / retry / fail.
+fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+    let mut select = conn.prepare_cached(
+        "DELETE FROM _honker_live
+         WHERE queue = ?1
+           AND attempts >= max_attempts
+           AND (expires_at IS NULL OR expires_at > unixepoch())
+           AND (
+             (state = 'pending' AND run_at <= unixepoch())
+             OR (state = 'processing' AND claim_expires_at < unixepoch())
+           )
+         RETURNING id, queue, payload, priority, run_at, max_attempts,
+                   attempts, created_at",
+    )?;
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, String, String, i64, i64, i64, i64, i64)> = select
+        .query_map(rusqlite::params![queue], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO _honker_dead
+           (id, queue, payload, priority, run_at, max_attempts,
+            attempts, last_error, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'max attempts exceeded', ?8)",
+    )?;
+    let count = rows.len() as i64;
+    for r in rows {
+        insert.execute(rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7])?;
+    }
+    Ok(count)
+}
+
 /// Returns JSON text: `[{"id":1,"queue":"...","payload":"...","worker_id":"...","attempts":N,"claim_expires_at":T}, ...]`
 pub fn claim_batch(
     conn: &Connection,
@@ -465,6 +519,12 @@ pub fn claim_batch(
     n: i64,
     timeout_s: i64,
 ) -> rusqlite::Result<String> {
+    // Drop reclaimable rows that already used their attempt budget so
+    // they cannot be claimed again (and so they don't clog the claim
+    // index forever). Same outer SQL statement / connection, so this
+    // shares the caller's transaction with the claim UPDATE below.
+    dead_letter_exhausted_claimable(conn, queue)?;
+
     let mut stmt = conn.prepare_cached(
         "UPDATE _honker_live
          SET state = 'processing',
@@ -475,6 +535,7 @@ pub fn claim_batch(
            SELECT id FROM _honker_live
            WHERE queue = ?2
              AND state IN ('pending', 'processing')
+             AND attempts < max_attempts
              AND (expires_at IS NULL OR expires_at > unixepoch())
              AND ((state = 'pending' AND run_at <= unixepoch())
                OR (state = 'processing' AND claim_expires_at < unixepoch()))
@@ -532,6 +593,9 @@ pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite
 ///   * a pending row's `run_at`
 ///   * one second after a processing row's `claim_expires_at`
 ///
+/// Rows that have already exhausted `max_attempts` are ignored — they
+/// are dead-lettered on the next claim path, not reclaimable.
+///
 /// Returns 0 if no such future deadline exists.
 pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
     Ok(conn
@@ -542,6 +606,7 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
                FROM _honker_live
                WHERE queue = ?1
                  AND state = 'pending'
+                 AND attempts < max_attempts
                  AND (expires_at IS NULL OR expires_at > unixepoch())
                  AND run_at > unixepoch()
                UNION ALL
@@ -549,6 +614,7 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
                FROM _honker_live
                WHERE queue = ?1
                  AND state = 'processing'
+                 AND attempts < max_attempts
                  AND (expires_at IS NULL OR expires_at > unixepoch())
                  AND claim_expires_at >= unixepoch()
              )",

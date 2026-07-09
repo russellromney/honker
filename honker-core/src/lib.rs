@@ -3162,4 +3162,83 @@ while True:
             "expected probe to fail for inaccessible dir, got Ok"
         );
     }
+
+    #[test]
+    fn claim_batch_dead_letters_reclaim_past_max_attempts() {
+        // Worker dies without retry/ack after the last allowed claim.
+        // The next claim must dead-letter the row, not reclaim it.
+        let path = temp_db("claim-max-attempts");
+        let conn = open_core_test_conn(&path);
+
+        let job_id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('q', '{\"n\":1}', NULL, NULL, 0, 2, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Claim 1 → attempts=1. Expire visibility.
+        let claimed1: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('q', 'w1', 1, 30)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(claimed1.contains(&format!("\"id\":{job_id}")));
+        conn.execute(
+            "UPDATE _honker_live SET claim_expires_at = unixepoch() - 1 WHERE id=?1",
+            rusqlite::params![job_id],
+        )
+        .unwrap();
+
+        // Claim 2 (reclaim) → attempts=2. Expire again.
+        let claimed2: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('q', 'w2', 1, 30)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(claimed2.contains(&format!("\"id\":{job_id}")));
+        conn.execute(
+            "UPDATE _honker_live SET claim_expires_at = unixepoch() - 1 WHERE id=?1",
+            rusqlite::params![job_id],
+        )
+        .unwrap();
+
+        // Claim 3: exhausted → empty claim, row in dead.
+        let claimed3: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('q', 'w3', 1, 30)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed3, "[]");
+
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_live WHERE id=?1",
+                rusqlite::params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (dead_attempts, last_error): (i64, String) = conn
+            .query_row(
+                "SELECT attempts, last_error FROM _honker_dead WHERE id=?1",
+                rusqlite::params![job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live, 0);
+        assert_eq!(dead_attempts, 2);
+        assert_eq!(last_error, "max attempts exceeded");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
 }
