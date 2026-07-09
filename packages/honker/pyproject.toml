@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "honker"
-version = "0.2.6"
+version = "0.2.7"
 description = "Durable queues, streams, pub/sub, and cron scheduler on SQLite. One file, zero servers."
 readme = "README.md"
 requires-python = ">=3.11"

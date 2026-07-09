@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "honker-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "honker-extension"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "honker-core",
  "rusqlite",
