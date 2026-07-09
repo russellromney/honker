@@ -118,18 +118,17 @@ class Scheduler:
     (`honker_scheduler_register` / `honker_scheduler_tick`); this class is
     ~40 lines of asyncio glue around lock + tick + sleep + heartbeat.
 
-    Leader-lock caveat: the scheduler lock is TTL-based and
-    best-effort, not true mutual exclusion. If a leader process pauses
-    for longer than `LOCK_TTL` (60s, e.g. GC pause, laptop sleep,
-    kernel OOM pressure), another process can acquire the lock while
-    the "dead" leader is still running. Both would fire scheduled
-    tasks until the original wakes and notices its lock is gone.
+    Leader-lock caveat: the scheduler lock is TTL-based, not true
+    mutual exclusion across freezes longer than `LOCK_TTL`. Heartbeats
+    refresh `expires_at` only for *this* leader's owner token. If the
+    TTL elapses and another process acquires the lock, the next
+    heartbeat sees 0 rows updated and sets `stop_event` so this
+    leader exits before another tick — no dual-fire after lock steal.
 
-    For idempotent cron work (health checks, metrics rollups) this is
-    fine. For work that must run exactly once per fire (nightly
-    backup, invoice generation), wrap the task body in a second
-    `db.lock('task-name', ttl=...)` and have it exit early on
-    `LockHeld`.
+    For work that must run exactly once per fire even under a brief
+    dual-leader race (the window between steal and the next heartbeat),
+    wrap the task body in a second `db.lock('task-name', ttl=...)` and
+    exit early on `LockHeld`.
     """
 
     LOCK_NAME = "honker-scheduler"
@@ -139,6 +138,10 @@ class Scheduler:
     def __init__(self, db, lock_name: Optional[str] = None):
         self.db = db
         self.lock_name = lock_name or self.LOCK_NAME
+        # Instance-overridable so tests can use short TTL/heartbeat
+        # without monkeypatching the class constants.
+        self.lock_ttl = self.LOCK_TTL
+        self.heartbeat_interval = self.HEARTBEAT_INTERVAL
         # Names registered via this Scheduler instance. The
         # authoritative registration lives in
         # `_honker_scheduler_tasks` — this set only exists so a
@@ -298,8 +301,15 @@ class Scheduler:
                     "process has populated _honker_scheduler_tasks."
                 )
 
-        with self.db.lock(self.lock_name, ttl=self.LOCK_TTL):
-            hb = asyncio.create_task(self._heartbeat_loop(stop_event))
+        # Hold the lock handle so we know our owner token. Heartbeats
+        # must UPDATE by (name, owner) — name-only refresh would extend
+        # a *successor* leader's row after our TTL elapsed, and we'd
+        # keep ticking as a dual leader.
+        lock = self.db.lock(self.lock_name, ttl=self.lock_ttl)
+        with lock:
+            hb = asyncio.create_task(
+                self._heartbeat_loop(stop_event, lock.owner)
+            )
             try:
                 await self._main_loop(stop_event)
             finally:
@@ -309,26 +319,39 @@ class Scheduler:
                 except asyncio.CancelledError:
                     pass
 
-    async def _heartbeat_loop(self, stop_event: asyncio.Event) -> None:
+    async def _heartbeat_loop(
+        self, stop_event: asyncio.Event, owner: str
+    ) -> None:
         """Refresh the leader lock's `expires_at` every
-        HEARTBEAT_INTERVAL seconds so the TTL doesn't elapse during
+        `heartbeat_interval` seconds so the TTL doesn't elapse during
         long sleeps between cron boundaries.
+
+        Scoped to `(name, owner)`. If the UPDATE touches 0 rows we
+        lost the lock (TTL elapsed, another process acquired it) —
+        set `stop_event` so `_main_loop` exits before the next tick
+        and we cannot double-fire alongside the new leader.
         """
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(
-                    stop_event.wait(), timeout=self.HEARTBEAT_INTERVAL
+                    stop_event.wait(), timeout=self.heartbeat_interval
                 )
                 return  # stop_event set
             except asyncio.TimeoutError:
                 pass
             with self.db.transaction() as tx:
-                tx.execute(
+                rows = tx.query(
                     "UPDATE _honker_locks "
                     "SET expires_at = unixepoch() + ? "
-                    "WHERE name = ?",
-                    [self.LOCK_TTL, self.lock_name],
+                    "WHERE name = ? AND owner = ? "
+                    "RETURNING 1 AS ok",
+                    [self.lock_ttl, self.lock_name, owner],
                 )
+            if not rows:
+                # Lost leadership. Signal the main loop to stop before
+                # the next honker_scheduler_tick.
+                stop_event.set()
+                return
 
     async def _main_loop(self, stop_event: asyncio.Event) -> None:
         # Subscribe to WAL eagerly so a register/unregister landing
