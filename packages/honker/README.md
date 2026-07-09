@@ -65,23 +65,34 @@ import time
 q.enqueue({"to": "later@example.com"}, run_at=int(time.time()) + 10)
 ```
 
-Recurring schedules use `schedule` expressions:
+Recurring schedules are registered on a `Scheduler`. Build the schedule with
+`crontab(expr)` or `every_s(n)`, then run the scheduler loop (it enqueues onto
+the target queue on each boundary; a normal worker claims the jobs):
 
 ```python
-sched = db.scheduler()
-sched.add("fast", queue="emails", schedule="@every 1s", payload={"kind": "tick"})
+from honker import Scheduler, crontab, every_s
+
+sched = Scheduler(db)
+sched.add(name="fast", queue="emails", schedule=every_s(1), payload={"kind": "tick"})
+sched.add(name="nightly", queue="emails", schedule=crontab("0 3 * * *"))
+
+await sched.run()  # acquires the leader lock and fires due tasks
 ```
 
-Supported schedule forms:
+`add()` is keyword-only and `schedule` must be a `CronSchedule` (from `crontab`
+or `every_s`), not a raw string. Supported schedule expressions:
 
-- 5-field cron: `0 3 * * *`
-- 6-field cron: `*/2 * * * * *`
-- interval: `@every 1s`
+- 5-field cron: `crontab("0 3 * * *")`
+- 6-field cron: `crontab("*/2 * * * * *")`
+- interval: `every_s(1)` (equivalently `crontab("@every 1s")`)
 
 ## Notes
 
 - `claim()` wakes on database updates and on due deadlines like `run_at`.
 - `schedule` is the canonical recurring-schedule name.
 - `cron` still works as a compatibility alias in older call sites.
+- Construct `db.queue(name)` handles **outside** an open `db.transaction()` (the
+  first call for a name runs its own schema-init transaction — a nested one
+  deadlocks). Create the handle first, then pass `tx=` to `enqueue`.
 
 For streams, notify/listen, tasks, SQL extension usage, and full scheduler docs, see the main repo and docs site.

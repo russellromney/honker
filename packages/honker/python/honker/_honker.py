@@ -216,6 +216,12 @@ class Queue:
         # so this binding and the SQLite loadable extension can't drift
         # on column counts. View + schema-version cleanup are
         # Python-binding-specific and stay here.
+        #
+        # NOTE: this opens its own transaction, so a Queue must not be
+        # constructed while a caller's `db.transaction()` is already open —
+        # the nested BEGIN deadlocks the single write connection. See the
+        # warning in `Database.queue`. Construct queues outside the
+        # transaction and pass `tx=` to `enqueue`.
         with self.db.transaction() as tx:
             tx.bootstrap_honker_schema()
             # Inspection view: UNION live + dead with a synthetic `state`.
@@ -1131,6 +1137,28 @@ class Database:
         visibility_timeout_s: int = 300,
         max_attempts: int = 3,
     ) -> Queue:
+        """Get (or lazily create) the queue named `name`.
+
+        Handles are cached per name, so repeated calls are cheap and return
+        the same object.
+
+        IMPORTANT — construct outside an open transaction. The *first* call
+        for a given name initializes the queue's schema in its own
+        transaction. Calling it for a brand-new name while a
+        ``with db.transaction()`` block is already open deadlocks: the nested
+        ``BEGIN`` blocks on the single write connection the outer transaction
+        holds, and the wait happens in the native extension (holding the GIL),
+        so it can't be interrupted. Create the handle first, then pass
+        ``tx=`` to :meth:`Queue.enqueue` inside the transaction::
+
+            emails = db.queue("emails")          # construct up front
+            with db.transaction() as tx:
+                tx.execute("INSERT INTO orders ...", [...])
+                emails.enqueue(payload, tx=tx)   # atomic outbox handoff
+
+        (Re-fetching an already-constructed name inside a transaction is fine —
+        only first construction runs the schema init.)
+        """
         existing = self._queues.get(name)
         if existing is not None:
             return existing
@@ -1144,6 +1172,14 @@ class Database:
         return q
 
     def stream(self, name: str) -> Stream:
+        """Get (or lazily create) the durable stream named `name`.
+
+        Handles are cached per name. Unlike :meth:`queue`, stream construction
+        does not run a schema-init transaction, so it is safe to call inside an
+        open ``with db.transaction()`` block. The common pattern is still to
+        construct the handle up front and pass ``tx=`` to
+        :meth:`Stream.publish` so the event commits atomically with the work.
+        """
         existing = self._streams.get(name)
         if existing is not None:
             return existing
