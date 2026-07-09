@@ -23,3 +23,8 @@ rules:
     ignore:
       - ci.yml
       - zizmor.yml
+  cache-poisoning:
+    ignore:
+      # setup-node does not restore package-manager caches here, and this
+      # workflow only builds proof artifacts. Publishing remains local.
+      - release-node.yml

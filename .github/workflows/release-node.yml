@@ -41,7 +41,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
-          package-manager-cache: false
+          cache: ""
 
       - name: Build native package
         working-directory: packages/honker-node
@@ -53,6 +53,17 @@ jobs:
             --target "${{ matrix.rust_target }}" \
             --features kernel-watcher,shm-fast-path
           test -f "honker.${{ matrix.platform }}.node"
+          ../../scripts/proof/check-node-native-artifacts.sh "honker.${{ matrix.platform }}.node"
+          node - <<'JS'
+          const platform = '${{ matrix.platform }}';
+          const expectedArch = platform.includes('x64') ? 'x64' : 'arm64';
+          if (process.arch === expectedArch) {
+            require(`./honker.${platform}.node`);
+            console.log(`native load ok: ${platform}`);
+          } else {
+            console.log(`native load skipped on ${process.arch}: ${platform}`);
+          }
+          JS
 
       - name: Upload native artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -73,7 +84,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "24"
-          package-manager-cache: false
+          cache: ""
 
       - name: Download native artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
@@ -87,18 +98,22 @@ jobs:
         run: |
           npm install
           npm exec -- napi artifacts --output-dir . --npm-dir npm
+          ../../scripts/proof/check-node-native-artifacts.sh honker.*.node npm/*/*.node
+          node -e "require('./npm/linux-x64-gnu/honker.linux-x64-gnu.node'); console.log('linux-x64 native load ok')"
           for dir in npm/*; do
             test -f "$dir"/honker.*.node
           done
+          package_dir="$RUNNER_TEMP/node-packages"
+          mkdir -p "$package_dir"
           mkdir -p "$RUNNER_TEMP/node-consumer"
-          npm pack --pack-destination "$RUNNER_TEMP/node-consumer"
+          npm pack --pack-destination "$package_dir"
           for dir in npm/*; do
-            npm pack "./$dir" --pack-destination "$RUNNER_TEMP/node-consumer"
+            npm pack "./$dir" --pack-destination "$package_dir"
           done
           cd "$RUNNER_TEMP/node-consumer"
           npm init -y >/dev/null
-          root_tgz=$(find . -maxdepth 1 -name 'russellthehippo-honker-node-[0-9]*.tgz' -print -quit)
-          platform_tgz=$(find . -maxdepth 1 -name 'russellthehippo-honker-node-linux-x64-gnu-*.tgz' -print -quit)
+          root_tgz=$(find "$package_dir" -maxdepth 1 -name 'russellthehippo-honker-node-[0-9]*.tgz' -print -quit)
+          platform_tgz=$(find "$package_dir" -maxdepth 1 -name 'russellthehippo-honker-node-linux-x64-gnu-*.tgz' -print -quit)
           test -n "$root_tgz"
           test -n "$platform_tgz"
           npm install "$root_tgz" "$platform_tgz" >/dev/null
@@ -127,7 +142,5 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: honker-node-npm
-          path: |
-            packages/honker-node/*.tgz
-            packages/honker-node/npm/*/*.tgz
+          path: ${{ runner.temp }}/node-packages/*.tgz
           if-no-files-found: warn
