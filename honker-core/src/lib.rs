@@ -1275,9 +1275,17 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        // Enqueue / stream_publish must NOT write synthetic wake rows.
         let enqueue_wakes: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM _honker_notifications WHERE channel='honker:pressure'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stream_wakes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_notifications WHERE channel='honker:stream:pressure-events'",
                 [],
                 |r| r.get(0),
             )
@@ -1289,7 +1297,8 @@ mod tests {
         assert_eq!(dead, 0);
         assert_eq!(stream_rows as usize, total_jobs);
         assert_eq!(notes as usize, total_jobs);
-        assert_eq!(enqueue_wakes as usize, total_jobs);
+        assert_eq!(enqueue_wakes, 0, "enqueue must not write wake notifications");
+        assert_eq!(stream_wakes, 0, "stream_publish must not write wake notifications");
         assert_eq!(integrity, "ok");
 
         drop(conn);

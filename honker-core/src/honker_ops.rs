@@ -653,8 +653,12 @@ pub fn enqueue(
         (None, None) => now,
     };
     let expires_at: Option<i64> = expires.map(|e| now + e);
-    let channel = format!("honker:{}", queue);
 
+    // No synthetic `_honker_notifications` row. The live-table INSERT
+    // already advances PRAGMA data_version on commit, which is what
+    // SharedUpdateWatcher / every binding's update_events path observes.
+    // Writing a wake row per enqueue used to grow the notifications
+    // table without bound on high-throughput queues.
     let id: i64 = conn.query_row(
         "INSERT INTO _honker_live
            (queue, payload, run_at, priority, max_attempts, expires_at)
@@ -669,12 +673,6 @@ pub fn enqueue(
             expires_at
         ],
         |r| r.get(0),
-    )?;
-    // Fire a wake so workers parked on this queue's channel re-poll.
-    conn.execute(
-        "INSERT INTO _honker_notifications (channel, payload)
-         VALUES (?1, 'new')",
-        rusqlite::params![channel],
     )?;
     Ok(id)
 }
@@ -766,14 +764,8 @@ pub fn retry(
              WHERE id = ?1",
             rusqlite::params![id, delay_s],
         )?;
-        // Fire a wake — the row is now claimable again (after the
-        // delay), and waiting workers should re-poll.
-        let channel = format!("honker:{}", queue);
-        conn.execute(
-            "INSERT INTO _honker_notifications (channel, payload)
-         VALUES (?1, 'new')",
-            rusqlite::params![channel],
-        )?;
+        // Wake comes from the live-table UPDATE + commit (data_version).
+        // No synthetic notification row — see enqueue() for rationale.
     }
     Ok(1)
 }
@@ -1139,15 +1131,14 @@ pub fn scheduler_unregister(conn: &Connection, name: &str) -> rusqlite::Result<i
     Ok(n as i64)
 }
 
-/// INSERT a row on channel `honker:scheduler` so a sleeping scheduler
-/// leader sitting on `update_events()` wakes and re-evaluates. Payload
-/// is opaque — the leader doesn't read it, only the update tick matters.
-fn scheduler_wake(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO _honker_notifications (channel, payload)
-         VALUES ('honker:scheduler', 'wake')",
-        [],
-    )?;
+/// Ensure a sleeping scheduler leader sitting on `update_events()`
+/// re-evaluates after a register/unregister/pause/resume/update.
+///
+/// The register/unregister/pause/resume/update statements already
+/// mutate `_honker_scheduler_tasks`, which advances data_version on
+/// commit. A synthetic notification row used to be written here and
+/// grew without bound under frequent schedule edits — no longer needed.
+fn scheduler_wake(_conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
@@ -1447,18 +1438,14 @@ pub fn stream_publish(
     key: Option<&str>,
     payload: &str,
 ) -> rusqlite::Result<i64> {
+    // Stream row INSERT advances data_version on commit — same wake
+    // path as enqueue. No synthetic notification row (see enqueue).
     let offset: i64 = conn.query_row(
         "INSERT INTO _honker_stream (topic, key, payload)
          VALUES (?1, ?2, ?3)
          RETURNING offset",
         rusqlite::params![topic, key, payload],
         |r| r.get(0),
-    )?;
-    let channel = format!("honker:stream:{}", topic);
-    conn.execute(
-        "INSERT INTO _honker_notifications (channel, payload)
-         VALUES (?1, 'new')",
-        rusqlite::params![channel],
     )?;
     Ok(offset)
 }

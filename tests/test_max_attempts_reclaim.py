@@ -111,6 +111,28 @@ def test_in_flight_claim_still_valid_is_not_dead_lettered(db_path):
     assert job.ack() is True
 
 
+def test_enqueue_does_not_grow_notifications_table(db_path):
+    """High-throughput enqueue must not write synthetic wake rows
+    into `_honker_notifications`. Workers wake on data_version from
+    the live-table commit instead.
+    """
+    db = honker.open(db_path)
+    q = db.queue("bulk")
+    before = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_notifications"
+    )[0]["c"]
+    for i in range(50):
+        q.enqueue({"i": i})
+    after = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_notifications"
+    )[0]["c"]
+    assert after == before
+    # Jobs still claimable — wake path is independent of notifications.
+    job = q.claim_one("w")
+    assert job is not None
+    job.ack()
+
+
 def test_queue_next_claim_at_ignores_exhausted_rows(db_path):
     """Deadlines for exhausted processing rows must not wake workers
     forever after the attempt budget is spent.
