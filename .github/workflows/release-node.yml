@@ -1,0 +1,145 @@
+name: Release · npm Node
+
+on:
+  push:
+    tags:
+      - "node-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload built packages to npm"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: node native · ${{ matrix.platform }}
+    timeout-minutes: 25
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64-gnu
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64-gnu
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+          - platform: darwin-x64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+          - platform: darwin-arm64
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+
+      - name: Build native package
+        working-directory: packages/honker-node
+        run: |
+          npm install
+          npm exec -- napi build \
+            --platform \
+            --release \
+            --target "${{ matrix.rust_target }}" \
+            --features kernel-watcher,shm-fast-path
+          test -f "honker.${{ matrix.platform }}.node"
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: node-native-${{ matrix.platform }}
+          path: packages/honker-node/honker.${{ matrix.platform }}.node
+          if-no-files-found: error
+
+  package:
+    name: npm package
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    needs: native
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download native artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          pattern: node-native-*
+          path: packages/honker-node
+          merge-multiple: true
+
+      - name: Pack and smoke test
+        working-directory: packages/honker-node
+        run: |
+          npm install
+          npm exec -- napi artifacts --output-dir . --npm-dir npm
+          npm exec -- napi pre-publish --npm-dir npm
+          for dir in npm/*; do
+            test -f "$dir"/honker.*.node
+          done
+          mkdir -p "$RUNNER_TEMP/node-consumer"
+          npm pack --pack-destination "$RUNNER_TEMP/node-consumer"
+          for dir in npm/*; do
+            npm pack "$dir" --pack-destination "$RUNNER_TEMP/node-consumer"
+          done
+          cd "$RUNNER_TEMP/node-consumer"
+          npm init -y >/dev/null
+          npm install ./*.tgz >/dev/null
+          node - <<'JS'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const { open } = require('@russellthehippo/honker-node');
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'honker-node-release-'));
+          try {
+            const db = open(path.join(dir, 'app.db'));
+            const q = db.queue('emails');
+            const id = q.enqueue({ to: 'alice@example.com' });
+            const job = q.claimOne('worker-1');
+            assert.equal(job.id, id);
+            assert.equal(job.payload.to, 'alice@example.com');
+            assert.equal(job.ack(), true);
+            db.close();
+          } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+          JS
+
+      - name: Upload npm package artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: honker-node-npm
+          path: |
+            packages/honker-node/*.tgz
+            packages/honker-node/npm/*/*.tgz
+          if-no-files-found: warn
+
+      - name: Publish packages to npm
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'node-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+        working-directory: packages/honker-node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in npm/*; do
+            npm publish "$dir" --access public --ignore-scripts
+          done
+          npm publish --access public --ignore-scripts

@@ -1,0 +1,71 @@
+name: Release · Hex
+
+on:
+  push:
+    tags:
+      - "ex-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload package to Hex"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: elixir package
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.19"
+
+      - name: Build extension and Python interop package
+        run: |
+          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+          uv venv --python "3.14" .venv
+          . .venv/bin/activate
+          uv pip install pytest pytest-xdist maturin
+          cd packages/honker
+          maturin develop --release --features kernel-watcher,shm-fast-path
+
+      - name: Test and build Hex package
+        working-directory: packages/honker-ex
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
+        run: |
+          mix local.hex --force
+          mix deps.get
+          mix test
+          mix hex.build
+
+      - name: Upload Hex package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: honker-hex
+          path: packages/honker-ex/honker-*.tar
+          if-no-files-found: error
+
+      - name: Publish package to Hex
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'ex-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+        working-directory: packages/honker-ex
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish --yes
