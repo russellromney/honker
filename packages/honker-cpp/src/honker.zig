@@ -533,9 +533,11 @@ export fn honker_cpp_scheduler_update(
     touch_priority: i64,
     expires_sec: i64,
     touch_expires: i64,
+    max_attempts: i64,
+    touch_max_attempts: i64,
 ) callconv(.c) i64 {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6)";
+    const sql = "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
     defer _ = c.sqlite3_finalize(stmt);
     bind_text(stmt, 1, name_z);
@@ -560,6 +562,12 @@ export fn honker_cpp_scheduler_update(
         _ = c.sqlite3_bind_null(stmt, 5);
     }
     _ = c.sqlite3_bind_int64(stmt, 6, touch_expires);
+    if (touch_max_attempts != 0) {
+        _ = c.sqlite3_bind_int64(stmt, 7, max_attempts);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 7);
+    }
+    _ = c.sqlite3_bind_int64(stmt, 8, touch_max_attempts);
     return step_scalar_int64(stmt);
 }
 

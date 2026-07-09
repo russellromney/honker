@@ -1195,14 +1195,15 @@ func (s *Scheduler) Resume(name string) (bool, error) {
 
 // ScheduleRow is one entry returned by Scheduler.List().
 type ScheduleRow struct {
-	Name       string `json:"name"`
-	Queue      string `json:"queue"`
-	CronExpr   string `json:"cron_expr"`
-	Payload    string `json:"payload"`
-	Priority   int64  `json:"priority"`
-	ExpiresS   *int64 `json:"expires_s"`
-	NextFireAt int64  `json:"next_fire_at"`
-	Enabled    bool   `json:"enabled"`
+	Name        string `json:"name"`
+	Queue       string `json:"queue"`
+	CronExpr    string `json:"cron_expr"`
+	Payload     string `json:"payload"`
+	Priority    int64  `json:"priority"`
+	ExpiresS    *int64 `json:"expires_s"`
+	NextFireAt  int64  `json:"next_fire_at"`
+	Enabled     bool   `json:"enabled"`
+	MaxAttempts int64  `json:"max_attempts"`
 }
 
 // List returns every registered schedule with current state.
@@ -1234,14 +1235,15 @@ type ScheduleUpdate struct {
 	//   &(*int64)(nil) -> clear (set to NULL)
 	//   &(&v)         -> set to v
 	// In practice most callers use the helpers below.
-	ExpiresS *(*int64)
+	ExpiresS    *(*int64)
+	MaxAttempts *int64
 }
 
 // Update mutates the named schedule's fields in place. Pass only the
 // fields you want to change. Cron change recomputes next_fire_at from
 // now. Returns true iff a row was updated.
 func (s *Scheduler) Update(name string, opts ScheduleUpdate) (bool, error) {
-	if opts.CronExpr == nil && opts.Payload == nil && opts.Priority == nil && opts.ExpiresS == nil {
+	if opts.CronExpr == nil && opts.Payload == nil && opts.Priority == nil && opts.ExpiresS == nil && opts.MaxAttempts == nil {
 		// Empty update is a no-op (matches Python/Node binding).
 		return false, nil
 	}
@@ -1269,10 +1271,16 @@ func (s *Scheduler) Update(name string, opts ScheduleUpdate) (bool, error) {
 			expiresArg = **opts.ExpiresS
 		}
 	}
+	touchMaxAttempts := int64(0)
+	var maxAttemptsArg interface{}
+	if opts.MaxAttempts != nil {
+		touchMaxAttempts = 1
+		maxAttemptsArg = *opts.MaxAttempts
+	}
 	var n int64
 	err := s.db.db.QueryRow(
-		"SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)",
-		name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires,
+		"SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?)",
+		name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires, maxAttemptsArg, touchMaxAttempts,
 	).Scan(&n)
 	return n > 0, err
 }
@@ -1312,8 +1320,6 @@ func (s *Scheduler) Run(ctx context.Context, owner string) error {
 }
 
 func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lockTTL int64, heartbeatInterval time.Duration, updateCh <-chan struct{}) error {
-	lastHeartbeat := time.Now()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -1321,21 +1327,17 @@ func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lo
 		default:
 		}
 
-		_, err := s.Tick()
+		ok, err := lock.Heartbeat(lockTTL)
 		if err != nil {
 			return err
 		}
-
-		if time.Since(lastHeartbeat) >= heartbeatInterval {
-			ok, err := lock.Heartbeat(lockTTL)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				// Lost the lock — exit leader loop and re-contest.
-				return nil
-			}
-			lastHeartbeat = time.Now()
+		if !ok {
+			// Lost the lock — exit leader loop and re-contest.
+			return nil
+		}
+		_, err = s.Tick()
+		if err != nil {
+			return err
 		}
 
 		waitFor := heartbeatInterval

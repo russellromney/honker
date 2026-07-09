@@ -23,19 +23,20 @@ fn schedule_list_round_trips_all_fields() {
             payload: json!({"team": "premier-league"}),
             priority: 3,
             expires_s: None,
-            max_attempts: None,
         })
         .unwrap();
     sched
-        .add(ScheduledTask {
-            name: "hourly-sync".into(),
-            queue: "syncs".into(),
-            schedule: "@every 1h".into(),
-            payload: json!(null),
-            priority: 0,
-            expires_s: None,
-            max_attempts: None,
-        })
+        .add_with_max_attempts(
+            ScheduledTask {
+                name: "hourly-sync".into(),
+                queue: "syncs".into(),
+                schedule: "@every 1h".into(),
+                payload: json!(null),
+                priority: 0,
+                expires_s: None,
+            },
+            9,
+        )
         .unwrap();
 
     let rows = sched.list().unwrap();
@@ -43,10 +44,40 @@ fn schedule_list_round_trips_all_fields() {
     let recap = rows.iter().find(|r| r.name == "daily-recap").unwrap();
     assert_eq!(recap.queue, "emails");
     assert_eq!(recap.priority, 3);
+    assert_eq!(recap.max_attempts, 3);
     assert!(recap.enabled);
     assert!(recap.next_fire_at > 0);
     let payload: serde_json::Value = serde_json::from_str(&recap.payload).unwrap();
     assert_eq!(payload["team"], "premier-league");
+
+    let sync = rows.iter().find(|r| r.name == "hourly-sync").unwrap();
+    assert_eq!(sync.max_attempts, 9);
+}
+
+#[test]
+fn schedule_update_max_attempts_round_trips() {
+    let (_tmp, db) = open_db();
+    let sched = db.scheduler();
+
+    sched
+        .add(ScheduledTask {
+            name: "hourly-sync".into(),
+            queue: "q".into(),
+            schedule: "@every 1s".into(),
+            payload: json!({"x": 1}),
+            priority: 0,
+            expires_s: None,
+        })
+        .unwrap();
+
+    assert!(sched.update_max_attempts("hourly-sync", 2).unwrap());
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "hourly-sync")
+        .unwrap();
+    assert_eq!(row.max_attempts, 2);
 }
 
 #[test]
@@ -61,7 +92,6 @@ fn pause_resume_idempotent() {
             payload: json!(null),
             priority: 0,
             expires_s: None,
-            max_attempts: None,
         })
         .unwrap();
 
@@ -101,7 +131,6 @@ fn update_mutates_fields_and_recomputes_next_fire_at() {
             payload: json!({"v": 1}),
             priority: 0,
             expires_s: None,
-            max_attempts: None,
         })
         .unwrap();
 
@@ -173,7 +202,6 @@ fn update_no_fields_is_noop() {
             payload: json!({"v": 1}),
             priority: 0,
             expires_s: None,
-            max_attempts: None,
         })
         .unwrap();
 
@@ -240,7 +268,6 @@ fn paused_schedule_does_not_emit_on_tick() {
             payload: json!({"x": 1}),
             priority: 0,
             expires_s: None,
-            max_attempts: None,
         })
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -289,7 +316,6 @@ fn update_payload_null_vs_omitted() {
             payload: json!({"v": 1}),
             priority: 0,
             expires_s: None,
-            max_attempts: None,
         })
         .unwrap();
 

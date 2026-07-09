@@ -270,10 +270,12 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // honker_scheduler_update(name, cron_expr_or_null, payload_or_null,
     //                          priority_or_null, expires_s_or_null,
     //                          touch_expires) -> 1 if updated, 0 if missing.
+    // Optional 8-arg form adds max_attempts_or_null, touch_max_attempts.
     // `touch_expires` is a 0/1 flag: when 1 we treat the expires_s arg
     // as the desired value (which may be NULL = "clear"); when 0 we
     // leave expires_s untouched. SQL has no good way to distinguish
-    // "user passed NULL" from "user did not specify" otherwise.
+    // "user passed NULL" from "user did not specify" otherwise. Same
+    // pattern for max_attempts so old 6-arg raw callers stay compatible.
     conn.create_scalar_function(
         "honker_scheduler_update",
         6,
@@ -298,6 +300,43 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
                 payload.as_deref(),
                 priority,
                 expires_s,
+                None,
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_scheduler_update",
+        8,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let cron_expr: Option<String> = ctx.get(1)?;
+            let payload: Option<String> = ctx.get(2)?;
+            let priority: Option<i64> = ctx.get(3)?;
+            let expires_s_arg: Option<i64> = ctx.get(4)?;
+            let touch_expires: i64 = ctx.get(5)?;
+            let max_attempts_arg: Option<i64> = ctx.get(6)?;
+            let touch_max_attempts: i64 = ctx.get(7)?;
+            let db = unsafe { ctx.get_connection() }?;
+            let expires_s = if touch_expires != 0 {
+                Some(expires_s_arg)
+            } else {
+                None
+            };
+            let max_attempts = if touch_max_attempts != 0 {
+                max_attempts_arg
+            } else {
+                None
+            };
+            scheduler_update(
+                &db,
+                &name,
+                cron_expr.as_deref(),
+                payload.as_deref(),
+                priority,
+                expires_s,
+                max_attempts,
             )
             .map_err(to_sql_err)
         },
@@ -1404,6 +1443,7 @@ pub fn scheduler_update(
     payload: Option<&str>,
     priority: Option<i64>,
     expires_s: Option<Option<i64>>,
+    max_attempts: Option<i64>,
 ) -> rusqlite::Result<i64> {
     // Verify exists first so we can return 0 cleanly without dynamic SQL gymnastics.
     let exists: bool = conn
@@ -1416,8 +1456,11 @@ pub fn scheduler_update(
     if !exists {
         return Ok(0);
     }
-    let any_field =
-        cron_expr.is_some() || payload.is_some() || priority.is_some() || expires_s.is_some();
+    let any_field = cron_expr.is_some()
+        || payload.is_some()
+        || priority.is_some()
+        || expires_s.is_some()
+        || max_attempts.is_some();
     if !any_field {
         // No fields to change. Don't wake the leader for a no-op.
         return Ok(0);
@@ -1449,6 +1492,13 @@ pub fn scheduler_update(
             conn.execute(
                 "UPDATE _honker_scheduler_tasks SET expires_s = ?2 WHERE name = ?1",
                 rusqlite::params![name, e],
+            )?;
+        }
+        if let Some(m) = max_attempts {
+            let m = if m < 1 { 1 } else { m };
+            conn.execute(
+                "UPDATE _honker_scheduler_tasks SET max_attempts = ?2 WHERE name = ?1",
+                rusqlite::params![name, m],
             )?;
         }
         if let Some(expr) = cron_expr {

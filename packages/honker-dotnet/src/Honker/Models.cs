@@ -80,11 +80,14 @@ public sealed class ScheduleUpdate
     public bool HasPriority { get; private set; }
     public long? ExpiresSeconds { get; private set; }
     public bool HasExpires { get; private set; }
+    public int? MaxAttempts { get; private set; }
+    public bool HasMaxAttempts { get; private set; }
 
     public ScheduleUpdate WithCron(string? cron) { Cron = cron; HasCron = true; return this; }
     public ScheduleUpdate WithPayload(object? payload) { Payload = payload; HasPayload = true; return this; }
     public ScheduleUpdate WithPriority(long? priority) { Priority = priority; HasPriority = true; return this; }
     public ScheduleUpdate WithExpiresSeconds(long? value) { ExpiresSeconds = value; HasExpires = true; return this; }
+    public ScheduleUpdate WithMaxAttempts(int? value) { MaxAttempts = value; HasMaxAttempts = true; return this; }
 }
 
 public sealed record JobRow

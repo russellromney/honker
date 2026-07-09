@@ -95,7 +95,7 @@ public sealed class Scheduler
     public bool Update(string name, ScheduleUpdate opts)
     {
         var anyField =
-            opts.HasCron || opts.HasPayload || opts.HasPriority || opts.HasExpires;
+            opts.HasCron || opts.HasPayload || opts.HasPriority || opts.HasExpires || opts.HasMaxAttempts;
         if (!anyField) return false;
 
         object? cronArg = opts.HasCron ? opts.Cron : null;
@@ -105,16 +105,22 @@ public sealed class Scheduler
             ? opts.ExpiresSeconds.Value
             : null;
         long touchExpires = opts.HasExpires ? 1L : 0L;
+        object? maxAttemptsArg = opts.HasMaxAttempts && opts.MaxAttempts.HasValue
+            ? opts.MaxAttempts.Value
+            : null;
+        long touchMaxAttempts = opts.HasMaxAttempts ? 1L : 0L;
 
         var n = Convert.ToInt64(_database.ExecuteScalar(
-            "SELECT honker_scheduler_update(@p0, @p1, @p2, @p3, @p4, @p5)",
+            "SELECT honker_scheduler_update(@p0, @p1, @p2, @p3, @p4, @p5, @p6, @p7)",
             null,
             name,
             cronArg ?? (object)DBNull.Value,
             payloadArg ?? (object)DBNull.Value,
             priorityArg ?? (object)DBNull.Value,
             expiresArg ?? (object)DBNull.Value,
-            touchExpires
+            touchExpires,
+            maxAttemptsArg ?? (object)DBNull.Value,
+            touchMaxAttempts
         ) ?? 0L);
         return n > 0;
     }
@@ -169,6 +175,12 @@ public sealed class Scheduler
         var lastHeartbeat = DateTime.UtcNow;
         while (!cancellationToken.IsCancellationRequested)
         {
+            if (!lockHandle.Heartbeat(60))
+            {
+                return;
+            }
+            lastHeartbeat = DateTime.UtcNow;
+
             long soonest;
             using (var tx = _database.BeginTransaction())
             {
@@ -176,16 +188,6 @@ public sealed class Scheduler
                 var rows = tx.Query("SELECT honker_scheduler_soonest() AS t");
                 soonest = Convert.ToInt64(rows[0]["t"] ?? 0L);
                 tx.Commit();
-            }
-
-            if (DateTime.UtcNow - lastHeartbeat >= heartbeatInterval)
-            {
-                if (!lockHandle.Heartbeat(60))
-                {
-                    return;
-                }
-
-                lastHeartbeat = DateTime.UtcNow;
             }
 
             if (soonest == 0)

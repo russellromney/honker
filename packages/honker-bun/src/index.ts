@@ -137,6 +137,7 @@ export interface ScheduleRow {
   expires_s: number | null;
   next_fire_at: number;
   enabled: boolean;
+  max_attempts: number;
 }
 
 export interface ScheduleUpdate {
@@ -145,6 +146,7 @@ export interface ScheduleUpdate {
   payload?: unknown;
   priority?: number | null;
   expiresS?: number | null;
+  maxAttempts?: number | null;
 }
 
 export interface JobRow {
@@ -1196,11 +1198,13 @@ export class Scheduler {
     const priorityArg = has("priority") ? (opts.priority as number) : null;
     const touchExpires = has("expiresS") ? 1 : 0;
     const expiresArg = has("expiresS") ? (opts.expiresS as number | null) : null;
+    const touchMaxAttempts = has("maxAttempts") ? 1 : 0;
+    const maxAttemptsArg = has("maxAttempts") ? (opts.maxAttempts as number | null) : null;
     const row = this.db.raw
-      .query<{ v: number }, [string, string | null, string | null, number | null, number | null, number]>(
-        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?) AS v",
+      .query<{ v: number }, [string, string | null, string | null, number | null, number | null, number, number | null, number]>(
+        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?) AS v",
       )
-      .get(name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires)!;
+      .get(name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires, maxAttemptsArg, touchMaxAttempts)!;
     if (row.v > 0) this.db._markUpdated();
     return row.v > 0;
   }
@@ -1247,13 +1251,10 @@ export class Scheduler {
   ): Promise<void> {
     let lastHeartbeat = Date.now();
     while (!signal.aborted) {
+      const stillOurs = lock.heartbeat(SCHEDULER_LOCK_TTL_S);
+      if (!stillOurs) return; // lost — exit leader loop, re-contest
+      lastHeartbeat = Date.now();
       this.tick();
-      const now = Date.now();
-      if (now - lastHeartbeat >= SCHEDULER_HEARTBEAT_MS) {
-        const stillOurs = lock.heartbeat(SCHEDULER_LOCK_TTL_S);
-        if (!stillOurs) return; // lost — exit leader loop, re-contest
-        lastHeartbeat = now;
-      }
       let waitMs = Math.max(0, SCHEDULER_HEARTBEAT_MS - (Date.now() - lastHeartbeat));
       const nextFire = this.soonest();
       if (nextFire && nextFire > 0) {

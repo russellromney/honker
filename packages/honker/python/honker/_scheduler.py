@@ -159,6 +159,7 @@ class Scheduler:
         payload: Any = None,
         priority: int = 0,
         expires: Optional[float] = None,
+        max_attempts: int = 3,
     ) -> None:
         """Register a periodic task in `_honker_scheduler_tasks`.
 
@@ -173,11 +174,8 @@ class Scheduler:
         - `expires`: how many seconds a fired job stays claimable.
           `queue.sweep_expired()` moves expired rows into
           `_honker_dead`.
+        - `max_attempts`: attempt budget for each fired job. Default 3.
         """
-        # max_attempts defaults to the target queue's max_attempts so
-        # scheduler-enqueued jobs share the same attempt budget as
-        # normal work on that queue.
-        q = self.db.queue(queue)
         with self.db.transaction() as tx:
             tx.query(
                 "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
@@ -188,7 +186,7 @@ class Scheduler:
                     json.dumps(payload),
                     int(priority),
                     int(expires) if expires is not None else None,
-                    int(q.max_attempts),
+                    int(max_attempts),
                 ],
             )
         self._registered.add(name)
@@ -230,8 +228,8 @@ class Scheduler:
     def list(self) -> list[dict]:
         """Return every registered schedule with its current state
         (cron_expr, payload, priority, expires_s, next_fire_at,
-        enabled). Useful for admin UIs and 'what's scheduled?' MCP
-        tools."""
+        enabled, max_attempts). Useful for admin UIs and
+        'what's scheduled?' MCP tools."""
         with self.db.transaction() as tx:
             rows = tx.query("SELECT honker_scheduler_list() AS j")
         raw = rows[0]["j"] if rows else "[]"
@@ -245,6 +243,7 @@ class Scheduler:
         payload: Any = _UNSET,
         priority: Optional[int] = None,
         expires: Any = _UNSET,
+        max_attempts: Any = _UNSET,
     ) -> bool:
         """Mutate fields of an existing schedule in place. Pass only
         the fields you want changed; others stay as-is. If `schedule`
@@ -252,7 +251,8 @@ class Scheduler:
         True iff a row was updated (False if name doesn't exist).
 
         `payload=None` means "set to JSON null". To leave payload
-        unchanged, omit the kwarg. Same for `expires`."""
+        unchanged, omit the kwarg. Same for `expires` and
+        `max_attempts`."""
         cron_expr = schedule.expr if schedule is not None else None
         payload_arg = json.dumps(payload) if payload is not _UNSET else None
         expires_arg = (
@@ -260,9 +260,15 @@ class Scheduler:
         )
         touch_expires = 1 if expires is not _UNSET else 0
         priority_arg = int(priority) if priority is not None else None
+        max_attempts_arg = (
+            int(max_attempts)
+            if max_attempts is not _UNSET and max_attempts is not None
+            else None
+        )
+        touch_max_attempts = 1 if max_attempts is not _UNSET else 0
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?) AS n",
+                "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?) AS n",
                 [
                     name,
                     cron_expr,
@@ -270,6 +276,8 @@ class Scheduler:
                     priority_arg,
                     expires_arg,
                     touch_expires,
+                    max_attempts_arg,
+                    touch_max_attempts,
                 ],
             )
         return rows[0]["n"] > 0

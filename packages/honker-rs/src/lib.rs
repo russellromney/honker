@@ -1323,7 +1323,6 @@ pub struct ScheduledTask {
     pub payload: serde_json::Value,
     pub priority: i64,
     pub expires_s: Option<i64>,
-    pub max_attempts: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1369,6 +1368,12 @@ pub struct Scheduler {
 impl Scheduler {
     /// Register a recurring task. Idempotent by `name`.
     pub fn add(&self, task: ScheduledTask) -> Result<()> {
+        self.add_with_max_attempts(task, 3)
+    }
+
+    /// Register a recurring task with an explicit per-fire attempt
+    /// budget. Idempotent by `name`.
+    pub fn add_with_max_attempts(&self, task: ScheduledTask, max_attempts: i64) -> Result<()> {
         let payload_json = serde_json::to_string(&task.payload)?;
         self.inner.with_conn(|c| {
             c.query_row(
@@ -1380,7 +1385,7 @@ impl Scheduler {
                     payload_json,
                     task.priority,
                     task.expires_s,
-                    task.max_attempts.unwrap_or(3),
+                    max_attempts,
                 ],
                 |_| Ok(()),
             )
@@ -1481,6 +1486,18 @@ impl Scheduler {
         })? > 0)
     }
 
+    /// Update only the attempt budget for future fired jobs. Existing
+    /// jobs already enqueued by this schedule keep their row-level budget.
+    pub fn update_max_attempts(&self, name: &str, max_attempts: i64) -> Result<bool> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_update(?1, NULL, NULL, NULL, NULL, 0, ?2, 1)",
+                params![name, max_attempts],
+                |r| r.get::<_, i64>(0),
+            )
+        })? > 0)
+    }
+
     /// Run the scheduler loop with leader election. Blocks until
     /// `stop` is set. Only the process holding the `honker-scheduler`
     /// lock fires; standbys wait for the lock to expire.
@@ -1526,25 +1543,23 @@ impl Scheduler {
         heartbeat: Duration,
         rx: &Receiver<()>,
     ) -> Result<()> {
-        let mut last_heartbeat = std::time::Instant::now();
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            self.tick()?;
-            if last_heartbeat.elapsed() >= heartbeat {
-                let still_ours: i64 = self.inner.with_conn(|c| {
-                    c.query_row(
-                        "SELECT honker_lock_renew(?1, ?2, ?3)",
-                        params!["honker-scheduler", owner, lock_ttl],
-                        |r| r.get(0),
-                    )
-                })?;
-                if still_ours == 0 {
-                    // Lost the lock (TTL expired, new leader). Drop
-                    // out of the leader loop so we don't double-fire
-                    // alongside whoever has it now.
-                    return Ok(());
-                }
-                last_heartbeat = std::time::Instant::now();
+            let still_ours: i64 = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_lock_renew(?1, ?2, ?3)",
+                    params!["honker-scheduler", owner, lock_ttl],
+                    |r| r.get(0),
+                )
+            })?;
+            if still_ours == 0 {
+                // Lost the lock (TTL expired, new leader). Drop out
+                // before ticking so we don't double-fire alongside
+                // whoever has it now.
+                return Ok(());
             }
+            let last_heartbeat = std::time::Instant::now();
+
+            self.tick()?;
             let mut wait_for = heartbeat.saturating_sub(last_heartbeat.elapsed());
             let soonest = self.soonest()?;
             if soonest > 0 {

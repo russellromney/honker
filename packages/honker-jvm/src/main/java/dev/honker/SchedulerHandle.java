@@ -45,14 +45,14 @@ public final class SchedulerHandle implements AutoCloseable {
     }
 
     private void runLoop() {
-        long lastHeartbeat = System.nanoTime();
         try {
             while (!closed.get()) {
-                scheduler.tick(Instant.now());
-                if (Duration.ofNanos(System.nanoTime() - lastHeartbeat).compareTo(options.heartbeatEvery()) >= 0) {
-                    heartbeat();
-                    lastHeartbeat = System.nanoTime();
+                heartbeat();
+                if (closed.get()) {
+                    return;
                 }
+
+                scheduler.tick(Instant.now());
                 Duration wait = scheduler.soonest()
                     .map(t -> Duration.between(Instant.now(), t))
                     .filter(d -> !d.isNegative() && !d.isZero())

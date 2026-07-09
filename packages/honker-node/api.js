@@ -650,9 +650,11 @@ class Scheduler {
     const priorityArg = has('priority') ? opts.priority : null;
     const touchExpires = has('expiresS') ? 1 : 0;
     const expiresArg = has('expiresS') ? opts.expiresS : null;
+    const touchMaxAttempts = has('maxAttempts') ? 1 : 0;
+    const maxAttemptsArg = has('maxAttempts') ? opts.maxAttempts : null;
     const n = this._db._callScalar(
-      'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)',
-      [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires],
+      'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires, maxAttemptsArg, touchMaxAttempts],
     );
     return n > 0;
   }
@@ -692,11 +694,9 @@ class Scheduler {
     const heartbeatMs = 20_000;
     let lastHeartbeat = monotonicMs();
     while (!aborted(signal)) {
+      if (!lock.heartbeat(60)) return;
+      lastHeartbeat = monotonicMs();
       this.tick();
-      if (monotonicMs() - lastHeartbeat >= heartbeatMs) {
-        if (!lock.heartbeat(60)) return;
-        lastHeartbeat = monotonicMs();
-      }
 
       let waitMs = Math.max(0, heartbeatMs - (monotonicMs() - lastHeartbeat));
       const nextFire = this.soonest();

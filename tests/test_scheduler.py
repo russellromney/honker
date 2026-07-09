@@ -261,9 +261,11 @@ def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
     assert int(row["next_fire_at"]) == orig_next + 3600
 
 
-def test_scheduler_register_uses_queue_max_attempts(db_path):
-    """Jobs fired by the scheduler inherit the target queue's
-    max_attempts instead of a hardcoded 3.
+def test_scheduler_register_defaults_to_three_max_attempts(db_path):
+    """Scheduler jobs default to a schedule-level attempt budget of 3.
+
+    Queue handles can have their own enqueue default; scheduled work is
+    cross-binding and uses Scheduler.add(max_attempts=...) for overrides.
     """
     db = honker.open(db_path)
     db.queue("custom", max_attempts=7)
@@ -277,7 +279,7 @@ def test_scheduler_register_uses_queue_max_attempts(db_path):
     row = db.query(
         "SELECT max_attempts FROM _honker_scheduler_tasks WHERE name='t'"
     )[0]
-    assert int(row["max_attempts"]) == 7
+    assert int(row["max_attempts"]) == 3
     # Force due and tick.
     with db.transaction() as tx:
         tx.execute(
@@ -288,7 +290,46 @@ def test_scheduler_register_uses_queue_max_attempts(db_path):
     job = db.query(
         "SELECT max_attempts FROM _honker_live WHERE queue='custom'"
     )[0]
-    assert int(job["max_attempts"]) == 7
+    assert int(job["max_attempts"]) == 3
+
+
+def test_scheduler_register_accepts_explicit_max_attempts(db_path):
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(
+        name="t",
+        queue="custom",
+        schedule=every_s(1),
+        payload={"x": 1},
+        max_attempts=4,
+    )
+    row = db.query(
+        "SELECT max_attempts FROM _honker_scheduler_tasks WHERE name='t'"
+    )[0]
+    assert int(row["max_attempts"]) == 4
+
+
+def test_scheduler_update_max_attempts_applies_to_future_fires(db_path):
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(name="t", queue="custom", schedule=every_s(1), payload={"x": 1})
+
+    assert sched.update("t", max_attempts=2) is True
+    row = sched.list()[0]
+    assert int(row["max_attempts"]) == 2
+
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at = unixepoch() - 1 "
+            "WHERE name='t'"
+        )
+        tx.query("SELECT honker_scheduler_tick(unixepoch())")
+    job = db.query(
+        "SELECT max_attempts FROM _honker_live WHERE queue='custom'"
+    )[0]
+    assert int(job["max_attempts"]) == 2
 
 
 def test_scheduler_tick_caps_catchup_storm(db_path):
