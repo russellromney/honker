@@ -1167,8 +1167,24 @@ class Database:
         (Re-fetching an already-constructed name inside a transaction is fine —
         only first construction runs the schema init.)
         """
+        visibility_timeout_s = int(visibility_timeout_s)
+        max_attempts = int(max_attempts)
         existing = self._queues.get(name)
         if existing is not None:
+            # Same options → memoized instance. Conflicting options used
+            # to be silently ignored (first caller won), which hid
+            # misconfigured multi-module setups.
+            if (
+                existing.visibility_timeout_s != visibility_timeout_s
+                or existing.max_attempts != max_attempts
+            ):
+                raise ValueError(
+                    f"queue {name!r} already opened with "
+                    f"visibility_timeout_s={existing.visibility_timeout_s}, "
+                    f"max_attempts={existing.max_attempts}; "
+                    f"got visibility_timeout_s={visibility_timeout_s}, "
+                    f"max_attempts={max_attempts}"
+                )
             return existing
         q = Queue(
             self,
@@ -1203,8 +1219,21 @@ class Database:
         base_backoff_s: int = 5,
         visibility_timeout_s: int = 60,
     ) -> Outbox:
+        max_attempts = int(max_attempts)
+        base_backoff_s = int(base_backoff_s)
+        visibility_timeout_s = int(visibility_timeout_s)
         existing = self._outboxes.get(name)
         if existing is not None:
+            if (
+                existing.max_attempts != max_attempts
+                or existing.base_backoff_s != base_backoff_s
+                or existing._queue.visibility_timeout_s != visibility_timeout_s
+            ):
+                raise ValueError(
+                    f"outbox {name!r} already opened with different options"
+                )
+            # delivery callable is not compared — rebinding the handler
+            # on a live outbox is not supported; use a new name.
             return existing
         o = Outbox(
             self,

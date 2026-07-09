@@ -101,3 +101,19 @@ def test_load_extension_helper_loads_sqlite_extension_when_available(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "load-helper.db"))
     honker.load_extension(conn)
     conn.execute("SELECT honker_bootstrap()")
+
+
+def test_queue_memoized_same_options(db_path):
+    db = honker.open(db_path)
+    q1 = db.queue("emails", visibility_timeout_s=300, max_attempts=3)
+    q2 = db.queue("emails", visibility_timeout_s=300, max_attempts=3)
+    assert q1 is q2
+
+
+def test_queue_conflicting_options_raises(db_path):
+    db = honker.open(db_path)
+    db.queue("emails", visibility_timeout_s=300, max_attempts=3)
+    with pytest.raises(ValueError, match="already opened"):
+        db.queue("emails", visibility_timeout_s=60, max_attempts=3)
+    with pytest.raises(ValueError, match="already opened"):
+        db.queue("emails", visibility_timeout_s=300, max_attempts=10)
