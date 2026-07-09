@@ -49,7 +49,8 @@ jobs:
           # Don't leave the GITHUB_TOKEN in `.git/config` for later
           # steps to scoop up.
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        run: rustup default stable
       # No rust-cache here. Releases run on tag-push (rare), so the
       # ~60s saved by sharing ci.yml's cache isn't worth the cache-
       # poisoning surface area: a compromised PR run could populate
