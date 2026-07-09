@@ -76,7 +76,8 @@ extern "C" {
 
     int64_t honker_cpp_scheduler_register(
         sqlite3* db, const char* name, const char* queue, const char* cron,
-        const char* payload_json, int64_t priority, int64_t expires_sec);
+        const char* payload_json, int64_t priority, int64_t expires_sec,
+        int64_t max_attempts);
     int64_t honker_cpp_scheduler_unregister(sqlite3* db, const char* name);
     char*   honker_cpp_scheduler_tick(sqlite3* db, int64_t now_unix);
     int64_t honker_cpp_scheduler_soonest(sqlite3* db);
@@ -88,7 +89,8 @@ extern "C" {
     int64_t honker_cpp_scheduler_update(
         sqlite3* db, const char* name, const char* cron, const char* payload_json,
         int64_t priority, int64_t touch_priority,
-        int64_t expires_sec, int64_t touch_expires);
+        int64_t expires_sec, int64_t touch_expires,
+        int64_t max_attempts, int64_t touch_max_attempts);
     int64_t honker_cpp_cancel(sqlite3* db, int64_t job_id);
     char*   honker_cpp_get_job(sqlite3* db, int64_t job_id);
 
@@ -833,14 +835,15 @@ class Scheduler {
 public:
     void add(std::string_view name, std::string_view queue, std::string_view schedule_expr,
              std::string_view payload_json, int64_t priority = 0,
-             std::optional<int64_t> expires_sec = std::nullopt) {
+             std::optional<int64_t> expires_sec = std::nullopt,
+             int64_t max_attempts = 3) {
         const std::string n{name};
         const std::string q{queue};
         const std::string c{schedule_expr};
         const std::string p{payload_json};
         const auto rc = honker_cpp_scheduler_register(
             db_->raw(), n.c_str(), q.c_str(), c.c_str(), p.c_str(), priority,
-            expires_sec.value_or(0));
+            expires_sec.value_or(0), max_attempts);
         if (rc < 0) throw Error{"scheduler_register failed: SQL error"};
         db_->mark_updated();
     }
@@ -906,10 +909,11 @@ public:
         std::optional<std::string_view> cron = std::nullopt,
         std::optional<std::string_view> payload_json = std::nullopt,
         std::optional<int64_t> priority = std::nullopt,
-        std::optional<std::optional<int64_t>> expires_sec = std::nullopt
+        std::optional<std::optional<int64_t>> expires_sec = std::nullopt,
+        std::optional<int64_t> max_attempts = std::nullopt
     ) {
         // Empty update is a no-op.
-        if (!cron && !payload_json && !priority && !expires_sec) return false;
+        if (!cron && !payload_json && !priority && !expires_sec && !max_attempts) return false;
 
         const std::string n{name};
         std::string c, p;
@@ -921,11 +925,13 @@ public:
         const int64_t touch_expires = expires_sec.has_value() ? 1 : 0;
         const int64_t expires_arg =
             (expires_sec.has_value() && expires_sec->has_value()) ? **expires_sec : -1;
+        const int64_t touch_max_attempts = max_attempts.has_value() ? 1 : 0;
 
         const auto rc = honker_cpp_scheduler_update(
             db_->raw(), n.c_str(), cron_z, payload_z,
             priority.value_or(0), touch_priority,
-            expires_arg, touch_expires
+            expires_arg, touch_expires,
+            max_attempts.value_or(0), touch_max_attempts
         );
         if (rc < 0) throw Error{"scheduler_update failed: SQL error"};
         if (rc > 0) db_->mark_updated();
@@ -946,24 +952,21 @@ public:
                 continue;
             }
 
-            auto last_hb = std::chrono::steady_clock::now();
             while (!stop_token.load()) {
+                auto hb = honker_cpp_lock_heartbeat(
+                    db_->raw(), "honker-scheduler", o.c_str(), LOCK_TTL);
+                if (hb <= 0) {
+                    // lost leadership before firing
+                    break;
+                }
+                auto last_hb = std::chrono::steady_clock::now();
+
                 auto now = std::chrono::system_clock::now().time_since_epoch();
                 auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(now).count();
                 auto fires = tick(now_sec);
                 (void)fires; // caller may process them if they override run()
 
                 auto now_clock = std::chrono::steady_clock::now();
-                if (now_clock - last_hb >= HEARTBEAT) {
-                    auto hb = honker_cpp_lock_heartbeat(
-                        db_->raw(), "honker-scheduler", o.c_str(), LOCK_TTL);
-                    if (hb <= 0) {
-                        // lost leadership
-                        break;
-                    }
-                    last_hb = now_clock;
-                }
-
                 auto wait = HEARTBEAT - (now_clock - last_hb);
                 auto next_fire = soonest();
                 if (next_fire > 0) {

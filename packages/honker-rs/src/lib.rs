@@ -630,11 +630,9 @@ impl Queue {
     /// cancellation to running handlers.
     pub fn cancel(&self, job_id: i64) -> Result<bool> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_cancel(?1)",
-                params![job_id],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT honker_cancel(?1)", params![job_id], |r| {
+                r.get::<_, i64>(0)
+            })
         })? > 0)
     }
 
@@ -1347,6 +1345,7 @@ pub struct ScheduleRow {
     pub expires_s: Option<i64>,
     pub next_fire_at: i64,
     pub enabled: bool,
+    pub max_attempts: i64,
 }
 
 /// Optional fields for `Scheduler::update()`. `None` means "leave
@@ -1369,10 +1368,16 @@ pub struct Scheduler {
 impl Scheduler {
     /// Register a recurring task. Idempotent by `name`.
     pub fn add(&self, task: ScheduledTask) -> Result<()> {
+        self.add_with_max_attempts(task, 3)
+    }
+
+    /// Register a recurring task with an explicit per-fire attempt
+    /// budget. Idempotent by `name`.
+    pub fn add_with_max_attempts(&self, task: ScheduledTask, max_attempts: i64) -> Result<()> {
         let payload_json = serde_json::to_string(&task.payload)?;
         self.inner.with_conn(|c| {
             c.query_row(
-                "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6)",
+                "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     task.name,
                     task.queue,
@@ -1380,6 +1385,7 @@ impl Scheduler {
                     payload_json,
                     task.priority,
                     task.expires_s,
+                    max_attempts,
                 ],
                 |_| Ok(()),
             )
@@ -1423,30 +1429,26 @@ impl Scheduler {
     /// Idempotent on already-paused (returns false).
     pub fn pause(&self, name: &str) -> Result<bool> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_scheduler_pause(?1)",
-                params![name],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT honker_scheduler_pause(?1)", params![name], |r| {
+                r.get::<_, i64>(0)
+            })
         })? > 0)
     }
 
     /// Resume a paused schedule. Returns true if a row was resumed.
     pub fn resume(&self, name: &str) -> Result<bool> {
         Ok(self.inner.with_conn(|c| {
-            c.query_row(
-                "SELECT honker_scheduler_resume(?1)",
-                params![name],
-                |r| r.get::<_, i64>(0),
-            )
+            c.query_row("SELECT honker_scheduler_resume(?1)", params![name], |r| {
+                r.get::<_, i64>(0)
+            })
         })? > 0)
     }
 
     /// List every registered schedule with current state.
     pub fn list(&self) -> Result<Vec<ScheduleRow>> {
-        let json: String = self.inner.with_conn(|c| {
-            c.query_row("SELECT honker_scheduler_list()", [], |r| r.get(0))
-        })?;
+        let json: String = self
+            .inner
+            .with_conn(|c| c.query_row("SELECT honker_scheduler_list()", [], |r| r.get(0)))?;
         Ok(serde_json::from_str(&json)?)
     }
 
@@ -1479,6 +1481,18 @@ impl Scheduler {
                     expires_arg,
                     touch_expires,
                 ],
+                |r| r.get::<_, i64>(0),
+            )
+        })? > 0)
+    }
+
+    /// Update only the attempt budget for future fired jobs. Existing
+    /// jobs already enqueued by this schedule keep their row-level budget.
+    pub fn update_max_attempts(&self, name: &str, max_attempts: i64) -> Result<bool> {
+        Ok(self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_scheduler_update(?1, NULL, NULL, NULL, NULL, 0, ?2, 1)",
+                params![name, max_attempts],
                 |r| r.get::<_, i64>(0),
             )
         })? > 0)
@@ -1529,20 +1543,23 @@ impl Scheduler {
         heartbeat: Duration,
         rx: &Receiver<()>,
     ) -> Result<()> {
-        let mut last_heartbeat = std::time::Instant::now();
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            self.tick()?;
-            if last_heartbeat.elapsed() >= heartbeat {
-                let still_ours =
-                    lock_try_acquire(&self.inner, "honker-scheduler", owner, lock_ttl)?;
-                if !still_ours {
-                    // Lost the lock (TTL expired, new leader). Drop
-                    // out of the leader loop so we don't double-fire
-                    // alongside whoever has it now.
-                    return Ok(());
-                }
-                last_heartbeat = std::time::Instant::now();
+            let still_ours: i64 = self.inner.with_conn(|c| {
+                c.query_row(
+                    "SELECT honker_lock_renew(?1, ?2, ?3)",
+                    params!["honker-scheduler", owner, lock_ttl],
+                    |r| r.get(0),
+                )
+            })?;
+            if still_ours == 0 {
+                // Lost the lock (TTL expired, new leader). Drop out
+                // before ticking so we don't double-fire alongside
+                // whoever has it now.
+                return Ok(());
             }
+            let last_heartbeat = std::time::Instant::now();
+
+            self.tick()?;
             let mut wait_for = heartbeat.saturating_sub(last_heartbeat.elapsed());
             let soonest = self.soonest()?;
             if soonest > 0 {
@@ -1658,8 +1675,18 @@ impl Lock {
     /// `Ok(false)` if the lock was stolen (TTL expired and someone
     /// else acquired it). Check the return value — holding the `Lock`
     /// value alone does not guarantee you still own the lock.
+    ///
+    /// Uses `honker_lock_renew` — `honker_lock_acquire` does not
+    /// refresh `expires_at` for an existing (name, owner) row.
     pub fn heartbeat(&self, ttl_s: i64) -> Result<bool> {
-        lock_try_acquire(&self.inner, &self.name, &self.owner, ttl_s)
+        let n: i64 = self.inner.with_conn(|c| {
+            c.query_row(
+                "SELECT honker_lock_renew(?1, ?2, ?3)",
+                params![self.name, self.owner, ttl_s],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n > 0)
     }
 }
 

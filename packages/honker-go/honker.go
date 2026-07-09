@@ -766,18 +766,18 @@ func (q *Queue) AckBatch(ids []int64, workerID string) (int64, error) {
 // JobRow is one job row read by Queue.GetJob. Pure data, no claim
 // semantics.
 type JobRow struct {
-	ID              int64   `json:"id"`
-	Queue           string  `json:"queue"`
-	Payload         string  `json:"payload"`
-	State           string  `json:"state"`
-	Priority        int64   `json:"priority"`
-	RunAt           int64   `json:"run_at"`
-	WorkerID        *string `json:"worker_id"`
-	ClaimExpiresAt  *int64  `json:"claim_expires_at"`
-	Attempts        int64   `json:"attempts"`
-	MaxAttempts     int64   `json:"max_attempts"`
-	CreatedAt       int64   `json:"created_at"`
-	ExpiresAt       *int64  `json:"expires_at"`
+	ID             int64   `json:"id"`
+	Queue          string  `json:"queue"`
+	Payload        string  `json:"payload"`
+	State          string  `json:"state"`
+	Priority       int64   `json:"priority"`
+	RunAt          int64   `json:"run_at"`
+	WorkerID       *string `json:"worker_id"`
+	ClaimExpiresAt *int64  `json:"claim_expires_at"`
+	Attempts       int64   `json:"attempts"`
+	MaxAttempts    int64   `json:"max_attempts"`
+	CreatedAt      int64   `json:"created_at"`
+	ExpiresAt      *int64  `json:"expires_at"`
 }
 
 // Cancel removes a pending or processing row by id. Returns true iff
@@ -1103,6 +1103,8 @@ type ScheduledTask struct {
 	Payload  any
 	Priority int64
 	ExpiresS *int64
+	// MaxAttempts is the attempt budget for each fired job. Defaults to 3.
+	MaxAttempts int64
 }
 
 // ScheduledFire is one firing of a scheduled task.
@@ -1123,10 +1125,14 @@ func (s *Scheduler) Add(task ScheduledTask) error {
 	if expr == "" {
 		expr = task.Cron
 	}
+	maxAttempts := task.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
 	_, err = s.db.db.Exec(
-		"SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
+		"SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
 		task.Name, task.Queue, expr, string(payloadJSON),
-		task.Priority, task.ExpiresS,
+		task.Priority, task.ExpiresS, maxAttempts,
 	)
 	return err
 }
@@ -1197,6 +1203,7 @@ type ScheduleRow struct {
 	ExpiresS    *int64 `json:"expires_s"`
 	NextFireAt  int64  `json:"next_fire_at"`
 	Enabled     bool   `json:"enabled"`
+	MaxAttempts int64  `json:"max_attempts"`
 }
 
 // List returns every registered schedule with current state.
@@ -1228,14 +1235,15 @@ type ScheduleUpdate struct {
 	//   &(*int64)(nil) -> clear (set to NULL)
 	//   &(&v)         -> set to v
 	// In practice most callers use the helpers below.
-	ExpiresS *(*int64)
+	ExpiresS    *(*int64)
+	MaxAttempts *int64
 }
 
 // Update mutates the named schedule's fields in place. Pass only the
 // fields you want to change. Cron change recomputes next_fire_at from
 // now. Returns true iff a row was updated.
 func (s *Scheduler) Update(name string, opts ScheduleUpdate) (bool, error) {
-	if opts.CronExpr == nil && opts.Payload == nil && opts.Priority == nil && opts.ExpiresS == nil {
+	if opts.CronExpr == nil && opts.Payload == nil && opts.Priority == nil && opts.ExpiresS == nil && opts.MaxAttempts == nil {
 		// Empty update is a no-op (matches Python/Node binding).
 		return false, nil
 	}
@@ -1263,10 +1271,16 @@ func (s *Scheduler) Update(name string, opts ScheduleUpdate) (bool, error) {
 			expiresArg = **opts.ExpiresS
 		}
 	}
+	touchMaxAttempts := int64(0)
+	var maxAttemptsArg interface{}
+	if opts.MaxAttempts != nil {
+		touchMaxAttempts = 1
+		maxAttemptsArg = *opts.MaxAttempts
+	}
 	var n int64
 	err := s.db.db.QueryRow(
-		"SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)",
-		name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires,
+		"SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?)",
+		name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires, maxAttemptsArg, touchMaxAttempts,
 	).Scan(&n)
 	return n > 0, err
 }
@@ -1306,8 +1320,6 @@ func (s *Scheduler) Run(ctx context.Context, owner string) error {
 }
 
 func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lockTTL int64, heartbeatInterval time.Duration, updateCh <-chan struct{}) error {
-	lastHeartbeat := time.Now()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -1315,21 +1327,17 @@ func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lo
 		default:
 		}
 
-		_, err := s.Tick()
+		ok, err := lock.Heartbeat(lockTTL)
 		if err != nil {
 			return err
 		}
-
-		if time.Since(lastHeartbeat) >= heartbeatInterval {
-			ok, err := lock.Heartbeat(lockTTL)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				// Lost the lock — exit leader loop and re-contest.
-				return nil
-			}
-			lastHeartbeat = time.Now()
+		if !ok {
+			// Lost the lock — exit leader loop and re-contest.
+			return nil
+		}
+		_, err = s.Tick()
+		if err != nil {
+			return err
 		}
 
 		waitFor := heartbeatInterval
@@ -1441,30 +1449,18 @@ func (l *Lock) Release() error {
 }
 
 // Heartbeat extends the lock's TTL. Returns true if we still own it.
-// Uses a direct UPDATE because honker_lock_acquire uses INSERT OR
-// IGNORE and won't extend an existing row.
+// Uses honker_lock_renew — honker_lock_acquire uses INSERT OR IGNORE
+// and won't extend an existing row.
 func (l *Lock) Heartbeat(ttlSec int64) (bool, error) {
-	tx, err := l.db.db.Begin()
+	var n int64
+	err := l.db.db.QueryRow(
+		"SELECT honker_lock_renew(?, ?, ?)",
+		l.name, l.owner, ttlSec,
+	).Scan(&n)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(
-		"UPDATE _honker_locks SET expires_at = unixepoch() + ? WHERE name = ? AND owner = ?",
-		ttlSec, l.name, l.owner,
-	)
-	if err != nil {
-		return false, err
-	}
-	var changes int64
-	if err := tx.QueryRow("SELECT changes()").Scan(&changes); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return changes > 0, nil
+	return n > 0, nil
 }
 
 func (l *Lock) finalize() {

@@ -133,8 +133,10 @@ class Lock {
   }
 
   heartbeat(ttlS) {
+    // honker_lock_acquire uses INSERT OR IGNORE and does not refresh
+    // expires_at for an existing owner. Use honker_lock_renew.
     return (
-      this._db._callScalar('SELECT honker_lock_acquire(?, ?, ?)', [
+      this._db._callScalar('SELECT honker_lock_renew(?, ?, ?)', [
         this.name,
         this.owner,
         ttlS,
@@ -604,16 +606,17 @@ class Scheduler {
     this._db = db;
   }
 
-  add({ name, queue, schedule = null, cron = null, payload, priority = 0, expiresS = null }) {
+  add({ name, queue, schedule = null, cron = null, payload, priority = 0, expiresS = null, maxAttempts = 3 }) {
     const expr = schedule ?? cron;
     if (!expr) throw new Error('must provide schedule or cron');
-    this._db._callScalar('SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)', [
+    this._db._callScalar('SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)', [
       name,
       queue,
       expr,
       jsonText(payload),
       priority,
       expiresS,
+      maxAttempts,
     ]);
   }
 
@@ -647,9 +650,11 @@ class Scheduler {
     const priorityArg = has('priority') ? opts.priority : null;
     const touchExpires = has('expiresS') ? 1 : 0;
     const expiresArg = has('expiresS') ? opts.expiresS : null;
+    const touchMaxAttempts = has('maxAttempts') ? 1 : 0;
+    const maxAttemptsArg = has('maxAttempts') ? opts.maxAttempts : null;
     const n = this._db._callScalar(
-      'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)',
-      [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires],
+      'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires, maxAttemptsArg, touchMaxAttempts],
     );
     return n > 0;
   }
@@ -689,11 +694,9 @@ class Scheduler {
     const heartbeatMs = 20_000;
     let lastHeartbeat = monotonicMs();
     while (!aborted(signal)) {
+      if (!lock.heartbeat(60)) return;
+      lastHeartbeat = monotonicMs();
       this.tick();
-      if (monotonicMs() - lastHeartbeat >= heartbeatMs) {
-        if (!lock.heartbeat(60)) return;
-        lastHeartbeat = monotonicMs();
-      }
 
       let waitMs = Math.max(0, heartbeatMs - (monotonicMs() - lastHeartbeat));
       const nextFire = this.soonest();

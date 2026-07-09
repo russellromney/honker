@@ -101,3 +101,43 @@ def test_load_extension_helper_loads_sqlite_extension_when_available(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "load-helper.db"))
     honker.load_extension(conn)
     conn.execute("SELECT honker_bootstrap()")
+
+
+def test_queue_memoized_same_options(db_path):
+    db = honker.open(db_path)
+    q1 = db.queue("emails", visibility_timeout_s=300, max_attempts=3)
+    q2 = db.queue("emails", visibility_timeout_s=300, max_attempts=3)
+    assert q1 is q2
+
+
+def test_queue_conflicting_options_raises(db_path):
+    db = honker.open(db_path)
+    db.queue("emails", visibility_timeout_s=300, max_attempts=3)
+    with pytest.raises(ValueError, match="already opened"):
+        db.queue("emails", visibility_timeout_s=60, max_attempts=3)
+    with pytest.raises(ValueError, match="already opened"):
+        db.queue("emails", visibility_timeout_s=300, max_attempts=10)
+
+
+def test_queue_lookup_only_reuses_custom_options(db_path):
+    """run_workers calls db.queue(name) with no options after the app
+    opened the queue with custom max_attempts. Pure lookup must reuse
+    the memoized instance.
+    """
+    db = honker.open(db_path)
+    q1 = db.queue("emails", visibility_timeout_s=120, max_attempts=7)
+    q2 = db.queue("emails")  # lookup only — no options
+    assert q1 is q2
+    assert q2.max_attempts == 7
+    assert q2.visibility_timeout_s == 120
+
+
+def test_queue_explicit_default_max_attempts_conflicts_with_custom(db_path):
+    """Passing max_attempts=3 explicitly after opening with 5 must
+    raise — not silently return the memoized instance. Regression
+    for the 'magic defaults' footgun.
+    """
+    db = honker.open(db_path)
+    db.queue("emails", max_attempts=5)
+    with pytest.raises(ValueError, match="already opened"):
+        db.queue("emails", max_attempts=3)

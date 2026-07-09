@@ -20,6 +20,7 @@
 
 use rusqlite::Connection;
 use rusqlite::functions::FunctionFlags;
+use serde_json::{Value, json};
 
 /// Wrap a Displayable error for SQLite scalar-function returns.
 fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
@@ -102,6 +103,18 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // honker_lock_renew(name, owner, ttl_s) -> 1 if this owner still
+    // holds the lock and expires_at was extended, 0 otherwise.
+    // Distinct from honker_lock_acquire: INSERT OR IGNORE does not
+    // refresh expires_at for an existing (name, owner) row.
+    conn.create_scalar_function("honker_lock_renew", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let name: String = ctx.get(0)?;
+        let owner: String = ctx.get(1)?;
+        let ttl: i64 = ctx.get(2)?;
+        let db = unsafe { ctx.get_connection() }?;
+        lock_renew(&db, &name, &owner, ttl).map_err(to_sql_err)
+    })?;
+
     conn.create_scalar_function(
         "honker_rate_limit_try",
         3,
@@ -128,6 +141,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 
     // honker_scheduler_register(name, queue, cron_expr, payload_json,
     //                       priority, expires_s_or_null) -> 1.
+    // Optional 7th arg max_attempts (default 3) pins the attempt budget
+    // on every job the scheduler enqueues for this task.
     // Upserts the task row. `next_fire_at` is recomputed as the next
     // cron boundary strictly after `unixepoch()`. Calling twice with
     // the same name replaces the first registration entirely.
@@ -144,7 +159,33 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let expires_s: Option<i64> = ctx.get(5)?;
             let db = unsafe { ctx.get_connection() }?;
             scheduler_register(
-                &db, &name, &queue, &cron_expr, &payload, priority, expires_s,
+                &db, &name, &queue, &cron_expr, &payload, priority, expires_s, 3,
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_scheduler_register",
+        7,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let queue: String = ctx.get(1)?;
+            let cron_expr: String = ctx.get(2)?;
+            let payload: String = ctx.get(3)?;
+            let priority: i64 = ctx.get(4)?;
+            let expires_s: Option<i64> = ctx.get(5)?;
+            let max_attempts: i64 = ctx.get(6)?;
+            let db = unsafe { ctx.get_connection() }?;
+            scheduler_register(
+                &db,
+                &name,
+                &queue,
+                &cron_expr,
+                &payload,
+                priority,
+                expires_s,
+                max_attempts,
             )
             .map_err(to_sql_err)
         },
@@ -229,10 +270,13 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // honker_scheduler_update(name, cron_expr_or_null, payload_or_null,
     //                          priority_or_null, expires_s_or_null,
     //                          touch_expires) -> 1 if updated, 0 if missing.
+    // Optional 8-arg form adds max_attempts_or_null, touch_max_attempts.
     // `touch_expires` is a 0/1 flag: when 1 we treat the expires_s arg
     // as the desired value (which may be NULL = "clear"); when 0 we
     // leave expires_s untouched. SQL has no good way to distinguish
-    // "user passed NULL" from "user did not specify" otherwise.
+    // "user passed NULL" from "user did not specify" otherwise. Same
+    // pattern for max_attempts so old 6-arg raw callers stay compatible;
+    // explicit NULL resets max_attempts to the scheduler default (3).
     conn.create_scalar_function(
         "honker_scheduler_update",
         6,
@@ -257,6 +301,43 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
                 payload.as_deref(),
                 priority,
                 expires_s,
+                None,
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_scheduler_update",
+        8,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let name: String = ctx.get(0)?;
+            let cron_expr: Option<String> = ctx.get(1)?;
+            let payload: Option<String> = ctx.get(2)?;
+            let priority: Option<i64> = ctx.get(3)?;
+            let expires_s_arg: Option<i64> = ctx.get(4)?;
+            let touch_expires: i64 = ctx.get(5)?;
+            let max_attempts_arg: Option<i64> = ctx.get(6)?;
+            let touch_max_attempts: i64 = ctx.get(7)?;
+            let db = unsafe { ctx.get_connection() }?;
+            let expires_s = if touch_expires != 0 {
+                Some(expires_s_arg)
+            } else {
+                None
+            };
+            let max_attempts = if touch_max_attempts != 0 {
+                Some(max_attempts_arg)
+            } else {
+                None
+            };
+            scheduler_update(
+                &db,
+                &name,
+                cron_expr.as_deref(),
+                payload.as_deref(),
+                priority,
+                expires_s,
+                max_attempts,
             )
             .map_err(to_sql_err)
         },
@@ -457,6 +538,60 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 // Claim / ack
 // ---------------------------------------------------------------------
 
+/// Move claimable rows that have already exhausted `max_attempts` into
+/// `_honker_dead`. Without this, a worker that dies after the last
+/// allowed claim leaves the row reclaimable forever — every reclaim
+/// would bump `attempts` past `max_attempts` with no dead-letter path
+/// (dead-letter previously only ran inside `retry()`).
+///
+/// "Claimable" here matches the reclaim predicate: pending+due or
+/// processing with an expired visibility timeout. In-flight claims
+/// that still hold a valid timeout are left alone so the holder can
+/// still ack / retry / fail.
+fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+    let mut select = conn.prepare_cached(
+        "DELETE FROM _honker_live
+         WHERE queue = ?1
+           AND attempts >= max_attempts
+           AND (expires_at IS NULL OR expires_at > unixepoch())
+           AND (
+             (state = 'pending' AND run_at <= unixepoch())
+             OR (state = 'processing' AND claim_expires_at < unixepoch())
+           )
+         RETURNING id, queue, payload, priority, run_at, max_attempts,
+                   attempts, created_at",
+    )?;
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, String, String, i64, i64, i64, i64, i64)> = select
+        .query_map(rusqlite::params![queue], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO _honker_dead
+           (id, queue, payload, priority, run_at, max_attempts,
+            attempts, last_error, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'max attempts exceeded', ?8)",
+    )?;
+    let count = rows.len() as i64;
+    for r in rows {
+        insert.execute(rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7])?;
+    }
+    Ok(count)
+}
+
 /// Returns JSON text: `[{"id":1,"queue":"...","payload":"...","worker_id":"...","attempts":N,"claim_expires_at":T}, ...]`
 pub fn claim_batch(
     conn: &Connection,
@@ -465,6 +600,12 @@ pub fn claim_batch(
     n: i64,
     timeout_s: i64,
 ) -> rusqlite::Result<String> {
+    // Drop reclaimable rows that already used their attempt budget so
+    // they cannot be claimed again (and so they don't clog the claim
+    // index forever). Same outer SQL statement / connection, so this
+    // shares the caller's transaction with the claim UPDATE below.
+    dead_letter_exhausted_claimable(conn, queue)?;
+
     let mut stmt = conn.prepare_cached(
         "UPDATE _honker_live
          SET state = 'processing',
@@ -475,6 +616,7 @@ pub fn claim_batch(
            SELECT id FROM _honker_live
            WHERE queue = ?2
              AND state IN ('pending', 'processing')
+             AND attempts < max_attempts
              AND (expires_at IS NULL OR expires_at > unixepoch())
              AND ((state = 'pending' AND run_at <= unixepoch())
                OR (state = 'processing' AND claim_expires_at < unixepoch()))
@@ -493,22 +635,21 @@ pub fn claim_batch(
             row.get::<_, i64>(5)?,
         ))
     })?;
-    let mut out = String::from("[");
-    let mut first = true;
+    let mut out = Vec::new();
     for row in rows {
         let (id, q, payload, w, attempts, claim_expires_at) = row?;
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        out.push_str(&format!(
-            "{{\"id\":{},\"queue\":{},\"payload\":{},\"worker_id\":{},\"attempts\":{},\"claim_expires_at\":{}}}",
-            id, json_str(&q), json_str(&payload), json_str(&w),
-            attempts, claim_expires_at,
-        ));
+        // payload stays a JSON string (double-encoded on the wire) so
+        // every binding's existing parse path keeps working.
+        out.push(json!({
+            "id": id,
+            "queue": q,
+            "payload": payload,
+            "worker_id": w,
+            "attempts": attempts,
+            "claim_expires_at": claim_expires_at,
+        }));
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
@@ -532,6 +673,9 @@ pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite
 ///   * a pending row's `run_at`
 ///   * one second after a processing row's `claim_expires_at`
 ///
+/// Rows that have already exhausted `max_attempts` are ignored — they
+/// are dead-lettered on the next claim path, not reclaimable.
+///
 /// Returns 0 if no such future deadline exists.
 pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
     Ok(conn
@@ -542,6 +686,7 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
                FROM _honker_live
                WHERE queue = ?1
                  AND state = 'pending'
+                 AND attempts < max_attempts
                  AND (expires_at IS NULL OR expires_at > unixepoch())
                  AND run_at > unixepoch()
                UNION ALL
@@ -549,6 +694,7 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
                FROM _honker_live
                WHERE queue = ?1
                  AND state = 'processing'
+                 AND attempts < max_attempts
                  AND (expires_at IS NULL OR expires_at > unixepoch())
                  AND claim_expires_at >= unixepoch()
              )",
@@ -587,8 +733,12 @@ pub fn enqueue(
         (None, None) => now,
     };
     let expires_at: Option<i64> = expires.map(|e| now + e);
-    let channel = format!("honker:{}", queue);
 
+    // No synthetic `_honker_notifications` row. The live-table INSERT
+    // already advances PRAGMA data_version on commit, which is what
+    // SharedUpdateWatcher / every binding's update_events path observes.
+    // Writing a wake row per enqueue used to grow the notifications
+    // table without bound on high-throughput queues.
     let id: i64 = conn.query_row(
         "INSERT INTO _honker_live
            (queue, payload, run_at, priority, max_attempts, expires_at)
@@ -603,12 +753,6 @@ pub fn enqueue(
             expires_at
         ],
         |r| r.get(0),
-    )?;
-    // Fire a wake so workers parked on this queue's channel re-poll.
-    conn.execute(
-        "INSERT INTO _honker_notifications (channel, payload)
-         VALUES (?1, 'new')",
-        rusqlite::params![channel],
     )?;
     Ok(id)
 }
@@ -700,14 +844,8 @@ pub fn retry(
              WHERE id = ?1",
             rusqlite::params![id, delay_s],
         )?;
-        // Fire a wake — the row is now claimable again (after the
-        // delay), and waiting workers should re-poll.
-        let channel = format!("honker:{}", queue);
-        conn.execute(
-            "INSERT INTO _honker_notifications (channel, payload)
-         VALUES (?1, 'new')",
-            rusqlite::params![channel],
-        )?;
+        // Wake comes from the live-table UPDATE + commit (data_version).
+        // No synthetic notification row — see enqueue() for rationale.
     }
     Ok(1)
 }
@@ -837,32 +975,21 @@ pub fn get_job(conn: &Connection, job_id: i64) -> rusqlite::Result<String> {
     else {
         return Ok(String::new());
     };
-    let opt_str = |v: &Option<String>| match v {
-        Some(s) => json_str(s),
-        None => "null".into(),
-    };
-    let opt_i = |v: Option<i64>| match v {
-        Some(n) => n.to_string(),
-        None => "null".into(),
-    };
-    Ok(format!(
-        "{{\"id\":{},\"queue\":{},\"payload\":{},\"state\":{},\
-         \"priority\":{},\"run_at\":{},\"worker_id\":{},\
-         \"claim_expires_at\":{},\"attempts\":{},\"max_attempts\":{},\
-         \"created_at\":{},\"expires_at\":{}}}",
-        id,
-        json_str(&queue),
-        json_str(&payload),
-        json_str(&state),
-        priority,
-        run_at,
-        opt_str(&worker_id),
-        opt_i(claim_expires_at),
-        attempts,
-        max_attempts,
-        created_at,
-        opt_i(expires_at),
-    ))
+    Ok(json!({
+        "id": id,
+        "queue": queue,
+        "payload": payload,
+        "state": state,
+        "priority": priority,
+        "run_at": run_at,
+        "worker_id": worker_id,
+        "claim_expires_at": claim_expires_at,
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    })
+    .to_string())
 }
 
 /// Extend the current claim by `extend_s` seconds. Returns 1 if the
@@ -874,10 +1001,14 @@ pub fn heartbeat(
     worker_id: &str,
     extend_s: i64,
 ) -> rusqlite::Result<i64> {
+    // Require a still-valid claim. Without `claim_expires_at >= now`,
+    // a late heartbeat after visibility timeout can steal the job
+    // back from a reclaimer (dual execution).
     let updated = conn.execute(
         "UPDATE _honker_live
          SET claim_expires_at = unixepoch() + ?3
-         WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'",
+         WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'
+           AND claim_expires_at >= unixepoch()",
         rusqlite::params![job_id, worker_id, extend_s],
     )?;
     Ok(updated as i64)
@@ -972,6 +1103,25 @@ pub fn lock_release(conn: &Connection, name: &str, owner: &str) -> rusqlite::Res
     Ok(deleted as i64)
 }
 
+/// Extend `expires_at` for a lock held by `owner`. Returns 1 if the
+/// row was updated, 0 if the lock is missing or held by someone else.
+///
+/// `honker_lock_acquire` uses `INSERT OR IGNORE` and does **not**
+/// refresh TTL on same-owner re-acquire — callers that need renewal
+/// (scheduler leaders, long critical sections) must use this.
+pub fn lock_renew(conn: &Connection, name: &str, owner: &str, ttl_s: i64) -> rusqlite::Result<i64> {
+    if ttl_s <= 0 {
+        return Err(to_sql_err("ttl_s must be positive"));
+    }
+    let updated = conn.execute(
+        "UPDATE _honker_locks
+         SET expires_at = unixepoch() + ?3
+         WHERE name = ?1 AND owner = ?2",
+        rusqlite::params![name, owner, ttl_s],
+    )?;
+    Ok(if updated > 0 { 1 } else { 0 })
+}
+
 // ---------------------------------------------------------------------
 // Rate limiting
 // ---------------------------------------------------------------------
@@ -1016,7 +1166,8 @@ pub fn rate_limit_sweep(conn: &Connection, older_than_s: i64) -> rusqlite::Resul
 /// Register (or re-register) a periodic task. `next_fire_at` is
 /// computed as the next cron boundary strictly after
 /// `unixepoch()`. Calling twice with the same name replaces the
-/// first registration entirely.
+/// first registration entirely. `max_attempts` is stored on the task
+/// row and applied to every job `scheduler_tick` enqueues for it.
 pub fn scheduler_register(
     conn: &Connection,
     name: &str,
@@ -1025,20 +1176,23 @@ pub fn scheduler_register(
     payload: &str,
     priority: i64,
     expires_s: Option<i64>,
+    max_attempts: i64,
 ) -> rusqlite::Result<i64> {
+    let max_attempts = if max_attempts < 1 { 1 } else { max_attempts };
     let now = now_unix(conn)?;
     let next_fire_at = super::cron::next_after_unix(cron_expr, now).map_err(to_sql_err)?;
     conn.execute(
         "INSERT INTO _honker_scheduler_tasks
-           (name, queue, cron_expr, payload, priority, expires_s, next_fire_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, max_attempts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(name) DO UPDATE SET
            queue = excluded.queue,
            cron_expr = excluded.cron_expr,
            payload = excluded.payload,
            priority = excluded.priority,
            expires_s = excluded.expires_s,
-           next_fire_at = excluded.next_fire_at",
+           next_fire_at = excluded.next_fire_at,
+           max_attempts = excluded.max_attempts",
         rusqlite::params![
             name,
             queue,
@@ -1046,7 +1200,8 @@ pub fn scheduler_register(
             payload,
             priority,
             expires_s,
-            next_fire_at
+            next_fire_at,
+            max_attempts
         ],
     )?;
     // Wake any sleeping scheduler leader so it re-computes
@@ -1054,6 +1209,9 @@ pub fn scheduler_register(
     // this, a leader that went to sleep for an hour before a newly-
     // registered 1-minute-from-now task existed would oversleep past
     // its first fire.
+    //
+    // Wake is the register/update write itself advancing data_version
+    // on commit — see scheduler_wake.
     scheduler_wake(conn)?;
     Ok(1)
 }
@@ -1073,29 +1231,42 @@ pub fn scheduler_unregister(conn: &Connection, name: &str) -> rusqlite::Result<i
     Ok(n as i64)
 }
 
-/// INSERT a row on channel `honker:scheduler` so a sleeping scheduler
-/// leader sitting on `update_events()` wakes and re-evaluates. Payload
-/// is opaque — the leader doesn't read it, only the update tick matters.
-fn scheduler_wake(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO _honker_notifications (channel, payload)
-         VALUES ('honker:scheduler', 'wake')",
-        [],
-    )?;
+/// Ensure a sleeping scheduler leader sitting on `update_events()`
+/// re-evaluates after a register/unregister/pause/resume/update.
+///
+/// The register/unregister/pause/resume/update statements already
+/// mutate `_honker_scheduler_tasks`, which advances data_version on
+/// commit. A synthetic notification row used to be written here and
+/// grew without bound under frequent schedule edits — no longer needed.
+fn scheduler_wake(_conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
+
+/// Max fires enqueued for a single schedule row in one
+/// `scheduler_tick` call. After a long outage an `@every 1s` task
+/// would otherwise enqueue tens of thousands of jobs in one writer
+/// transaction.
+///
+/// **Semantics (intentional):** once the cap is hit, remaining missed
+/// boundaries for that task are **skipped** — `next_fire_at` jumps to
+/// the next boundary strictly after `now_unix`. Those intermediate
+/// fires are never enqueued. Run the scheduler continuously, use
+/// coarser schedules, or raise this constant if every missed fire
+/// must be delivered.
+pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 
 /// For each registered task whose `next_fire_at <= now_unix`,
 /// enqueue the payload into its queue and advance `next_fire_at`
 /// to the next boundary. Keeps advancing within one tick while
 /// boundaries remain in the past (catches up after a scheduler
-/// outage) — same semantics as the previous Python `_fire_due`.
+/// outage), up to [`SCHEDULER_MAX_CATCHUP_FIRES`] per task.
 /// Returns a JSON array of `{name, queue, fire_at, job_id}` fires.
 pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<String> {
     #[allow(clippy::type_complexity)]
-    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64)> = {
+    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64, i64)> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT name, queue, cron_expr, payload, priority, expires_s, next_fire_at
+            "SELECT name, queue, cron_expr, payload, priority, expires_s,
+                    next_fire_at, COALESCE(max_attempts, 3)
              FROM _honker_scheduler_tasks
              WHERE next_fire_at <= ?1 AND enabled = 1",
         )?;
@@ -1108,31 +1279,47 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 r.get::<_, i64>(4)?,
                 r.get::<_, Option<i64>>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?
     };
-    let mut out = String::from("[");
-    let mut first = true;
-    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at) in tasks {
+    let mut out = Vec::new();
+    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at, max_attempts) in
+        tasks
+    {
+        let mut fires_this_task: i64 = 0;
         while next_fire_at <= now_unix {
+            if fires_this_task >= SCHEDULER_MAX_CATCHUP_FIRES {
+                // Skip the remaining backlog. Resume from the next
+                // boundary strictly after now so we don't immediately
+                // re-enter the catch-up loop on the next tick.
+                // Intermediate boundaries are intentionally never
+                // enqueued (see SCHEDULER_MAX_CATCHUP_FIRES docs).
+                next_fire_at =
+                    super::cron::next_after_unix(&cron_expr, now_unix).map_err(to_sql_err)?;
+                break;
+            }
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
+            // max_attempts comes from the schedule row, not a constant.
             let job_id = enqueue(
-                conn, &queue, &payload, None, None, priority, 3, /* max_attempts default */
+                conn,
+                &queue,
+                &payload,
+                None,
+                None,
+                priority,
+                max_attempts,
                 expires_s,
             )?;
-            if !first {
-                out.push(',');
-            }
-            first = false;
-            out.push_str(&format!(
-                "{{\"name\":{},\"queue\":{},\"fire_at\":{},\"job_id\":{}}}",
-                json_str(&name),
-                json_str(&queue),
-                next_fire_at,
-                job_id,
-            ));
+            out.push(json!({
+                "name": name,
+                "queue": queue,
+                "fire_at": next_fire_at,
+                "job_id": job_id,
+            }));
+            fires_this_task += 1;
             // Advance to the next boundary strictly after this one.
             next_fire_at =
                 super::cron::next_after_unix(&cron_expr, next_fire_at).map_err(to_sql_err)?;
@@ -1144,8 +1331,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
             rusqlite::params![name, next_fire_at],
         )?;
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 pub fn scheduler_soonest(conn: &Connection) -> rusqlite::Result<i64> {
@@ -1185,15 +1371,25 @@ pub fn scheduler_resume(conn: &Connection, name: &str) -> rusqlite::Result<i64> 
 
 /// Return all registered schedules as a JSON array. Each row:
 /// `{name, queue, cron_expr, payload, priority, expires_s,
-///   next_fire_at, enabled}`.
+///   next_fire_at, enabled, max_attempts}`.
 pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
     let mut stmt = conn.prepare(
         "SELECT name, queue, cron_expr, payload, priority, expires_s,
-                next_fire_at, enabled
+                next_fire_at, enabled, COALESCE(max_attempts, 3)
            FROM _honker_scheduler_tasks
            ORDER BY name",
     )?;
-    let rows: Vec<(String, String, String, String, i64, Option<i64>, i64, i64)> = stmt
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+    )> = stmt
         .query_map([], |r| {
             Ok((
                 r.get(0)?,
@@ -1204,35 +1400,36 @@ pub fn scheduler_list(conn: &Connection) -> rusqlite::Result<String> {
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut out = String::from("[");
-    for (i, (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, enabled)) in
-        rows.iter().enumerate()
+    let mut out = Vec::new();
+    for (
+        name,
+        queue,
+        cron_expr,
+        payload,
+        priority,
+        expires_s,
+        next_fire_at,
+        enabled,
+        max_attempts,
+    ) in rows
     {
-        if i > 0 {
-            out.push(',');
-        }
-        let expires_repr = match expires_s {
-            Some(v) => v.to_string(),
-            None => "null".into(),
-        };
-        out.push_str(&format!(
-            "{{\"name\":{},\"queue\":{},\"cron_expr\":{},\"payload\":{},\
-             \"priority\":{},\"expires_s\":{},\"next_fire_at\":{},\"enabled\":{}}}",
-            json_str(name),
-            json_str(queue),
-            json_str(cron_expr),
-            json_str(payload),
-            priority,
-            expires_repr,
-            next_fire_at,
-            if *enabled != 0 { "true" } else { "false" },
-        ));
+        out.push(json!({
+            "name": name,
+            "queue": queue,
+            "cron_expr": cron_expr,
+            "payload": payload,
+            "priority": priority,
+            "expires_s": expires_s,
+            "next_fire_at": next_fire_at,
+            "enabled": enabled != 0,
+            "max_attempts": max_attempts,
+        }));
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 /// Mutate one or more fields of a registered schedule. Pass `None` for
@@ -1247,6 +1444,7 @@ pub fn scheduler_update(
     payload: Option<&str>,
     priority: Option<i64>,
     expires_s: Option<Option<i64>>,
+    max_attempts: Option<Option<i64>>,
 ) -> rusqlite::Result<i64> {
     // Verify exists first so we can return 0 cleanly without dynamic SQL gymnastics.
     let exists: bool = conn
@@ -1259,8 +1457,11 @@ pub fn scheduler_update(
     if !exists {
         return Ok(0);
     }
-    let any_field =
-        cron_expr.is_some() || payload.is_some() || priority.is_some() || expires_s.is_some();
+    let any_field = cron_expr.is_some()
+        || payload.is_some()
+        || priority.is_some()
+        || expires_s.is_some()
+        || max_attempts.is_some();
     if !any_field {
         // No fields to change. Don't wake the leader for a no-op.
         return Ok(0);
@@ -1292,6 +1493,14 @@ pub fn scheduler_update(
             conn.execute(
                 "UPDATE _honker_scheduler_tasks SET expires_s = ?2 WHERE name = ?1",
                 rusqlite::params![name, e],
+            )?;
+        }
+        if let Some(m) = max_attempts {
+            let m = m.unwrap_or(3);
+            let m = if m < 1 { 1 } else { m };
+            conn.execute(
+                "UPDATE _honker_scheduler_tasks SET max_attempts = ?2 WHERE name = ?1",
+                rusqlite::params![name, m],
             )?;
         }
         if let Some(expr) = cron_expr {
@@ -1381,18 +1590,14 @@ pub fn stream_publish(
     key: Option<&str>,
     payload: &str,
 ) -> rusqlite::Result<i64> {
+    // Stream row INSERT advances data_version on commit — same wake
+    // path as enqueue. No synthetic notification row (see enqueue).
     let offset: i64 = conn.query_row(
         "INSERT INTO _honker_stream (topic, key, payload)
          VALUES (?1, ?2, ?3)
          RETURNING offset",
         rusqlite::params![topic, key, payload],
         |r| r.get(0),
-    )?;
-    let channel = format!("honker:stream:{}", topic);
-    conn.execute(
-        "INSERT INTO _honker_notifications (channel, payload)
-         VALUES (?1, 'new')",
-        rusqlite::params![channel],
     )?;
     Ok(offset)
 }
@@ -1422,29 +1627,18 @@ pub fn stream_read_since(
             r.get::<_, i64>(4)?,
         ))
     })?;
-    let mut out = String::from("[");
-    let mut first = true;
+    let mut out = Vec::new();
     for row in rows {
         let (off, top, key, payload, created_at) = row?;
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        let key_tok = match key {
-            Some(s) => json_str(&s),
-            None => "null".to_string(),
-        };
-        out.push_str(&format!(
-            "{{\"offset\":{},\"topic\":{},\"key\":{},\"payload\":{},\"created_at\":{}}}",
-            off,
-            json_str(&top),
-            key_tok,
-            json_str(&payload),
-            created_at,
-        ));
+        out.push(json!({
+            "offset": off,
+            "topic": top,
+            "key": key,
+            "payload": payload,
+            "created_at": created_at,
+        }));
     }
-    out.push(']');
-    Ok(out)
+    Ok(Value::Array(out).to_string())
 }
 
 pub fn stream_save_offset(
@@ -1482,27 +1676,4 @@ pub fn stream_get_offset(conn: &Connection, consumer: &str, topic: &str) -> rusq
 
 fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
-}
-
-/// Escape a string for inclusion as a JSON string literal. Used by
-/// `claim_batch` to build its JSON array return value without
-/// pulling in serde_json just for one site.
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

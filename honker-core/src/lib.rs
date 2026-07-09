@@ -347,7 +347,8 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       priority INTEGER NOT NULL DEFAULT 0,
       expires_s INTEGER,
       next_fire_at INTEGER NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1
+      enabled INTEGER NOT NULL DEFAULT 1,
+      max_attempts INTEGER NOT NULL DEFAULT 3
     );
     CREATE TABLE IF NOT EXISTS _honker_results (
       job_id INTEGER PRIMARY KEY,
@@ -404,6 +405,23 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
             Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {
                 // Lost the race; the other process added it. Fine.
             }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Migration: max_attempts on scheduler tasks (per-fire job budget).
+    let has_max_attempts: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM pragma_table_info('_honker_scheduler_tasks') WHERE name='max_attempts'",
+        )?;
+        stmt.query_row([], |_| Ok(true)).unwrap_or(false)
+    };
+    if !has_max_attempts {
+        match conn.execute(
+            "ALTER TABLE _honker_scheduler_tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -567,14 +585,28 @@ impl Readers {
                 *out += 1;
                 drop(out);
                 drop(pool);
-                let conn = open_conn(&self.path, false)?;
-                // Re-check: if close() raced us, drop the brand-new
-                // connection instead of handing it out.
-                if self.closed.load(Ordering::Acquire) {
-                    drop(conn);
-                    return Err(closed_err());
+                match open_conn(&self.path, false) {
+                    Ok(conn) => {
+                        // Re-check: if close() raced us, drop the
+                        // brand-new connection instead of handing it
+                        // out. Release the capacity slot so a later
+                        // open after a failed race doesn't think the
+                        // pool is full forever.
+                        if self.closed.load(Ordering::Acquire) {
+                            *self.outstanding.lock() -= 1;
+                            drop(conn);
+                            return Err(closed_err());
+                        }
+                        return Ok(conn);
+                    }
+                    Err(e) => {
+                        // Open failed — free the slot we reserved or
+                        // every transient open failure permanently
+                        // shrinks max_readers until the pool is dead.
+                        *self.outstanding.lock() -= 1;
+                        return Err(e);
+                    }
                 }
-                return Ok(conn);
             }
             drop(out);
             self.available.wait(&mut pool);
@@ -1275,9 +1307,17 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        // Enqueue / stream_publish must NOT write synthetic wake rows.
         let enqueue_wakes: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM _honker_notifications WHERE channel='honker:pressure'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stream_wakes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_notifications WHERE channel='honker:stream:pressure-events'",
                 [],
                 |r| r.get(0),
             )
@@ -1289,7 +1329,14 @@ mod tests {
         assert_eq!(dead, 0);
         assert_eq!(stream_rows as usize, total_jobs);
         assert_eq!(notes as usize, total_jobs);
-        assert_eq!(enqueue_wakes as usize, total_jobs);
+        assert_eq!(
+            enqueue_wakes, 0,
+            "enqueue must not write wake notifications"
+        );
+        assert_eq!(
+            stream_wakes, 0,
+            "stream_publish must not write wake notifications"
+        );
         assert_eq!(integrity, "ok");
 
         drop(conn);
@@ -2285,6 +2332,7 @@ while True:
                 "expires_s",
                 "next_fire_at",
                 "enabled",
+                "max_attempts",
             ],
         );
         let res_cols: Vec<String> = conn
@@ -3161,5 +3209,99 @@ while True:
             result.is_err(),
             "expected probe to fail for inaccessible dir, got Ok"
         );
+    }
+
+    #[test]
+    fn readers_open_failure_does_not_leak_capacity() {
+        // Path under a missing directory — open_conn fails every time.
+        // Without the outstanding decrement on open failure, two
+        // failures with max=2 permanently fill the counter and the
+        // third acquire blocks forever on the condvar.
+        let r = Arc::new(Readers::new(
+            "/this/parent/does/not/exist/honker-readers-leak.db".into(),
+            2,
+        ));
+        for i in 0..5 {
+            let r = r.clone();
+            let handle = std::thread::spawn(move || r.acquire());
+            let result = handle.join().expect("acquire thread panicked");
+            assert!(
+                result.is_err(),
+                "attempt {i}: expected open failure, got Ok"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_batch_dead_letters_reclaim_past_max_attempts() {
+        // Worker dies without retry/ack after the last allowed claim.
+        // The next claim must dead-letter the row, not reclaim it.
+        let path = temp_db("claim-max-attempts");
+        let conn = open_core_test_conn(&path);
+
+        let job_id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('q', '{\"n\":1}', NULL, NULL, 0, 2, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Claim 1 → attempts=1. Expire visibility.
+        let claimed1: String = conn
+            .query_row("SELECT honker_claim_batch('q', 'w1', 1, 30)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(claimed1.contains(&format!("\"id\":{job_id}")));
+        conn.execute(
+            "UPDATE _honker_live SET claim_expires_at = unixepoch() - 1 WHERE id=?1",
+            rusqlite::params![job_id],
+        )
+        .unwrap();
+
+        // Claim 2 (reclaim) → attempts=2. Expire again.
+        let claimed2: String = conn
+            .query_row("SELECT honker_claim_batch('q', 'w2', 1, 30)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(claimed2.contains(&format!("\"id\":{job_id}")));
+        conn.execute(
+            "UPDATE _honker_live SET claim_expires_at = unixepoch() - 1 WHERE id=?1",
+            rusqlite::params![job_id],
+        )
+        .unwrap();
+
+        // Claim 3: exhausted → empty claim, row in dead.
+        let claimed3: String = conn
+            .query_row("SELECT honker_claim_batch('q', 'w3', 1, 30)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(claimed3, "[]");
+
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_live WHERE id=?1",
+                rusqlite::params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (dead_attempts, last_error): (i64, String) = conn
+            .query_row(
+                "SELECT attempts, last_error FROM _honker_dead WHERE id=?1",
+                rusqlite::params![job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live, 0);
+        assert_eq!(dead_attempts, 2);
+        assert_eq!(last_error, "max attempts exceeded");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

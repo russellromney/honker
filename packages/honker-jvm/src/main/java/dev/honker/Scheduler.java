@@ -17,8 +17,8 @@ public final class Scheduler {
     public void add(String name, String queue, CronSchedule schedule, String payloadJson, ScheduleOptions options) {
         Long expires = options.expires() == null ? null : Durations.seconds(options.expires(), "schedule expires");
         db.transaction(tx -> tx.query(
-            "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
-            Params.of(name, queue, schedule.expression(), payloadJson, options.priority(), expires)
+            "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
+            Params.of(name, queue, schedule.expression(), payloadJson, options.priority(), expires, options.maxAttempts())
         ));
     }
 

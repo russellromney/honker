@@ -73,7 +73,13 @@ async def run_task(
             # should wrap it themselves or switch to async.
             result = handler(job.payload)
         if save_result:
-            job.queue.save_result(job.id, result, ttl=result_ttl)
+            try:
+                job.queue.save_result(job.id, result, ttl=result_ttl)
+            except Exception:
+                # The handler already succeeded. Do not retry it and
+                # duplicate side effects just because result persistence
+                # failed or the return value was not JSON-serializable.
+                traceback.print_exc()
         job.ack()
     except asyncio.CancelledError:
         # Let the worker-loop unwind. Don't ack / retry — the job's
@@ -81,11 +87,18 @@ async def run_task(
         raise
     except asyncio.TimeoutError:
         delay = _compute_delay(retry_delay, backoff, job.attempts)
-        _retry_or_fail(job, retries, delay, "handler timeout")
+        # Include the configured timeout so dead-letter rows are
+        # diagnosable (matches decorated-task timeout wording).
+        msg = (
+            f"timeout after {timeout}s"
+            if timeout is not None
+            else "handler timeout"
+        )
+        _retry_or_fail(job, retries, delay, msg)
     except Retryable as r:
-        # Handler explicitly asked for a retry with a caller-chosen
-        # delay. Don't apply the default backoff formula.
-        job.retry(delay_s=r.delay_s, error=str(r))
+        # Handler-chosen delay, but still respect the attempt budget
+        # so Retryable cannot infinite-loop past retries=.
+        _retry_or_fail(job, retries, r.delay_s, str(r))
     except Exception as e:
         err = f"{e}\n{traceback.format_exc()}"
         delay = _compute_delay(retry_delay, backoff, job.attempts)

@@ -1,7 +1,7 @@
 //! Phase Mantle tests: schedule lifecycle (pause/resume/list/update)
 //! and queue cancel/get_job.
 
-use honker::{Database, EnqueueOpts, QueueOpts, ScheduledTask, ScheduleUpdate};
+use honker::{Database, EnqueueOpts, QueueOpts, ScheduleUpdate, ScheduledTask};
 use serde_json::json;
 
 fn open_db() -> (tempfile::TempDir, Database) {
@@ -26,14 +26,17 @@ fn schedule_list_round_trips_all_fields() {
         })
         .unwrap();
     sched
-        .add(ScheduledTask {
-            name: "hourly-sync".into(),
-            queue: "syncs".into(),
-            schedule: "@every 1h".into(),
-            payload: json!(null),
-            priority: 0,
-            expires_s: None,
-        })
+        .add_with_max_attempts(
+            ScheduledTask {
+                name: "hourly-sync".into(),
+                queue: "syncs".into(),
+                schedule: "@every 1h".into(),
+                payload: json!(null),
+                priority: 0,
+                expires_s: None,
+            },
+            9,
+        )
         .unwrap();
 
     let rows = sched.list().unwrap();
@@ -41,10 +44,40 @@ fn schedule_list_round_trips_all_fields() {
     let recap = rows.iter().find(|r| r.name == "daily-recap").unwrap();
     assert_eq!(recap.queue, "emails");
     assert_eq!(recap.priority, 3);
+    assert_eq!(recap.max_attempts, 3);
     assert!(recap.enabled);
     assert!(recap.next_fire_at > 0);
     let payload: serde_json::Value = serde_json::from_str(&recap.payload).unwrap();
     assert_eq!(payload["team"], "premier-league");
+
+    let sync = rows.iter().find(|r| r.name == "hourly-sync").unwrap();
+    assert_eq!(sync.max_attempts, 9);
+}
+
+#[test]
+fn schedule_update_max_attempts_round_trips() {
+    let (_tmp, db) = open_db();
+    let sched = db.scheduler();
+
+    sched
+        .add(ScheduledTask {
+            name: "hourly-sync".into(),
+            queue: "q".into(),
+            schedule: "@every 1s".into(),
+            payload: json!({"x": 1}),
+            priority: 0,
+            expires_s: None,
+        })
+        .unwrap();
+
+    assert!(sched.update_max_attempts("hourly-sync", 2).unwrap());
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "hourly-sync")
+        .unwrap();
+    assert_eq!(row.max_attempts, 2);
 }
 
 #[test]
@@ -66,13 +99,23 @@ fn pause_resume_idempotent() {
     assert!(!sched.pause("a").unwrap()); // idempotent
     assert!(!sched.pause("missing").unwrap());
 
-    let row = sched.list().unwrap().into_iter().find(|r| r.name == "a").unwrap();
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "a")
+        .unwrap();
     assert!(!row.enabled);
 
     assert!(sched.resume("a").unwrap());
     assert!(!sched.resume("a").unwrap()); // already enabled
 
-    let row = sched.list().unwrap().into_iter().find(|r| r.name == "a").unwrap();
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "a")
+        .unwrap();
     assert!(row.enabled);
 }
 
@@ -91,44 +134,60 @@ fn update_mutates_fields_and_recomputes_next_fire_at() {
         })
         .unwrap();
 
-    assert!(sched
-        .update(
-            "t",
-            ScheduleUpdate {
-                payload: Some(json!({"v": 99})),
-                priority: Some(5),
-                ..Default::default()
-            },
-        )
-        .unwrap());
-    let row = sched.list().unwrap().into_iter().find(|r| r.name == "t").unwrap();
+    assert!(
+        sched
+            .update(
+                "t",
+                ScheduleUpdate {
+                    payload: Some(json!({"v": 99})),
+                    priority: Some(5),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    );
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "t")
+        .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
     assert_eq!(payload["v"], 99);
     assert_eq!(row.priority, 5);
 
     let before = row.next_fire_at;
-    assert!(sched
-        .update(
-            "t",
-            ScheduleUpdate {
-                cron_expr: Some("*/5 * * * *".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap());
-    let row = sched.list().unwrap().into_iter().find(|r| r.name == "t").unwrap();
+    assert!(
+        sched
+            .update(
+                "t",
+                ScheduleUpdate {
+                    cron_expr: Some("*/5 * * * *".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    );
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "t")
+        .unwrap();
     assert_eq!(row.cron_expr, "*/5 * * * *");
     assert_ne!(row.next_fire_at, before);
 
-    assert!(!sched
-        .update(
-            "missing",
-            ScheduleUpdate {
-                payload: Some(json!({})),
-                ..Default::default()
-            },
-        )
-        .unwrap());
+    assert!(
+        !sched
+            .update(
+                "missing",
+                ScheduleUpdate {
+                    payload: Some(json!({})),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    );
 }
 
 #[test]
@@ -146,9 +205,19 @@ fn update_no_fields_is_noop() {
         })
         .unwrap();
 
-    let before: Vec<_> = sched.list().unwrap().into_iter().map(|r| r.next_fire_at).collect();
+    let before: Vec<_> = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.next_fire_at)
+        .collect();
     assert!(!sched.update("t", ScheduleUpdate::default()).unwrap());
-    let after: Vec<_> = sched.list().unwrap().into_iter().map(|r| r.next_fire_at).collect();
+    let after: Vec<_> = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.next_fire_at)
+        .collect();
     assert_eq!(before, after);
 }
 
@@ -176,7 +245,9 @@ fn queue_get_job_returns_row_misses_after_cancel() {
 fn cancel_processing_invalidates_ack() {
     let (_tmp, db) = open_db();
     let q = db.queue("emails", QueueOpts::default());
-    let id = q.enqueue(&json!({"to": "x"}), EnqueueOpts::default()).unwrap();
+    let id = q
+        .enqueue(&json!({"to": "x"}), EnqueueOpts::default())
+        .unwrap();
     let job = q.claim_one("worker-1").unwrap().unwrap();
     assert_eq!(job.id, id);
 
@@ -222,7 +293,9 @@ fn paused_schedule_does_not_emit_on_tick() {
 fn queue_get_job_misses_after_ack() {
     let (_tmp, db) = open_db();
     let q = db.queue("emails", QueueOpts::default());
-    let id = q.enqueue(&json!({"to": "x"}), EnqueueOpts::default()).unwrap();
+    let id = q
+        .enqueue(&json!({"to": "x"}), EnqueueOpts::default())
+        .unwrap();
 
     let job = q.claim_one("worker-1").unwrap().unwrap();
     assert_eq!(job.id, id);
@@ -256,7 +329,12 @@ fn update_payload_null_vs_omitted() {
             },
         )
         .unwrap();
-    let row = sched.list().unwrap().into_iter().find(|r| r.name == "t").unwrap();
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "t")
+        .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
     assert_eq!(payload, json!({"v": 1}));
     assert_eq!(row.priority, 7);
@@ -271,7 +349,12 @@ fn update_payload_null_vs_omitted() {
             },
         )
         .unwrap();
-    let row = sched.list().unwrap().into_iter().find(|r| r.name == "t").unwrap();
+    let row = sched
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "t")
+        .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
     assert!(payload.is_null());
 }

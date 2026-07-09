@@ -15,6 +15,18 @@ export interface ScheduledFire {
   job_id: number
 }
 
+export interface ScheduleRow {
+  name: string
+  queue: string
+  cron_expr: string
+  payload: string
+  priority: number
+  expires_s: number | null
+  next_fire_at: number
+  enabled: boolean
+  max_attempts: number
+}
+
 export interface StreamEvent {
   offset: number
   topic: string
@@ -44,6 +56,16 @@ export interface SchedulerAddOptions {
   payload: JsonValue
   priority?: number
   expiresS?: number | null
+  maxAttempts?: number
+}
+
+export interface SchedulerUpdateOptions {
+  schedule?: string | null
+  cron?: string | null
+  payload?: JsonValue
+  priority?: number | null
+  expiresS?: number | null
+  maxAttempts?: number | null
 }
 
 export class Transaction {
@@ -116,6 +138,10 @@ export class Listener implements AsyncIterableIterator<Notification> {
 export class Scheduler {
   add(opts: SchedulerAddOptions): number | null
   remove(name: string): number
+  pause(name: string): boolean
+  resume(name: string): boolean
+  list(): ScheduleRow[]
+  update(name: string, opts?: SchedulerUpdateOptions): boolean
   tick(now?: number): ScheduledFire[]
   soonest(): number | null
   run(owner: string, signal?: AbortSignal): Promise<void>

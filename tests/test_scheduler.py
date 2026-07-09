@@ -223,9 +223,8 @@ def test_scheduler_tick_skips_already_fired(db_path):
 
 def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
     """If the scheduler was down for multiple boundaries, tick walks
-    forward firing each one. Current behavior is to catch up
-    unbounded — fine for low-frequency schedules; for noisy ones
-    callers can use `expires` to drop stale catch-up jobs.
+    forward firing each one (within the catch-up cap). For noisy
+    schedules callers can use `expires` to drop stale catch-up jobs.
     """
     db = honker.open(db_path)
     db.queue("catchup-q")
@@ -260,6 +259,139 @@ def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
         "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='h'"
     )[0]
     assert int(row["next_fire_at"]) == orig_next + 3600
+
+
+def test_scheduler_register_defaults_to_three_max_attempts(db_path):
+    """Scheduler jobs default to a schedule-level attempt budget of 3.
+
+    Queue handles can have their own enqueue default; scheduled work is
+    cross-binding and uses Scheduler.add(max_attempts=...) for overrides.
+    """
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(
+        name="t",
+        queue="custom",
+        schedule=every_s(1),
+        payload={"x": 1},
+    )
+    row = db.query(
+        "SELECT max_attempts FROM _honker_scheduler_tasks WHERE name='t'"
+    )[0]
+    assert int(row["max_attempts"]) == 3
+    # Force due and tick.
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at = unixepoch() - 1 "
+            "WHERE name='t'"
+        )
+        tx.query("SELECT honker_scheduler_tick(unixepoch())")
+    job = db.query(
+        "SELECT max_attempts FROM _honker_live WHERE queue='custom'"
+    )[0]
+    assert int(job["max_attempts"]) == 3
+
+
+def test_scheduler_register_accepts_explicit_max_attempts(db_path):
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(
+        name="t",
+        queue="custom",
+        schedule=every_s(1),
+        payload={"x": 1},
+        max_attempts=4,
+    )
+    row = db.query(
+        "SELECT max_attempts FROM _honker_scheduler_tasks WHERE name='t'"
+    )[0]
+    assert int(row["max_attempts"]) == 4
+
+
+def test_scheduler_update_max_attempts_applies_to_future_fires(db_path):
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(name="t", queue="custom", schedule=every_s(1), payload={"x": 1})
+
+    assert sched.update("t", max_attempts=2) is True
+    row = sched.list()[0]
+    assert int(row["max_attempts"]) == 2
+
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at = unixepoch() - 1 "
+            "WHERE name='t'"
+        )
+        tx.query("SELECT honker_scheduler_tick(unixepoch())")
+    job = db.query(
+        "SELECT max_attempts FROM _honker_live WHERE queue='custom'"
+    )[0]
+    assert int(job["max_attempts"]) == 2
+
+
+def test_scheduler_update_max_attempts_null_resets_to_default(db_path):
+    db = honker.open(db_path)
+    db.queue("custom", max_attempts=7)
+    sched = Scheduler(db)
+    sched.add(
+        name="t",
+        queue="custom",
+        schedule=every_s(1),
+        payload={"x": 1},
+        max_attempts=5,
+    )
+
+    assert sched.update("t", max_attempts=None) is True
+    row = db.query(
+        "SELECT max_attempts FROM _honker_scheduler_tasks WHERE name='t'"
+    )[0]
+    assert int(row["max_attempts"]) == 3
+
+
+def test_scheduler_tick_caps_catchup_storm(db_path):
+    """A long outage on a high-frequency schedule must not enqueue
+    unbounded jobs in one tick. Cap is 64; remaining boundaries are
+    skipped and next_fire_at jumps past now.
+    """
+    db = honker.open(db_path)
+    db.queue("storm-q")
+    sched = Scheduler(db)
+    sched.add(
+        name="every-sec",
+        queue="storm-q",
+        schedule=every_s(1),
+    )
+    row = db.query(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='every-sec'"
+    )[0]
+    orig = int(row["next_fire_at"])
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at=? WHERE name='every-sec'",
+            [orig - 1000],
+        )
+    now = orig
+    with db.transaction() as tx:
+        result = tx.query("SELECT honker_scheduler_tick(?) AS j", [now])
+    fires = json.loads(result[0]["j"])
+    assert len(fires) == 64, f"expected cap of 64 fires, got {len(fires)}"
+    live = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_live WHERE queue='storm-q'"
+    )[0]["c"]
+    assert live == 64
+    row = db.query(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='every-sec'"
+    )[0]
+    next_at = int(row["next_fire_at"])
+    assert next_at > now
+    # Intermediate boundaries between the 64th fire and next_at are
+    # intentionally never enqueued (catch-up skip semantics).
+    fire_ats = sorted(int(f["fire_at"]) for f in fires)
+    assert fire_ats[-1] == orig - 1000 + 63
+    assert next_at == now + 1  # @every 1s: next_after(now)
 
 
 def test_scheduler_tick_racing_writers_produce_no_duplicates(db_path):
@@ -503,3 +635,137 @@ async def test_scheduler_run_proceeds_if_another_process_registered(db_path):
         "scheduler silently returned without acquiring the lock — "
         "regression of Phase Shakedown (b)"
     )
+
+
+async def test_scheduler_heartbeat_scoped_to_owner_exits_on_lock_steal(db_path):
+    """After another process steals the leader lock, the old leader's
+    heartbeat must fail (owner-scoped UPDATE) and stop the main loop
+    so it cannot keep firing alongside the new leader.
+
+    Regression: a name-only UPDATE would extend the *successor's* row
+    and the old leader would dual-fire forever.
+    """
+    db = honker.open(db_path)
+    q = db.queue("steal-q")
+    sched = Scheduler(db)
+    # Fast heartbeat so the test doesn't wait 30s.
+    sched.heartbeat_interval = 0.05
+    sched.lock_ttl = 60
+    # Far-future schedule so ticks don't enqueue noise; we only care
+    # that the leader exits after lock steal.
+    sched.add(
+        name="steal-task",
+        queue="steal-q",
+        schedule=crontab("0 0 1 1 *"),
+        payload={"k": 1},
+    )
+
+    stop = asyncio.Event()
+    run_task = asyncio.create_task(sched.run(stop_event=stop))
+
+    # Wait until the leader holds the lock.
+    deadline = time.time() + 2.0
+    owner = None
+    while time.time() < deadline:
+        rows = db.query(
+            "SELECT owner FROM _honker_locks WHERE name=?",
+            [sched.lock_name],
+        )
+        if rows:
+            owner = rows[0]["owner"]
+            break
+        await asyncio.sleep(0.01)
+    assert owner is not None, "leader never acquired the lock"
+
+    # Steal the lock: expire the old row, insert a new owner. This is
+    # what a standby does after TTL elapses.
+    with db.transaction() as tx:
+        tx.execute(
+            "DELETE FROM _honker_locks WHERE name=?",
+            [sched.lock_name],
+        )
+        tx.execute(
+            "INSERT INTO _honker_locks (name, owner, expires_at) "
+            "VALUES (?, 'thief', unixepoch() + 60)",
+            [sched.lock_name],
+        )
+
+    # Old leader's next tick/heartbeat must notice renew failure and
+    # raise LeadershipLost (not a silent return).
+    with pytest.raises(honker.LeadershipLost, match="lost"):
+        await asyncio.wait_for(run_task, timeout=3.0)
+
+    # Thief still holds the lock — old leader must not have released
+    # the thief's row (release is owner-scoped) or extended it under
+    # the old owner path.
+    rows = db.query(
+        "SELECT owner FROM _honker_locks WHERE name=?",
+        [sched.lock_name],
+    )
+    assert len(rows) == 1
+    assert rows[0]["owner"] == "thief"
+
+    # No accidental enqueues from dual-fire.
+    live = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_live WHERE queue='steal-q'"
+    )[0]["c"]
+    assert live == 0
+    del q
+
+
+async def test_scheduler_heartbeat_extends_own_ttl(db_path):
+    """Happy path: heartbeat refreshes expires_at for the leader's
+    own owner token so long sleeps don't drop leadership.
+    """
+    db = honker.open(db_path)
+    db.queue("hb-q")
+    sched = Scheduler(db)
+    sched.heartbeat_interval = 0.05
+    sched.lock_ttl = 30
+    sched.add(
+        name="hb-task",
+        queue="hb-q",
+        schedule=crontab("0 0 1 1 *"),
+    )
+
+    stop = asyncio.Event()
+    run_task = asyncio.create_task(sched.run(stop_event=stop))
+
+    # Wait for lock acquisition.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        rows = db.query(
+            "SELECT owner, expires_at FROM _honker_locks WHERE name=?",
+            [sched.lock_name],
+        )
+        if rows:
+            break
+        await asyncio.sleep(0.01)
+    assert rows, "leader never acquired the lock"
+    first_exp = int(rows[0]["expires_at"])
+
+    # Force expires_at near now; next heartbeat should push it out.
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_locks SET expires_at = unixepoch() + 2 "
+            "WHERE name=?",
+            [sched.lock_name],
+        )
+
+    # Wait for at least one heartbeat cycle.
+    await asyncio.sleep(0.2)
+    rows = db.query(
+        "SELECT expires_at FROM _honker_locks WHERE name=?",
+        [sched.lock_name],
+    )
+    assert rows, "lock vanished during heartbeat"
+    new_exp = int(rows[0]["expires_at"])
+    # Should be roughly now + lock_ttl (30), not ~now+2.
+    assert new_exp >= first_exp - 5  # not collapsed
+    import time as _time
+    assert new_exp >= int(_time.time()) + 20, (
+        f"heartbeat did not extend TTL; expires_at={new_exp}"
+    )
+
+    stop.set()
+    await asyncio.wait_for(run_task, timeout=3.0)

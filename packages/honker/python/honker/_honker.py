@@ -6,6 +6,16 @@ import uuid
 from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional
 
+# Queue / outbox defaults. Sentinels distinguish "caller omitted the
+# option" (pure lookup of a memoized instance) from "caller passed the
+# numeric default explicitly" (must match existing options).
+DEFAULT_VISIBILITY_TIMEOUT_S = 300
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_OUTBOX_MAX_ATTEMPTS = 5
+DEFAULT_OUTBOX_BASE_BACKOFF_S = 5
+DEFAULT_OUTBOX_VISIBILITY_TIMEOUT_S = 60
+_UNSET = object()
+
 
 def _core_open(path, max_readers, watcher_backend=None, watcher_poll_interval_ms=None):
     from honker._honker_native import open as _open
@@ -259,6 +269,7 @@ class Queue:
         delay: Optional[float] = None,
         priority: int = 0,
         expires: Optional[float] = None,
+        max_attempts: Optional[int] = None,
     ) -> int:
         """Insert one job row. Returns the inserted `id` (primary key
         in `_honker_live`). Delegates to `honker_enqueue`, which handles
@@ -274,6 +285,10 @@ class Queue:
         `expires`: seconds from now. Claim path filters expired rows;
         `queue.sweep_expired()` moves them into `_honker_dead`.
 
+        `max_attempts`: per-job attempt budget. Defaults to the queue's
+        `max_attempts`. Decorated tasks pass `@task(retries=N)` here so
+        the SQL claim/retry path and the worker path share one budget.
+
         For bulk inserts with one commit + one cross-process wake,
         pass a shared `tx`:
 
@@ -286,10 +301,13 @@ class Queue:
         run_at_val = int(run_at) if run_at is not None else None
         delay_val = int(delay) if delay is not None else None
         expires_val = int(expires) if expires is not None else None
+        attempts_val = (
+            int(max_attempts) if max_attempts is not None else self.max_attempts
+        )
         sql = "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?) AS id"
         params = [
             self.name, payload_str, run_at_val, delay_val,
-            int(priority), self.max_attempts, expires_val,
+            int(priority), attempts_val, expires_val,
         ]
         if tx is not None:
             rows = tx.query(sql, params)
@@ -922,6 +940,13 @@ class LockHeld(Exception):
     """
 
 
+class LeadershipLost(Exception):
+    """Raised by `Scheduler.run()` when the leader lock was stolen
+    (TTL elapsed and another process acquired it). Distinct from a
+    clean stop via `stop_event` or an empty schedule table.
+    """
+
+
 class _Lock:
     """Context manager returned by `Database.lock(name, ttl=60)`.
 
@@ -955,6 +980,21 @@ class _Lock:
                 raise LockHeld(f"lock {self.name!r} is already held")
             self.acquired = True
         return self
+
+    def renew(self, ttl: Optional[int] = None) -> bool:
+        """Extend `expires_at` for this owner. Returns True iff we still
+        hold the lock. False means the TTL elapsed and another owner
+        acquired it (or the row was released).
+        """
+        if not self.acquired:
+            return False
+        ttl_s = int(ttl) if ttl is not None else self.ttl
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_lock_renew(?, ?, ?) AS r",
+                [self.name, self.owner, ttl_s],
+            )
+        return bool(rows[0]["r"])
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         if self.acquired:
@@ -1134,13 +1174,19 @@ class Database:
     def queue(
         self,
         name: str,
-        visibility_timeout_s: int = 300,
-        max_attempts: int = 3,
+        visibility_timeout_s=_UNSET,
+        max_attempts=_UNSET,
     ) -> Queue:
-        """Get (or lazily create) the queue named `name`.
+        """Return a memoized Queue for `name`.
 
-        Handles are cached per name, so repeated calls are cheap and return
-        the same object.
+        Options apply only on first open. Subsequent calls:
+
+          * `db.queue(name)` with no options — pure lookup of the
+            existing instance (used by `run_workers`).
+          * Same options as first open — return the memoized instance.
+          * Different options — raise `ValueError`. Explicit defaults
+            (e.g. `max_attempts=3`) still count as specified options
+            and must match; they are not treated as lookup.
 
         IMPORTANT — construct outside an open transaction. The *first* call
         for a given name initializes the queue's schema in its own
@@ -1160,13 +1206,38 @@ class Database:
         only first construction runs the schema init.)
         """
         existing = self._queues.get(name)
+        lookup_only = (
+            visibility_timeout_s is _UNSET and max_attempts is _UNSET
+        )
+        vt = (
+            DEFAULT_VISIBILITY_TIMEOUT_S
+            if visibility_timeout_s is _UNSET
+            else int(visibility_timeout_s)
+        )
+        ma = (
+            DEFAULT_MAX_ATTEMPTS
+            if max_attempts is _UNSET
+            else int(max_attempts)
+        )
         if existing is not None:
+            if lookup_only:
+                return existing
+            if (
+                existing.visibility_timeout_s != vt
+                or existing.max_attempts != ma
+            ):
+                raise ValueError(
+                    f"queue {name!r} already opened with "
+                    f"visibility_timeout_s={existing.visibility_timeout_s}, "
+                    f"max_attempts={existing.max_attempts}; "
+                    f"got visibility_timeout_s={vt}, max_attempts={ma}"
+                )
             return existing
         q = Queue(
             self,
             name,
-            visibility_timeout_s=visibility_timeout_s,
-            max_attempts=max_attempts,
+            visibility_timeout_s=vt,
+            max_attempts=ma,
         )
         self._queues[name] = q
         return q
@@ -1191,12 +1262,27 @@ class Database:
         self,
         name: str,
         delivery: Callable,
-        max_attempts: int = 5,
-        base_backoff_s: int = 5,
-        visibility_timeout_s: int = 60,
+        max_attempts: int = DEFAULT_OUTBOX_MAX_ATTEMPTS,
+        base_backoff_s: int = DEFAULT_OUTBOX_BASE_BACKOFF_S,
+        visibility_timeout_s: int = DEFAULT_OUTBOX_VISIBILITY_TIMEOUT_S,
     ) -> Outbox:
+        max_attempts = int(max_attempts)
+        base_backoff_s = int(base_backoff_s)
+        visibility_timeout_s = int(visibility_timeout_s)
+        if not callable(delivery):
+            raise TypeError("delivery must be callable")
         existing = self._outboxes.get(name)
         if existing is not None:
+            if (
+                existing.max_attempts != max_attempts
+                or existing.base_backoff_s != base_backoff_s
+                or existing._queue.visibility_timeout_s != visibility_timeout_s
+                or existing.delivery is not delivery
+            ):
+                raise ValueError(
+                    f"outbox {name!r} already opened with different options "
+                    f"or a different delivery callable"
+                )
             return existing
         o = Outbox(
             self,
