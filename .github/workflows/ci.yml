@@ -297,7 +297,7 @@ jobs:
       - name: Test (basic — node only)
         working-directory: packages/honker-node
         shell: bash
-        run: node --test test/basic.js
+        run: node --test test/api.test.js test/basic.js
       - name: Test (parity — node API surface)
         working-directory: packages/honker-node
         shell: bash
