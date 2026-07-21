@@ -79,6 +79,11 @@ export class Transaction {
 
 export class UpdateEvents {
   raw(): any
+  /** Wait for the next database update. Resolves on the next commit;
+   *  rejects when the watcher dies or close() cuts the subscription.
+   *  Concurrent calls share one native wait and settle together, so
+   *  racing next() against your own timeout never starts extra native
+   *  waits. */
   next(): Promise<void>
   close(): void
 }
