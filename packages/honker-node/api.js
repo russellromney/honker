@@ -36,29 +36,44 @@ function aborted(signal) {
 }
 
 function abortPromise(signal) {
-  if (!signal) return new Promise(() => {});
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
+  // Every caller must cancel() once its race settles: an { once: true }
+  // listener is only removed by the platform when abort actually fires,
+  // so without cancel() each poll timeout would leak one listener on
+  // the signal until it aborts (issue #67).
+  if (!signal) return { promise: new Promise(() => {}), cancel() {} };
+  if (signal.aborted) return { promise: Promise.resolve(), cancel() {} };
+  let onAbort;
+  const promise = new Promise((resolve) => {
+    onAbort = resolve;
     signal.addEventListener('abort', resolve, { once: true });
   });
+  return {
+    promise,
+    cancel() {
+      signal.removeEventListener('abort', onAbort);
+    },
+  };
 }
 
 async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
   if (aborted(signal)) return;
-  const wait = updateEvents._subscribe();
+  // A dead watcher never fires again (UpdateEvents._settle records
+  // native-wait failures): skip the event wait and degrade to plain
+  // poll cadence instead of hot-looping on instantly-rejecting waits.
+  const wait = updateEvents._dead == null ? updateEvents._subscribe() : null;
+  const onAbort = abortPromise(signal);
   try {
     // Waiter promises reject on watcher death / close(); internal wait
     // loops treat that as an ordinary wake (they re-check their closed
     // flags and exit), so swallow it here.
-    const settled = wait.promise.catch(() => undefined);
-    if (timeoutMs == null) {
-      await Promise.race([settled, abortPromise(signal)]);
-      return;
-    }
-    const ms = Math.max(0, timeoutMs);
-    await Promise.race([settled, delay(ms), abortPromise(signal)]);
+    const racers = [];
+    if (wait) racers.push(wait.promise.catch(() => undefined));
+    if (timeoutMs != null) racers.push(delay(Math.max(0, timeoutMs)));
+    racers.push(onAbort.promise);
+    await Promise.race(racers);
   } finally {
-    wait.cancel();
+    if (wait) wait.cancel();
+    onAbort.cancel();
   }
 }
 
@@ -113,6 +128,12 @@ class UpdateEvents {
     // has no cancellation, and the alternative is a thread per wait.
     this._pending = null;
     this._waiters = new Set();
+    // Set when the native wait fails (watcher death — close() is
+    // checked first and takes precedence). The subscription can never
+    // fire again: the shared watcher's sender is gone, and a fresh
+    // native next() would reject instantly. Internal wait loops check
+    // this to degrade to poll cadence instead of hot-looping.
+    this._dead = null;
   }
 
   raw() {
@@ -130,6 +151,9 @@ class UpdateEvents {
   _subscribe() {
     if (this._closed) {
       return { promise: Promise.resolve(), cancel() {} };
+    }
+    if (this._dead != null) {
+      return { promise: Promise.reject(this._dead), cancel() {} };
     }
     if (!this._pending) {
       const pending = this._ev.next().then(
@@ -154,6 +178,7 @@ class UpdateEvents {
   _settle(pending, err) {
     if (this._pending !== pending) return;
     this._pending = null;
+    if (err != null) this._dead = err;
     const waiters = [...this._waiters];
     this._waiters.clear();
     for (const w of waiters) {
@@ -519,7 +544,11 @@ class StreamSubscription {
         this._maybeSaveOffset();
         return { done: false, value: event };
       }
-      await this._updates.next().catch(() => undefined);
+      // 1 s fallback poll: while the watcher is live the event wait
+      // wins every race, so this costs nothing; when the watcher is
+      // dead it bounds the loop to poll cadence instead of spinning
+      // on instantly-rejecting waits.
+      await waitForUpdateOrTimeout(this._updates, null, 1000);
     }
     return { done: true, value: undefined };
   }

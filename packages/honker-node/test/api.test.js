@@ -200,6 +200,122 @@ test('listener wakes on notify after fallback poll timeouts', async () => {
   }
 });
 
+test('poll timeouts remove their abort listeners', async () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  const db = open(dbPath);
+  try {
+    const q = db.queue('q');
+    const waker = q.claimWaker({ idlePollS: 0.001 });
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), 200);
+
+    // Count listeners on the real AbortSignal. Every poll iteration
+    // subscribes to 'abort'; losing the race to the timeout must
+    // remove that listener again (issue #67).
+    let added = 0;
+    let removed = 0;
+    const signal = controller.signal;
+    const realAdd = signal.addEventListener.bind(signal);
+    const realRemove = signal.removeEventListener.bind(signal);
+    signal.addEventListener = (...args) => {
+      added += 1;
+      return realAdd(...args);
+    };
+    signal.removeEventListener = (...args) => {
+      removed += 1;
+      return realRemove(...args);
+    };
+
+    try {
+      await waker.next('worker', { signal });
+    } finally {
+      clearTimeout(abortTimer);
+      waker.close();
+    }
+
+    assert.ok(added >= 2, `expected several poll iterations, saw ${added}`);
+    // The listener whose abort fires is auto-removed by the platform
+    // (once: true) without a removeEventListener call — allow that one.
+    assert.ok(
+      added - removed <= 1,
+      `${added - removed} abort listeners leaked across poll timeouts`
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('watcher death degrades wait loops to poll cadence', {
+  // Same trigger as the watcher-death contract tests: atomically
+  // replace the db file so the watcher thread panics and dies.
+  skip: process.platform === 'win32' ? 'rename-over-open denied on Windows' : false,
+}, async () => {
+  const fs = require('node:fs');
+  const { path: dbPath, open, cleanup } = tmpdb();
+  const db = open(dbPath);
+  try {
+    const tx = db.transaction();
+    tx.execute('CREATE TABLE _warm (i INTEGER)');
+    tx.commit();
+    await delay(100);
+
+    const updates = db.updateEvents();
+    const replacement = `${dbPath}.replacement`;
+    fs.writeFileSync(replacement, '');
+    fs.renameSync(replacement, dbPath);
+
+    // Public contract: next() rejects once the watcher dies (an
+    // ordinary wake may come first — keep awaiting until rejection).
+    let raised = false;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && !raised) {
+      const result = await updates.next().then(() => null, (e) => e);
+      if (result instanceof Error) raised = true;
+    }
+    assert.ok(raised, 'next() must reject after watcher death');
+    assert.ok(updates._dead, 'the death is recorded on the subscription');
+
+    // The wait loops must fall back to poll cadence. Count real
+    // claimOne calls over one abort window: poll cadence (200 ms)
+    // means ~3 calls; a hot loop on instantly-rejecting waits means
+    // thousands. After the replace the db itself may or may not still
+    // answer (the panic message says to reopen) — that's out of scope
+    // here, so the loop's own SQL calls are made error-tolerant; only
+    // their cadence is under test.
+    const q = db.queue('q');
+    const tolerant = (fn, fallback) => (...args) => {
+      try {
+        return fn(...args);
+      } catch {
+        return fallback;
+      }
+    };
+    q._nextClaimAt = tolerant(q._nextClaimAt.bind(q), null);
+    let claims = 0;
+    const realClaimOne = q.claimOne.bind(q);
+    q.claimOne = tolerant((workerId) => {
+      claims += 1;
+      return realClaimOne(workerId);
+    }, null);
+    const waker = q.claimWaker({ idlePollS: 0.2 });
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), 500);
+    try {
+      const result = await waker.next('worker', { signal: controller.signal });
+      assert.equal(result, null);
+    } finally {
+      clearTimeout(abortTimer);
+      waker.close();
+    }
+    assert.ok(
+      claims <= 8,
+      `${claims} claimOne calls in 500 ms — a hot loop would make thousands`
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test('no unhandled promise rejections from shared waits', async () => {
   // Last test in the file (node --test runs top-level tests in order):
   // gives any stray rejection from the scenarios above time to surface.
