@@ -43,18 +43,34 @@ function abortPromise(signal) {
   });
 }
 
+const pendingUpdateWaits = new WeakMap();
+
+function nextUpdate(updateEvents) {
+  const existing = pendingUpdateWaits.get(updateEvents);
+  if (existing) return existing;
+
+  const pending = updateEvents.next().catch(() => undefined);
+  pendingUpdateWaits.set(updateEvents, pending);
+  void pending.finally(() => {
+    if (pendingUpdateWaits.get(updateEvents) === pending) {
+      pendingUpdateWaits.delete(updateEvents);
+    }
+  });
+  return pending;
+}
+
 async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
   if (aborted(signal)) return;
   if (timeoutMs == null) {
     await Promise.race([
-      updateEvents.next().catch(() => undefined),
+      nextUpdate(updateEvents),
       abortPromise(signal),
     ]);
     return;
   }
   const ms = Math.max(0, timeoutMs);
   await Promise.race([
-    updateEvents.next().catch(() => undefined),
+    nextUpdate(updateEvents),
     delay(ms),
     abortPromise(signal),
   ]);
