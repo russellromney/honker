@@ -43,37 +43,61 @@ function abortPromise(signal) {
   });
 }
 
+// One pending native UpdateEvents.next() per source, reused across poll
+// timeouts: Promise.race does not cancel its losers, and each abandoned
+// native next() pins a Tokio blocking-pool thread until the next commit.
+// Callers subscribe their own promise via the record's waiter set and
+// MUST cancel() when their race settles another way — racing the cached
+// promise directly would retain one settled-race closure per poll until
+// the next commit (unbounded growth while the database stays idle).
+//
+// While no commit arrives, the single pending native wait holds its one
+// blocking thread even between waker.next() calls (e.g. during job
+// processing). That residual thread is deliberate: native next() has no
+// cancellation, and the pre-fix alternative leaked one thread per poll.
 const pendingUpdateWaits = new WeakMap();
 
 function nextUpdate(updateEvents) {
-  const existing = pendingUpdateWaits.get(updateEvents);
-  if (existing) return existing;
-
-  const pending = updateEvents.next().catch(() => undefined);
-  pendingUpdateWaits.set(updateEvents, pending);
-  void pending.finally(() => {
-    if (pendingUpdateWaits.get(updateEvents) === pending) {
-      pendingUpdateWaits.delete(updateEvents);
-    }
+  let record = pendingUpdateWaits.get(updateEvents);
+  if (!record) {
+    record = { waiters: new Set() };
+    pendingUpdateWaits.set(updateEvents, record);
+    const settle = () => {
+      if (pendingUpdateWaits.get(updateEvents) === record) {
+        pendingUpdateWaits.delete(updateEvents);
+      }
+      const waiters = [...record.waiters];
+      record.waiters.clear();
+      for (const resolve of waiters) resolve();
+    };
+    void updateEvents.next().then(settle, settle);
+  }
+  let resolveWait;
+  const promise = new Promise((resolve) => {
+    resolveWait = resolve;
   });
-  return pending;
+  record.waiters.add(resolveWait);
+  return {
+    promise,
+    cancel() {
+      record.waiters.delete(resolveWait);
+    },
+  };
 }
 
 async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
   if (aborted(signal)) return;
-  if (timeoutMs == null) {
-    await Promise.race([
-      nextUpdate(updateEvents),
-      abortPromise(signal),
-    ]);
-    return;
+  const wait = nextUpdate(updateEvents);
+  try {
+    if (timeoutMs == null) {
+      await Promise.race([wait.promise, abortPromise(signal)]);
+      return;
+    }
+    const ms = Math.max(0, timeoutMs);
+    await Promise.race([wait.promise, delay(ms), abortPromise(signal)]);
+  } finally {
+    wait.cancel();
   }
-  const ms = Math.max(0, timeoutMs);
-  await Promise.race([
-    nextUpdate(updateEvents),
-    delay(ms),
-    abortPromise(signal),
-  ]);
 }
 
 function unwrapTx(tx) {
@@ -883,3 +907,8 @@ module.exports = function buildApi(nativeBinding) {
     NativeUpdateEvents: nativeBinding.UpdateEvents,
   };
 };
+
+// Test-only handle for observing shared wait bookkeeping (api.test.js).
+// Attached to the buildApi function itself so the exported API surface
+// (and parity tests) stay unchanged.
+module.exports._pendingUpdateWaits = pendingUpdateWaits;
