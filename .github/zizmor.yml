@@ -29,3 +29,9 @@ rules:
       # workflow only builds proof artifacts. Publishing remains local.
       - release-node.yml
       - release-bun.yml
+  adhoc-packages:
+    ignore:
+      # The smoke tests install the tarballs/gems the same job just
+      # built — there is no lockfile for an artifact produced in-job.
+      - release-node.yml
+      - release-ruby.yml
