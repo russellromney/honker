@@ -61,6 +61,11 @@ async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
   // native-wait failures): skip the event wait and degrade to plain
   // poll cadence instead of hot-looping on instantly-rejecting waits.
   const wait = updateEvents._dead == null ? updateEvents._subscribe() : null;
+  // An event-only wait (timeoutMs == null) on a dead watcher could
+  // never settle — not even close() would wake it, since there is no
+  // parked waiter left to reject. Degrade it to a 1 s cadence so the
+  // wait loops keep re-checking their closed/abort flags.
+  const effectiveMs = wait == null && timeoutMs == null ? 1000 : timeoutMs;
   const onAbort = abortPromise(signal);
   try {
     // Waiter promises reject on watcher death / close(); internal wait
@@ -68,7 +73,7 @@ async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
     // flags and exit), so swallow it here.
     const racers = [];
     if (wait) racers.push(wait.promise.catch(() => undefined));
-    if (timeoutMs != null) racers.push(delay(Math.max(0, timeoutMs)));
+    if (effectiveMs != null) racers.push(delay(Math.max(0, effectiveMs)));
     racers.push(onAbort.promise);
     await Promise.race(racers);
   } finally {

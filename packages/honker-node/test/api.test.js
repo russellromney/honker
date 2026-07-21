@@ -316,6 +316,64 @@ test('watcher death degrades wait loops to poll cadence', {
   }
 });
 
+test('event-only waker still exits after watcher death', {
+  // Regression: a waker with idlePollS null parked before the watcher
+  // dies re-waits on the dead path, where an event-only wait could
+  // never settle — close() could not wake it (hang). The dead path
+  // degrades null timeouts to a 1 s cadence instead.
+  skip: process.platform === 'win32' ? 'rename-over-open denied on Windows' : false,
+  timeout: 15000,
+}, async () => {
+  const fs = require('node:fs');
+  const { path: dbPath, open, cleanup } = tmpdb();
+  const db = open(dbPath);
+  try {
+    const tx = db.transaction();
+    tx.execute('CREATE TABLE _warm (i INTEGER)');
+    tx.commit();
+    await delay(100);
+
+    const q = db.queue('q');
+    // The replace may leave the db itself broken (disk I/O error on
+    // later reads) — out of scope here; only the wait cadence is
+    // under test, so the loop's SQL calls are made error-tolerant.
+    const tolerant = (fn, fallback) => (...args) => {
+      try {
+        return fn(...args);
+      } catch {
+        return fallback;
+      }
+    };
+    q._nextClaimAt = tolerant(q._nextClaimAt.bind(q), null);
+    q.claimOne = tolerant(q.claimOne.bind(q), null);
+    const waker = q.claimWaker({ idlePollS: null }); // event-only, no signal
+    const parked = waker.next('worker');
+    await delay(100); // waker is parked in its event wait
+
+    const replacement = `${dbPath}.replacement`;
+    fs.writeFileSync(replacement, '');
+    fs.renameSync(replacement, dbPath);
+
+    // Wait for the death to reach the waker's own subscription.
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && waker._updates._dead == null) {
+      await delay(50);
+    }
+    assert.ok(waker._updates._dead, 'watcher death reached the waker');
+
+    const started = Date.now();
+    waker.close();
+    const result = await parked;
+    assert.equal(result, null);
+    assert.ok(
+      Date.now() - started < 5000,
+      'close() must unblock an event-only wait on a dead watcher'
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test('no unhandled promise rejections from shared waits', async () => {
   // Last test in the file (node --test runs top-level tests in order):
   // gives any stray rejection from the scenarios above time to surface.
