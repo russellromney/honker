@@ -43,58 +43,20 @@ function abortPromise(signal) {
   });
 }
 
-// One pending native UpdateEvents.next() per source, reused across poll
-// timeouts: Promise.race does not cancel its losers, and each abandoned
-// native next() pins a Tokio blocking-pool thread until the next commit.
-// Callers subscribe their own promise via the record's waiter set and
-// MUST cancel() when their race settles another way — racing the cached
-// promise directly would retain one settled-race closure per poll until
-// the next commit (unbounded growth while the database stays idle).
-//
-// While no commit arrives, the single pending native wait holds its one
-// blocking thread even between waker.next() calls (e.g. during job
-// processing). That residual thread is deliberate: native next() has no
-// cancellation, and the pre-fix alternative leaked one thread per poll.
-const pendingUpdateWaits = new WeakMap();
-
-function nextUpdate(updateEvents) {
-  let record = pendingUpdateWaits.get(updateEvents);
-  if (!record) {
-    record = { waiters: new Set() };
-    pendingUpdateWaits.set(updateEvents, record);
-    const settle = () => {
-      if (pendingUpdateWaits.get(updateEvents) === record) {
-        pendingUpdateWaits.delete(updateEvents);
-      }
-      const waiters = [...record.waiters];
-      record.waiters.clear();
-      for (const resolve of waiters) resolve();
-    };
-    void updateEvents.next().then(settle, settle);
-  }
-  let resolveWait;
-  const promise = new Promise((resolve) => {
-    resolveWait = resolve;
-  });
-  record.waiters.add(resolveWait);
-  return {
-    promise,
-    cancel() {
-      record.waiters.delete(resolveWait);
-    },
-  };
-}
-
 async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
   if (aborted(signal)) return;
-  const wait = nextUpdate(updateEvents);
+  const wait = updateEvents._subscribe();
   try {
+    // Waiter promises reject on watcher death / close(); internal wait
+    // loops treat that as an ordinary wake (they re-check their closed
+    // flags and exit), so swallow it here.
+    const settled = wait.promise.catch(() => undefined);
     if (timeoutMs == null) {
-      await Promise.race([wait.promise, abortPromise(signal)]);
+      await Promise.race([settled, abortPromise(signal)]);
       return;
     }
     const ms = Math.max(0, timeoutMs);
-    await Promise.race([wait.promise, delay(ms), abortPromise(signal)]);
+    await Promise.race([settled, delay(ms), abortPromise(signal)]);
   } finally {
     wait.cancel();
   }
@@ -138,15 +100,76 @@ class UpdateEvents {
   constructor(ev) {
     this._ev = ev;
     this._closed = false;
+    // One pending native wait shared by every concurrent waiter. The
+    // native next() parks a Tokio blocking-pool thread on recv() until
+    // the next commit or close(), and it cannot be cancelled — so every
+    // abandoned next() (Promise.race losers, in particular) would pin
+    // one more OS thread for the life of an idle database. Sharing the
+    // wait means N concurrent next() calls cost one thread total.
+    //
+    // While no commit arrives, the single pending wait holds its one
+    // thread even between waker.next() calls (e.g. during job
+    // processing). That residual thread is deliberate: the native wait
+    // has no cancellation, and the alternative is a thread per wait.
+    this._pending = null;
+    this._waiters = new Set();
   }
 
   raw() {
     return this._ev;
   }
 
+  // Internal: subscribe to the shared native wait. The promise
+  // RESOLVES on the next update and REJECTS when the native wait fails
+  // (watcher death, close()) — same contract as awaiting next().
+  // Callers that race the returned promise MUST cancel() when their
+  // race settles another way — otherwise each abandoned race leaves
+  // its waiter in the set until the wait settles (bounded by poll
+  // rate × idle time; waitForUpdateOrTimeout cancels, keeping the set
+  // at one entry per in-flight wait).
+  _subscribe() {
+    if (this._closed) {
+      return { promise: Promise.resolve(), cancel() {} };
+    }
+    if (!this._pending) {
+      const pending = this._ev.next().then(
+        () => this._settle(pending, null),
+        (err) => this._settle(pending, err),
+      );
+      this._pending = pending;
+    }
+    let waiter;
+    const promise = new Promise((resolve, reject) => {
+      waiter = { resolve, reject };
+    });
+    this._waiters.add(waiter);
+    return {
+      promise,
+      cancel: () => {
+        this._waiters.delete(waiter);
+      },
+    };
+  }
+
+  _settle(pending, err) {
+    if (this._pending !== pending) return;
+    this._pending = null;
+    const waiters = [...this._waiters];
+    this._waiters.clear();
+    for (const w of waiters) {
+      if (err == null) w.resolve();
+      else w.reject(err);
+    }
+  }
+
+  /** Wait for the next database update. Resolves on the next commit;
+   *  rejects when the watcher dies or close() cuts the subscription.
+   *  Concurrent calls share one native wait and settle together — a
+   *  wake is a "go re-read state" hint, not a per-caller event — so
+   *  racing next() against your own timeout never starts extra native
+   *  waits. */
   async next() {
-    if (this._closed) return;
-    await this._ev.next();
+    await this._subscribe().promise;
   }
 
   close() {
@@ -907,8 +930,3 @@ module.exports = function buildApi(nativeBinding) {
     NativeUpdateEvents: nativeBinding.UpdateEvents,
   };
 };
-
-// Test-only handle for observing shared wait bookkeeping (api.test.js).
-// Attached to the buildApi function itself so the exported API surface
-// (and parity tests) stay unchanged.
-module.exports._pendingUpdateWaits = pendingUpdateWaits;
