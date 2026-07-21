@@ -32,7 +32,7 @@ jobs:
   package-proof:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
           # Don't leave the GITHUB_TOKEN in `.git/config` for later
           # steps to scoop up.
