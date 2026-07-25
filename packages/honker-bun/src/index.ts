@@ -1030,7 +1030,11 @@ async function* subscribeImpl(
         continue;
       }
       for (const ev of events) {
-        yield ev;
+        // Advance BEFORE the yield: if the consumer breaks or throws
+        // after receiving this event, the offset (and any periodic
+        // save) must already reflect it — otherwise the finally-flush
+        // saves the previous offset and the event is re-delivered on
+        // the next subscribe.
         lastOffset = ev.offset;
         const enoughEvents = saveEveryN > 0 && lastOffset - lastSaved >= saveEveryN;
         const enoughTime = saveEveryS > 0 && Date.now() - lastSaveAt >= saveEveryS * 1000;
@@ -1039,6 +1043,7 @@ async function* subscribeImpl(
           lastSaved = lastOffset;
           lastSaveAt = Date.now();
         }
+        yield ev;
       }
     }
   } finally {
