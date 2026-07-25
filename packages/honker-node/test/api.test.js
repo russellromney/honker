@@ -174,7 +174,7 @@ test('UpdateEvents.next() rejects when closed mid-wait', async () => {
     const pending = updates.next();
     await delay(50); // let the native wait park
     updates.close();
-    await assert.rejects(pending);
+    await assert.rejects(pending, /watcher died|closed/i);
   } finally {
     cleanup();
   }
@@ -267,12 +267,18 @@ test('watcher death degrades wait loops to poll cadence', {
     // Public contract: next() rejects once the watcher dies (an
     // ordinary wake may come first — keep awaiting until rejection).
     let raised = false;
+    let result = null;
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline && !raised) {
-      const result = await updates.next().then(() => null, (e) => e);
+      result = await updates.next().then(() => null, (e) => e);
       if (result instanceof Error) raised = true;
     }
     assert.ok(raised, 'next() must reject after watcher death');
+    assert.match(
+      String(result && result.message),
+      /watcher died/i,
+      'rejection must be identifiable as watcher death'
+    );
     assert.ok(updates._dead, 'the death is recorded on the subscription');
 
     // The wait loops must fall back to poll cadence. Count real
