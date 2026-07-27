@@ -1213,19 +1213,18 @@ class Database:
             conditions.append("created_at < unixepoch() - ?")
             params.append(int(older_than_s))
         if max_keep is not None:
-            # Pre-compute MAX(id) once instead of a subquery the
-            # planner might (or might not) hoist out of the DELETE
-            # predicate. Also correctly handles an empty table and
-            # a max_keep larger than the current row count — both
-            # devolve to "nothing qualifies for id-based deletion."
-            rows = self.query(
-                "SELECT MAX(id) AS m FROM _honker_notifications"
+            # Use a subquery so MAX(id) is evaluated atomically
+            # inside the DELETE, avoiding a TOCTOU race where rows
+            # inserted between a separate SELECT and the DELETE
+            # would cause the wrong number of rows to be removed.
+            # COALESCE handles an empty table (MAX returns NULL)
+            # and when max_keep >= row count the subtraction goes
+            # negative, matching zero rows — both are safe no-ops.
+            conditions.append(
+                "id <= (SELECT COALESCE(MAX(id), 0) - ? "
+                "FROM _honker_notifications)"
             )
-            max_id = rows[0]["m"] if rows and rows[0]["m"] is not None else 0
-            threshold = max_id - int(max_keep)
-            if threshold >= 1:
-                conditions.append("id <= ?")
-                params.append(threshold)
+            params.append(int(max_keep))
         if not conditions:
             return 0
         with self.transaction() as tx:
