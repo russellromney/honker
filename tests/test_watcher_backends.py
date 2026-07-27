@@ -82,7 +82,23 @@ async def _drive_commits_and_count_wakes(db, n: int, spacing_ms: int) -> int:
     "backend",
     [
         None,        # default polling — control
-        "kernel",    # Phase 003
+        pytest.param(
+            "kernel",  # Phase 003
+            marks=pytest.mark.xfail(
+                sys.platform == "win32",
+                reason=(
+                    "kernel-watcher's contract explicitly permits missed "
+                    "wakes (see honker-core/src/kernel_watcher.rs), and "
+                    "ReadDirectoryChangesW delivers nothing at all for "
+                    "some CI runs — observed 0 wakes for 4 commits inside "
+                    "a 2.6 s window. The backend is not proven on Windows; "
+                    "say so rather than fudging the threshold until it "
+                    "passes. Non-strict so a run that does deliver is not "
+                    "itself a failure."
+                ),
+                strict=False,
+            ),
+        ),
         "shm",       # Phase 004
     ],
 )
@@ -97,8 +113,10 @@ async def test_watcher_backend_detects_commits(db_path, backend):
     # `update_events()` fires once per observed commit. The first wake
     # may be from the CREATE TABLE; we tolerate >= n (each insert) and
     # bound generously to surface a runaway watcher.
-    min_wakes = 1 if backend == "kernel" and sys.platform == "win32" else n
-    assert counted >= min_wakes, (
+    # Every platform is held to the full count. Windows' kernel backend
+    # used to be let through on `>= 1`, which proved nothing and still
+    # flaked at 0 — the xfail above replaces that fudge.
+    assert counted >= n, (
         f"watcher_backend={backend!r}: only {counted} wakes for {n} commits"
     )
     max_wakes = n * 4 if backend == "kernel" else n + 2

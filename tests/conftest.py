@@ -17,7 +17,13 @@ for path in (_HONKER_PYTHON_ROOT, _PACKAGES_ROOT):
 
 @pytest.fixture
 def db_path():
-    with tempfile.TemporaryDirectory() as d:
+    # ignore_cleanup_errors: the gc.collect() below cannot free `db`
+    # when a test *fails* — pytest keeps the traceback alive for its
+    # report, and the traceback pins the frame that holds the reference.
+    # On Windows that turns any failing test into a second, confusing
+    # teardown ERROR (WinError 32) on top of the real one. A leaked temp
+    # dir on a CI runner costs nothing; a phantom error costs triage time.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
         yield os.path.join(d, "t.db")
         # Pytest captures test-function locals for failure reporting,
         # so the test's `db = honker.open(path)` reference can outlive
