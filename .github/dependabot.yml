@@ -16,6 +16,14 @@
 # Cargo) and monthly for the binding ecosystems, which mostly move on
 # their own upstream schedules. Everything is grouped so a quiet week
 # produces one PR rather than nine.
+#
+# Every entry carries the same `cooldown`: don't propose a version that
+# shipped in the last week. A compromised release is usually yanked
+# within days, so waiting out that window is most of the protection a
+# pin buys, and neither the weekly nor the monthly cadence here is
+# urgent enough to trade it away. Majors wait longer — they need a human
+# read regardless, so there is no cost to letting them settle. zizmor's
+# dependabot-cooldown audit enforces the floor.
 
 version: 2
 
@@ -26,6 +34,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 5
     groups:
       actions:
@@ -42,6 +55,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 5
     groups:
       cargo-minor-patch:
@@ -57,6 +75,11 @@ updates:
       - "/bench/wal_index_methods"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       binding-cargo:
@@ -69,6 +92,11 @@ updates:
     directory: "/packages/honker-node"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       npm:
@@ -80,6 +108,11 @@ updates:
     directory: "/packages/honker-bun"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       bun:
@@ -91,6 +124,11 @@ updates:
     directory: "/packages/honker-dotnet"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       nuget:
@@ -102,6 +140,11 @@ updates:
     directory: "/packages/honker-ruby"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       bundler:
@@ -113,6 +156,11 @@ updates:
     directory: "/packages/honker-ex"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       mix:
@@ -124,6 +172,11 @@ updates:
     directory: "/packages/honker-go"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       gomod:
@@ -140,6 +193,11 @@ updates:
       - "/packages/honker-kotlin"
     schedule:
       interval: monthly
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     open-pull-requests-limit: 3
     groups:
       maven:
