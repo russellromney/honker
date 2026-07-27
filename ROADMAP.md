@@ -320,7 +320,7 @@ the default either way; "available in wheels" is the only flip.
 > Before: 1.0 release prep
 
 Phase Mantle itself shipped in PR #42 (see `CHANGELOG.md`): the
-`enabled` column, the seven `honker_scheduler_*` / `honker_cancel` /
+`enabled` column, the six new `honker_scheduler_*` / `honker_cancel` /
 `honker_get_job` SQL functions, scheduler `pause` / `resume` / `remove`
 / `list` / `update`, and queue `cancel` / `get_job` across every
 maintained binding. Two acceptance items were never met and are the

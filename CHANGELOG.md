@@ -9,8 +9,9 @@ stance recorded in the phase entry that drove it.
   tick and `soonest()` filter on `enabled = 1`, so a paused schedule
   neither emits nor holds the wake deadline.
 - New SQL functions: `honker_scheduler_pause`, `honker_scheduler_resume`,
-  `honker_scheduler_list`, `honker_scheduler_update`,
-  `honker_scheduler_unregister`, `honker_cancel`, and `honker_get_job`.
+  `honker_scheduler_list`, `honker_scheduler_update`, `honker_cancel`,
+  and `honker_get_job`. (`remove()` goes through the pre-existing
+  `honker_scheduler_unregister`.)
   Lifecycle methods go through these rather than binding-local state, so
   they operate on rows registered by another process (CLI tool, admin
   script, MCP wrapper).
