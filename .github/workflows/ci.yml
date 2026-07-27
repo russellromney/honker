@@ -457,8 +457,19 @@ jobs:
           python -m pytest tests/test_ruby_python_interop.py -q --tb=short
 
   ci-ok:
-    # THE required status check. Point branch protection at this job and
-    # nothing else.
+    # THE required status check for everything in *this* workflow.
+    #
+    # Branch protection should require exactly two checks:
+    #   - "ci · all green"  (this job)
+    #   - "zizmor"          (.github/workflows/zizmor.yml)
+    #
+    # `needs:` cannot reach a job in another workflow, so this aggregate
+    # does not and cannot subsume zizmor. Requiring only this job would
+    # silently un-gate the workflow-security lint that guards the
+    # release workflows holding publish tokens — exactly the check you
+    # least want to drop. zizmor's `pull_request` trigger is
+    # deliberately unfiltered so it reports on every PR and is safe to
+    # require; see the comment at the top of that file.
     #
     # Why an aggregate instead of listing the real jobs: `python` and
     # `node` build their matrices with fromJson and deliberately run a
