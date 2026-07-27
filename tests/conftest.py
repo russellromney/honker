@@ -33,6 +33,10 @@ def pytest_runtest_logreport(report):
         _FAILED_NODES.add(report.nodeid)
 
 
+def _test_failed(node):
+    return node.nodeid in _FAILED_NODES
+
+
 @pytest.fixture
 def db_path(request):
     # Cleanup is strict on purpose. A WinError 32 here means SQLite
