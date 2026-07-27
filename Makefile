@@ -19,7 +19,7 @@ help:
 	@echo "  make test-jvm-consumer - clean Maven consumer proof for JVM/Kotlin"
 	@echo "  make test-all       - everything, including slow marks"
 	@echo ""
-	@echo "Lint (same checks as the CI `lint` job):"
+	@echo "Lint (same checks as the CI 'lint' job):"
 	@echo "  make lint           - cargo fmt --check + clippy -D warnings"
 	@echo "  make lint-fix       - apply cargo fmt and clippy --fix"
 	@echo ""

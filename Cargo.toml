@@ -20,7 +20,7 @@ resolver = "2"
 # and the `lint` job in CI agree. CI runs clippy with `-D warnings`, which
 # turns everything left at `warn` into a hard failure.
 #
-# The three allows below are clippy's design opinions, not correctness
+# The two allows below are clippy's design opinions, not correctness
 # findings, and each would cost more than it buys right now:
 #
 #   too_many_arguments — `honker_ops::enqueue` takes 8. Collapsing them
