@@ -39,6 +39,7 @@ defmodule Honker.Scheduler do
     * `:priority`   — integer (default 0)
     * `:expires_s`  — seconds; the fired job expires this many seconds
                       after its scheduled fire time. Default `nil`.
+    * `:max_attempts` — attempt budget for each fired job. Default `3`.
   """
   def add(%Database{conn: conn}, opts) do
     name = Keyword.fetch!(opts, :name)
@@ -48,13 +49,14 @@ defmodule Honker.Scheduler do
     payload = Keyword.fetch!(opts, :payload)
     priority = Keyword.get(opts, :priority, 0)
     expires_s = Keyword.get(opts, :expires_s)
+    max_attempts = Keyword.get(opts, :max_attempts, 3)
 
     payload_json = Jason.encode!(payload)
 
     case Honker.query_first(
            conn,
-           "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6)",
-           [name, queue, schedule, payload_json, priority, expires_s]
+           "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+           [name, queue, schedule, payload_json, priority, expires_s, max_attempts]
          ) do
       {:ok, [_]} ->
         Honker.mark_updated(conn)
@@ -64,7 +66,8 @@ defmodule Honker.Scheduler do
         Honker.mark_updated(conn)
         :ok
 
-      other -> other
+      other ->
+        other
     end
   end
 
@@ -79,7 +82,8 @@ defmodule Honker.Scheduler do
         Honker.mark_updated(conn)
         {:ok, count}
 
-      other -> other
+      other ->
+        other
     end
   end
 
@@ -139,7 +143,7 @@ defmodule Honker.Scheduler do
   @doc """
   Return every registered schedule with current state. Each entry is a
   map with: name, queue, cron_expr, payload, priority, expires_s,
-  next_fire_at, enabled.
+  next_fire_at, enabled, max_attempts.
   """
   def list(%Database{conn: conn}) do
     case Honker.query_first(conn, "SELECT honker_scheduler_list()", []) do
@@ -156,8 +160,9 @@ defmodule Honker.Scheduler do
 
   @doc """
   Mutate fields in place. `opts` is a keyword list with any of:
-  `cron:` / `schedule:`, `payload:`, `priority:`, `expires_s:`. Omit a
-  key to leave its field alone. `payload: nil` writes JSON null.
+  `cron:` / `schedule:`, `payload:`, `priority:`, `expires_s:`,
+  `max_attempts:`. Omit a key to leave its field alone. `payload: nil`
+  writes JSON null; `max_attempts: nil` resets to default 3.
   Cron change recomputes `next_fire_at` from now. Returns
   `{:ok, true}` iff a row was updated.
   """
@@ -174,18 +179,37 @@ defmodule Honker.Scheduler do
         do: Jason.encode!(Keyword.get(opts, :payload)),
         else: nil
 
-    priority_arg = if Keyword.has_key?(opts, :priority), do: Keyword.get(opts, :priority), else: nil
-    touch_expires = if Keyword.has_key?(opts, :expires_s), do: 1, else: 0
-    expires_arg = if Keyword.has_key?(opts, :expires_s), do: Keyword.get(opts, :expires_s), else: nil
+    priority_arg =
+      if Keyword.has_key?(opts, :priority), do: Keyword.get(opts, :priority), else: nil
 
-    if cron_arg == nil and payload_arg == nil and priority_arg == nil and touch_expires == 0 do
+    touch_expires = if Keyword.has_key?(opts, :expires_s), do: 1, else: 0
+
+    expires_arg =
+      if Keyword.has_key?(opts, :expires_s), do: Keyword.get(opts, :expires_s), else: nil
+
+    touch_max_attempts = if Keyword.has_key?(opts, :max_attempts), do: 1, else: 0
+
+    max_attempts_arg =
+      if Keyword.has_key?(opts, :max_attempts), do: Keyword.get(opts, :max_attempts), else: nil
+
+    if cron_arg == nil and payload_arg == nil and priority_arg == nil and touch_expires == 0 and
+         touch_max_attempts == 0 do
       # Empty update is a no-op.
       {:ok, false}
     else
       case Honker.query_first(
              conn,
-             "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6)",
-             [name, cron_arg, payload_arg, priority_arg, expires_arg, touch_expires]
+             "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             [
+               name,
+               cron_arg,
+               payload_arg,
+               priority_arg,
+               expires_arg,
+               touch_expires,
+               max_attempts_arg,
+               touch_max_attempts
+             ]
            ) do
         {:ok, [n]} ->
           if n > 0, do: Honker.mark_updated(conn)
@@ -222,7 +246,7 @@ defmodule Honker.Scheduler do
             run(db, owner, stop_fun)
 
           {:ok, %Lock{} = lock} ->
-            case leader_loop(db, lock, stop_fun, System.monotonic_time(:millisecond)) do
+            case leader_loop(db, lock, stop_fun) do
               :ok ->
                 _ = Lock.release(lock, db)
                 run(db, owner, stop_fun)
@@ -247,44 +271,32 @@ defmodule Honker.Scheduler do
     end
   end
 
-  defp leader_loop(%Database{} = db, %Lock{} = lock, stop_fun, last_heartbeat_ms) do
+  defp leader_loop(%Database{} = db, %Lock{} = lock, stop_fun) do
     cond do
       stop_fun.() ->
         {:stop, :stopped}
 
       true ->
-        case tick(db) do
-          {:ok, _fires} ->
-            now_ms = System.monotonic_time(:millisecond)
+        case Lock.heartbeat(lock, db, @lock_ttl_s) do
+          {:ok, true} ->
+            new_last_ms = System.monotonic_time(:millisecond)
 
-            case maybe_heartbeat(db, lock, last_heartbeat_ms, now_ms) do
-              {:ok, :kept, new_last_ms} ->
-                wait_ms = next_wait_ms(db, now_ms, new_last_ms)
+            case tick(db) do
+              {:ok, _fires} ->
+                wait_ms = next_wait_ms(db, new_last_ms, new_last_ms)
                 wait_update_or_timeout(db, wait_ms, stop_fun)
-                leader_loop(db, lock, stop_fun, new_last_ms)
-
-              {:ok, :lost} ->
-                {:stop, :lost_lock}
+                leader_loop(db, lock, stop_fun)
 
               {:error, _} = err ->
                 err
             end
 
+          {:ok, false} ->
+            {:stop, :lost_lock}
+
           {:error, _} = err ->
             err
         end
-    end
-  end
-
-  defp maybe_heartbeat(db, lock, last_ms, now_ms) do
-    if now_ms - last_ms >= @heartbeat_ms do
-      case Lock.heartbeat(lock, db, @lock_ttl_s) do
-        {:ok, true} -> {:ok, :kept, now_ms}
-        {:ok, false} -> {:ok, :lost}
-        err -> err
-      end
-    else
-      {:ok, :kept, last_ms}
     end
   end
 

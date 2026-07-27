@@ -89,15 +89,16 @@ public sealed class OutboxLockTests
     {
         using var harness = TestHarness.Create();
         using var db = harness.Open();
-        var calls = new List<int>();
+        var calls = 0;
 
         var outbox = db.Outbox(
             "retry",
             async payload =>
             {
-                calls.Add(payload.GetProperty("n").GetInt32());
+                Assert.Equal(1, payload.GetProperty("n").GetInt32());
+                var call = Interlocked.Increment(ref calls);
                 await Task.CompletedTask;
-                if (calls.Count < 3)
+                if (call < 3)
                 {
                     throw new InvalidOperationException("transient");
                 }
@@ -110,7 +111,7 @@ public sealed class OutboxLockTests
         var worker = Task.Run(() => outbox.RunWorker("w1", cts.Token), cts.Token);
         try
         {
-            await WaitUntilAsync(() => calls.Count >= 3, TimeSpan.FromSeconds(3), cts.Token, async () =>
+            await WaitUntilAsync(() => Volatile.Read(ref calls) >= 3, TimeSpan.FromSeconds(3), cts.Token, async () =>
             {
                 using var tx = db.BeginTransaction();
                 tx.Execute("UPDATE _honker_live SET run_at=unixepoch() - 1 WHERE queue=@p0", "_outbox:retry");
@@ -124,7 +125,7 @@ public sealed class OutboxLockTests
             await Task.WhenAll(worker.ContinueWith(_ => Task.CompletedTask));
         }
 
-        Assert.True(calls.Count >= 3);
+        Assert.True(Volatile.Read(ref calls) >= 3);
         Assert.Equal(0, Scalar(db, "SELECT COUNT(*) AS c FROM _honker_jobs WHERE queue=@p0", "_outbox:retry"));
     }
 

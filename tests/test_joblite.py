@@ -186,6 +186,28 @@ def test_expired_claim_cannot_ack_and_is_reclaimable(db_path):
     assert job2.ack() is True
 
 
+def test_heartbeat_rejects_expired_claim(db_path):
+    """A heartbeat after visibility timeout must fail so a reclaimer
+    cannot race with a late sticky heartbeat (dual execution).
+    """
+    db = honker.open(db_path)
+    q = db.queue("work", visibility_timeout_s=60)
+    q.enqueue({"n": 1})
+    job = q.claim_one("owner")
+    assert job is not None
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_live SET claim_expires_at = unixepoch() - 1 WHERE id=?",
+            [job.id],
+        )
+    assert q.heartbeat(job.id, "owner", extend_s=60) is False
+    # Reclaimer can take the job (attempts still under max).
+    job2 = q.claim_one("reclaimer")
+    assert job2 is not None
+    assert job2.id == job.id
+    assert job2.ack() is True
+
+
 def test_heartbeat_only_extends_matching_worker(db_path):
     """PLAN test #5: heartbeat rejects a mismatched worker_id."""
     db = honker.open(db_path)

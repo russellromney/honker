@@ -103,3 +103,32 @@ def test_lock_uuid_owners_are_distinct(db_path):
         # (Can't actually check b's owner because __init__ fails
         # to enter; a's owner is whatever uuid4 produced.)
         assert a.owner
+
+
+def test_lock_renew_extends_ttl_for_owner(db_path):
+    """honker_lock_renew refreshes expires_at; lock_acquire does not."""
+    db = honker.open(db_path)
+    with db.lock("renew-me", ttl=30) as lk:
+        with db.transaction() as tx:
+            tx.execute(
+                "UPDATE _honker_locks SET expires_at = unixepoch() + 2 "
+                "WHERE name='renew-me'"
+            )
+        assert lk.renew(ttl=60) is True
+        row = db.query(
+            "SELECT expires_at FROM _honker_locks WHERE name='renew-me'"
+        )[0]
+        import time
+        assert int(row["expires_at"]) >= int(time.time()) + 50
+
+
+def test_lock_renew_fails_after_steal(db_path):
+    db = honker.open(db_path)
+    with db.lock("steal-renew", ttl=60) as lk:
+        with db.transaction() as tx:
+            tx.execute("DELETE FROM _honker_locks WHERE name='steal-renew'")
+            tx.execute(
+                "INSERT INTO _honker_locks (name, owner, expires_at) "
+                "VALUES ('steal-renew', 'thief', unixepoch() + 60)"
+            )
+        assert lk.renew(ttl=60) is False

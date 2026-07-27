@@ -43,13 +43,13 @@ module Honker
     #
     # Idempotent by `name`; registering the same name twice replaces
     # the previous row.
-    def add(name:, queue:, cron: nil, schedule: nil, payload:, priority: 0, expires_s: nil)
+    def add(name:, queue:, cron: nil, schedule: nil, payload:, priority: 0, expires_s: nil, max_attempts: 3)
       expr = schedule || cron
       raise ArgumentError, "must provide cron: or schedule:" if expr.nil? || expr.empty?
 
       @db.db.get_first_row(
-        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
-        [name, queue, expr, JSON.dump(payload), priority, expires_s],
+        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
+        [name, queue, expr, JSON.dump(payload), priority, expires_s, max_attempts],
       )
       @db.mark_updated
       nil
@@ -105,7 +105,7 @@ module Honker
 
     # Return every registered schedule with current state. Each entry
     # is a Hash with: name, queue, cron_expr, payload (JSON string),
-    # priority, expires_s, next_fire_at, enabled.
+    # priority, expires_s, next_fire_at, enabled, max_attempts.
     def list
       raw = @db.db.get_first_row("SELECT honker_scheduler_list()")[0]
       return [] if raw.nil? || raw.empty?
@@ -115,9 +115,10 @@ module Honker
 
     # Mutate fields in place. Pass only the kwargs you want changed
     # (omitting a kwarg leaves the field alone). `payload: nil`
-    # writes JSON null. Cron change recomputes next_fire_at from now.
+    # writes JSON null; `max_attempts: nil` resets to default 3.
+    # Cron change recomputes next_fire_at from now.
     # Returns true iff a row was updated.
-    def update(name, schedule: UNSET, cron: UNSET, payload: UNSET, priority: UNSET, expires_s: UNSET)
+    def update(name, schedule: UNSET, cron: UNSET, payload: UNSET, priority: UNSET, expires_s: UNSET, max_attempts: UNSET)
       expr = nil
       expr = schedule if schedule != UNSET
       expr = cron if expr.nil? && cron != UNSET
@@ -126,13 +127,16 @@ module Honker
       priority_arg = (priority == UNSET) ? nil : priority
       touch_expires = (expires_s == UNSET) ? 0 : 1
       expires_arg = (expires_s == UNSET) ? nil : expires_s
+      touch_max_attempts = (max_attempts == UNSET) ? 0 : 1
+      max_attempts_arg = (max_attempts == UNSET) ? nil : max_attempts
 
-      any_field = !expr.nil? || payload != UNSET || priority != UNSET || expires_s != UNSET
+      any_field = !expr.nil? || payload != UNSET || priority != UNSET || expires_s != UNSET || max_attempts != UNSET
       return false unless any_field
 
       n = @db.db.get_first_row(
-        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)",
-        [name, expr, payload_arg, priority_arg, expires_arg, touch_expires],
+        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?)",
+        [name, expr, payload_arg, priority_arg, expires_arg, touch_expires,
+         max_attempts_arg, touch_max_attempts],
       )[0]
       @db.mark_updated if n.positive?
       n.positive?
@@ -187,18 +191,15 @@ module Honker
     def leader_loop(owner, stop_fn)
       last_heartbeat = monotonic_now
       until stop_fn.call
+        still_ours = lock_renew(LEADER_LOCK, owner, LOCK_TTL_S)
+        # IMPORTANT: if refresh failed, a new leader has the lock.
+        # Break out before ticking so we don't double-fire.
+        return unless still_ours
+
+        last_heartbeat = monotonic_now
         # tick errors escape up to `run`, which releases the lock in
         # its `ensure` before re-raising.
         tick
-        if monotonic_now - last_heartbeat >= HEARTBEAT_S
-          still_ours = lock_try_acquire(LEADER_LOCK, owner, LOCK_TTL_S)
-          # IMPORTANT: if refresh failed, a new leader has the lock.
-          # Break out of the leader loop so we don't double-fire. This
-          # is the bug the Rust binding fixed; don't reintroduce it.
-          return unless still_ours
-
-          last_heartbeat = monotonic_now
-        end
 
         wait_s = HEARTBEAT_S - (monotonic_now - last_heartbeat)
         wait_s = 0 if wait_s.negative?
@@ -235,6 +236,13 @@ module Honker
     def lock_try_acquire(name, owner, ttl_s)
       @db.db.get_first_row(
         "SELECT honker_lock_acquire(?, ?, ?)",
+        [name, owner, ttl_s],
+      )[0] == 1
+    end
+
+    def lock_renew(name, owner, ttl_s)
+      @db.db.get_first_row(
+        "SELECT honker_lock_renew(?, ?, ?)",
         [name, owner, ttl_s],
       )[0] == 1
     end

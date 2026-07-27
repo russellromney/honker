@@ -1,16 +1,10 @@
-name: Release · NuGet
+name: Proof · NuGet package
 
 on:
   push:
     tags:
       - "dotnet-v*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Upload built package to NuGet"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -41,10 +35,11 @@ jobs:
             rid: win-x64
             native_name: honker_ext.dll
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        run: rustup default stable
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4
         with:
           dotnet-version: "10.0.x"
@@ -79,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: native-assets
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
           persist-credentials: false
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4
@@ -108,14 +103,3 @@ jobs:
           name: honker-nuget
           path: artifacts/honker-dotnet/*.nupkg
           if-no-files-found: error
-
-      - name: Upload package to NuGet
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref_name, 'dotnet-v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-        shell: bash
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          dotnet nuget push artifacts/honker-dotnet/*.nupkg \
-            --source https://api.nuget.org/v3/index.json \
-            --api-key "$NUGET_API_KEY" \
-            --skip-duplicate

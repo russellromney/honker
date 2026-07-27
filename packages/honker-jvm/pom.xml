@@ -5,7 +5,7 @@
 
   <groupId>dev.honker</groupId>
   <artifactId>honker</artifactId>
-  <version>0.1.0</version>
+  <version>0.4.0</version>
   <name>honker-jvm</name>
   <description>JVM binding for Honker queues, streams, pub/sub, scheduler, locks, and rate limits on SQLite.</description>
 

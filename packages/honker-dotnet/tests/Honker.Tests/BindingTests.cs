@@ -152,12 +152,12 @@ public sealed class BindingTests
             probe.Queue("shared");
         }
 
-        var workers = Enumerable.Range(0, 3)
-            .Select(i => StartQueueWorkerProcess(harness, backend, $"w{i}"))
-            .ToArray();
-        foreach (var worker in workers)
+        var workers = new List<QueueWorkerProcess>();
+        for (var i = 0; i < 3; i += 1)
         {
+            var worker = StartQueueWorkerProcess(harness, backend, $"w{i}");
             WaitReady(worker.ReadyPath, worker.Process);
+            workers.Add(worker);
         }
 
         using (var writer = harness.Open())
@@ -194,16 +194,13 @@ public sealed class BindingTests
             probe.Queue("shared");
         }
 
-        var writers = Enumerable.Range(0, 3)
-            .Select(offset =>
-            {
-                var goPath = Path.Combine(harness.DirectoryPath, $"writer-{offset}.go");
-                return (Process: StartQueueWriterProcess(harness, offset * 20, 20, goPath), GoPath: goPath);
-            })
-            .ToArray();
-        foreach (var (writer, _) in writers)
+        var writers = new List<(QueueWriterProcess Process, string GoPath)>();
+        for (var offset = 0; offset < 3; offset += 1)
         {
+            var goPath = Path.Combine(harness.DirectoryPath, $"writer-{offset}.go");
+            var writer = StartQueueWriterProcess(harness, offset * 20, 20, goPath);
             WaitReady(writer.ReadyPath, writer.Process);
+            writers.Add((writer, goPath));
         }
 
         var worker = StartQueueWorkerProcess(harness, backend, "solo");

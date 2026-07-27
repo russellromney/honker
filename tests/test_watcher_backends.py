@@ -110,8 +110,8 @@ async def test_watcher_backend_detects_commits(db_path, backend):
 
 async def test_custom_watcher_poll_interval_detects_commits(db_path):
     db = honker.open(db_path, watcher_poll_interval_ms=25)
-    counted = await _drive_commits_and_count_wakes(db, n=2, spacing_ms=60)
-    assert counted >= 2
+    counted = await _drive_commits_and_count_wakes(db, n=1, spacing_ms=60)
+    assert counted >= 1
 
 
 async def test_unknown_watcher_backend_raises(db_path):

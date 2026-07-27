@@ -17,7 +17,6 @@ defmodule Honker.Lock do
   owner has stolen the lock — stop doing the work the lock guards.
   """
 
-  alias Exqlite.Sqlite3
   alias Honker.Database
 
   @enforce_keys [:name, :owner]
@@ -71,33 +70,17 @@ defmodule Honker.Lock do
   holding the `%Honker.Lock{}` struct is not a guarantee.
   """
   def heartbeat(%__MODULE__{name: name, owner: owner}, %Database{conn: conn}, ttl_s) do
-    # UPDATE ... RETURNING would be cleanest, but Exqlite's `step` gives
-    # us the affected-row state, and `Sqlite3.changes/1` reflects the
-    # last write. Scope the update to (name, owner) so a stolen lock is
-    # a zero-change UPDATE.
-    sql = """
-    UPDATE _honker_locks
-    SET expires_at = unixepoch() + ?3
-    WHERE name = ?1 AND owner = ?2
-    """
-
-    with {:ok, stmt} <- Sqlite3.prepare(conn, sql),
-         :ok <- Sqlite3.bind(stmt, [name, owner, ttl_s]),
-         step <- Sqlite3.step(conn, stmt),
-         :ok <- Sqlite3.release(conn, stmt) do
-      case step do
-        :done -> {:ok, changed?(conn)}
-        {:row, _} -> {:ok, changed?(conn)}
-        err -> err
-      end
-    end
-  end
-
-  defp changed?(conn) do
-    case Sqlite3.changes(conn) do
-      {:ok, n} when n > 0 -> true
-      n when is_integer(n) and n > 0 -> true
-      _ -> false
+    # honker_lock_renew refreshes expires_at for this owner only.
+    # honker_lock_acquire uses INSERT OR IGNORE and does not extend TTL.
+    case Honker.query_first(
+           conn,
+           "SELECT honker_lock_renew(?1, ?2, ?3)",
+           [name, owner, ttl_s]
+         ) do
+      {:ok, [1]} -> {:ok, true}
+      {:ok, [0]} -> {:ok, false}
+      {:ok, nil} -> {:ok, false}
+      other -> other
     end
   end
 end

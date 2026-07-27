@@ -74,14 +74,33 @@ mkdir -p "$TMP/npm"
 (
   cd "$ROOT/packages/honker-node"
   npm install
+  cp index.js "$TMP/node-index.js"
   npx napi build --platform --release
+  cp "$TMP/node-index.js" index.js
+  node_platform="$(node -p "process.platform + '-' + process.arch")"
+  case "$node_platform" in
+    darwin-arm64) platform_dir="npm/darwin-arm64"; platform_suffix="darwin-arm64" ;;
+    darwin-x64) platform_dir="npm/darwin-x64"; platform_suffix="darwin-x64" ;;
+    linux-x64) platform_dir="npm/linux-x64-gnu"; platform_suffix="linux-x64-gnu" ;;
+    linux-arm64) platform_dir="npm/linux-arm64-gnu"; platform_suffix="linux-arm64-gnu" ;;
+    *) echo "unsupported node package proof platform: $node_platform" >&2; exit 1 ;;
+  esac
+  cp "honker.$platform_suffix.node" "$platform_dir/honker.$platform_suffix.node"
+  ../../scripts/proof/check-node-native-artifacts.sh \
+    "honker.$platform_suffix.node" \
+    "$platform_dir/honker.$platform_suffix.node"
   npm pack --pack-destination "$TMP/npm"
+  npm pack "./$platform_dir" --pack-destination "$TMP/npm"
 )
 mkdir -p "$TMP/node-consumer"
 (
   cd "$TMP/node-consumer"
   npm init -y >/dev/null
-  npm install "$TMP"/npm/*.tgz >/dev/null
+  root_tgz="$(find "$TMP/npm" -maxdepth 1 -name 'russellthehippo-honker-node-[0-9]*.tgz' -print -quit)"
+  platform_tgz="$(find "$TMP/npm" -maxdepth 1 -name 'russellthehippo-honker-node-*-*.tgz' ! -name 'russellthehippo-honker-node-[0-9]*.tgz' -print -quit)"
+  test -n "$root_tgz"
+  test -n "$platform_tgz"
+  npm install "$root_tgz" "$platform_tgz" >/dev/null
   node <<'JS'
 const assert = require('node:assert/strict');
 const fs = require('node:fs');

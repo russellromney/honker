@@ -45,14 +45,14 @@ public final class SchedulerHandle implements AutoCloseable {
     }
 
     private void runLoop() {
-        long lastHeartbeat = System.nanoTime();
         try {
             while (!closed.get()) {
-                scheduler.tick(Instant.now());
-                if (Duration.ofNanos(System.nanoTime() - lastHeartbeat).compareTo(options.heartbeatEvery()) >= 0) {
-                    heartbeat();
-                    lastHeartbeat = System.nanoTime();
+                heartbeat();
+                if (closed.get()) {
+                    return;
                 }
+
+                scheduler.tick(Instant.now());
                 Duration wait = scheduler.soonest()
                     .map(t -> Duration.between(Instant.now(), t))
                     .filter(d -> !d.isNegative() && !d.isZero())
@@ -99,10 +99,19 @@ public final class SchedulerHandle implements AutoCloseable {
     }
 
     private void heartbeat() {
-        db.transactionVoid(tx -> tx.execute(
-            "UPDATE _honker_locks SET expires_at = unixepoch() + ? WHERE name = ? AND owner = ?",
-            Params.of(Durations.seconds(options.lockTtl(), "lockTtl"), lock.name(), lock.owner())
-        ));
+        // honker_lock_renew(name, owner, ttl_s). Must check return
+        // value so a stolen lock stops the leader loop.
+        int ok = db.transaction(tx -> tx.query(
+            "SELECT honker_lock_renew(?, ?, ?) AS r",
+            Params.of(
+                lock.name(),
+                lock.owner(),
+                Durations.seconds(options.lockTtl(), "lockTtl")
+            )
+        ).get(0).getInt("r"));
+        if (ok == 0) {
+            closed.set(true);
+        }
     }
 
     @Override

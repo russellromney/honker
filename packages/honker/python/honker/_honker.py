@@ -1,10 +1,21 @@
 import asyncio
 import json
+import threading
 import time
 import traceback
 import uuid
 from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional
+
+# Queue / outbox defaults. Sentinels distinguish "caller omitted the
+# option" (pure lookup of a memoized instance) from "caller passed the
+# numeric default explicitly" (must match existing options).
+DEFAULT_VISIBILITY_TIMEOUT_S = 300
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_OUTBOX_MAX_ATTEMPTS = 5
+DEFAULT_OUTBOX_BASE_BACKOFF_S = 5
+DEFAULT_OUTBOX_VISIBILITY_TIMEOUT_S = 60
+_UNSET = object()
 
 
 def _core_open(path, max_readers, watcher_backend=None, watcher_poll_interval_ms=None):
@@ -216,6 +227,19 @@ class Queue:
         # so this binding and the SQLite loadable extension can't drift
         # on column counts. View + schema-version cleanup are
         # Python-binding-specific and stay here.
+        #
+        # Schema init opens its own write transaction. The writer is a
+        # single connection slot: nested transaction() on the same thread
+        # waits forever for a slot the outer `with` still holds. Fail fast
+        # instead of hanging (see Database.queue). Construct queues
+        # outside the transaction and pass tx= to enqueue.
+        if getattr(self.db, "_tx_depth", 0) > 0:
+            raise RuntimeError(
+                f"cannot construct Queue {self.name!r} while a "
+                "db.transaction() is open: schema init needs its own write "
+                "transaction and would deadlock the single writer. "
+                "Construct the queue first, then pass tx= to enqueue."
+            )
         with self.db.transaction() as tx:
             tx.bootstrap_honker_schema()
             # Inspection view: UNION live + dead with a synthetic `state`.
@@ -253,6 +277,7 @@ class Queue:
         delay: Optional[float] = None,
         priority: int = 0,
         expires: Optional[float] = None,
+        max_attempts: Optional[int] = None,
     ) -> int:
         """Insert one job row. Returns the inserted `id` (primary key
         in `_honker_live`). Delegates to `honker_enqueue`, which handles
@@ -268,6 +293,10 @@ class Queue:
         `expires`: seconds from now. Claim path filters expired rows;
         `queue.sweep_expired()` moves them into `_honker_dead`.
 
+        `max_attempts`: per-job attempt budget. Defaults to the queue's
+        `max_attempts`. Decorated tasks pass `@task(retries=N)` here so
+        the SQL claim/retry path and the worker path share one budget.
+
         For bulk inserts with one commit + one cross-process wake,
         pass a shared `tx`:
 
@@ -280,10 +309,13 @@ class Queue:
         run_at_val = int(run_at) if run_at is not None else None
         delay_val = int(delay) if delay is not None else None
         expires_val = int(expires) if expires is not None else None
+        attempts_val = (
+            int(max_attempts) if max_attempts is not None else self.max_attempts
+        )
         sql = "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?) AS id"
         params = [
             self.name, payload_str, run_at_val, delay_val,
-            int(priority), self.max_attempts, expires_val,
+            int(priority), attempts_val, expires_val,
         ]
         if tx is not None:
             rows = tx.query(sql, params)
@@ -916,6 +948,13 @@ class LockHeld(Exception):
     """
 
 
+class LeadershipLost(Exception):
+    """Raised by `Scheduler.run()` when the leader lock was stolen
+    (TTL elapsed and another process acquired it). Distinct from a
+    clean stop via `stop_event` or an empty schedule table.
+    """
+
+
 class _Lock:
     """Context manager returned by `Database.lock(name, ttl=60)`.
 
@@ -950,6 +989,21 @@ class _Lock:
             self.acquired = True
         return self
 
+    def renew(self, ttl: Optional[int] = None) -> bool:
+        """Extend `expires_at` for this owner. Returns True iff we still
+        hold the lock. False means the TTL elapsed and another owner
+        acquired it (or the row was released).
+        """
+        if not self.acquired:
+            return False
+        ttl_s = int(ttl) if ttl is not None else self.ttl
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT honker_lock_renew(?, ?, ?) AS r",
+                [self.name, self.owner, ttl_s],
+            )
+        return bool(rows[0]["r"])
+
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         if self.acquired:
             with self.db.transaction() as tx:
@@ -961,6 +1015,56 @@ class _Lock:
         return False  # don't suppress exceptions from the with-body
 
 
+class _TxDepthGuard:
+    """Tracks open `Database.transaction()` blocks for reentrancy checks.
+
+    The native writer is a single connection slot. Nested
+    `transaction()` on the *same thread* deadlocks (outer holds the
+    slot; inner waits for it forever). Depth is **per-thread** so
+    another thread waiting for the writer still blocks correctly until
+    the holder releases — only same-thread re-entry fails fast.
+
+    Queue schema init opens its own transaction, so first-time
+    `db.queue(name)` inside an open outer tx on this thread would hang;
+    that path raises with a queue-specific message before entering.
+
+    Bootstrap in `Database.__init__` uses `_inner.transaction()`
+    directly and does not bump depth — correct, since no user outer tx
+    is open.
+    """
+
+    __slots__ = ("_db", "_inner", "_entered")
+
+    def __init__(self, db: "Database", inner):
+        self._db = db
+        self._inner = inner
+        self._entered = False
+
+    def __enter__(self):
+        # Same-thread re-entry would deadlock on the writer slot.
+        # Cross-thread wait (depth 0 here, another thread holds the
+        # slot) is fine — native acquire blocks until free.
+        if self._db._tx_depth > 0:
+            raise RuntimeError(
+                "nested db.transaction() is not supported: the writer is "
+                "a single connection slot and re-entry deadlocks on this "
+                "thread. Keep one open transaction and pass tx= to "
+                "enqueue/publish/..."
+            )
+        tx = self._inner.__enter__()
+        self._db._tx_local.depth = self._db._tx_depth + 1
+        self._entered = True
+        return tx
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return self._inner.__exit__(exc_type, exc, tb)
+        finally:
+            if self._entered:
+                self._db._tx_local.depth = max(0, self._db._tx_depth - 1)
+                self._entered = False
+
+
 class Database:
     """Wrapper over the honker Database that adds queue/stream/outbox."""
 
@@ -969,14 +1073,22 @@ class Database:
         self._queues: dict = {}
         self._streams: dict = {}
         self._outboxes: dict = {}
+        # Per-thread nesting depth of `self.transaction()` (not
+        # `_inner.transaction()`). See `_TxDepthGuard`.
+        self._tx_local = threading.local()
         # Bootstrap the shared honker schema up-front so features
         # like db.lock() (which doesn't touch Queue or Stream) find
         # their tables on first use.
         with self._inner.transaction() as tx:
             tx.bootstrap_honker_schema()
 
+    @property
+    def _tx_depth(self) -> int:
+        """Open `self.transaction()` count on *this* thread only."""
+        return int(getattr(self._tx_local, "depth", 0) or 0)
+
     def transaction(self):
-        return self._inner.transaction()
+        return _TxDepthGuard(self, self._inner.transaction())
 
     def listen(self, channel: str, fallback_poll_s: Optional[float] = 15.0):
         return Listener(self, channel, fallback_poll_s=fallback_poll_s)
@@ -1128,22 +1240,82 @@ class Database:
     def queue(
         self,
         name: str,
-        visibility_timeout_s: int = 300,
-        max_attempts: int = 3,
+        visibility_timeout_s=_UNSET,
+        max_attempts=_UNSET,
     ) -> Queue:
+        """Return a memoized Queue for `name`.
+
+        Options apply only on first open. Subsequent calls:
+
+          * `db.queue(name)` with no options — pure lookup of the
+            existing instance (used by `run_workers`).
+          * Same options as first open — return the memoized instance.
+          * Different options — raise `ValueError`. Explicit defaults
+            (e.g. `max_attempts=3`) still count as specified options
+            and must match; they are not treated as lookup.
+
+        IMPORTANT — construct outside an open transaction. The *first* call
+        for a given name initializes the queue's schema in its own
+        transaction. Calling it for a brand-new name while a
+        ``with db.transaction()`` block is already open raises
+        ``RuntimeError`` (it would otherwise deadlock the single writer).
+        Create the handle first, then pass ``tx=`` to
+        :meth:`Queue.enqueue` inside the transaction::
+
+            emails = db.queue("emails")          # construct up front
+            with db.transaction() as tx:
+                tx.execute("INSERT INTO orders ...", [...])
+                emails.enqueue(payload, tx=tx)   # atomic outbox handoff
+
+        (Re-fetching an already-constructed name inside a transaction is fine —
+        only first construction runs the schema init.)
+        """
         existing = self._queues.get(name)
+        lookup_only = (
+            visibility_timeout_s is _UNSET and max_attempts is _UNSET
+        )
+        vt = (
+            DEFAULT_VISIBILITY_TIMEOUT_S
+            if visibility_timeout_s is _UNSET
+            else int(visibility_timeout_s)
+        )
+        ma = (
+            DEFAULT_MAX_ATTEMPTS
+            if max_attempts is _UNSET
+            else int(max_attempts)
+        )
         if existing is not None:
+            if lookup_only:
+                return existing
+            if (
+                existing.visibility_timeout_s != vt
+                or existing.max_attempts != ma
+            ):
+                raise ValueError(
+                    f"queue {name!r} already opened with "
+                    f"visibility_timeout_s={existing.visibility_timeout_s}, "
+                    f"max_attempts={existing.max_attempts}; "
+                    f"got visibility_timeout_s={vt}, max_attempts={ma}"
+                )
             return existing
         q = Queue(
             self,
             name,
-            visibility_timeout_s=visibility_timeout_s,
-            max_attempts=max_attempts,
+            visibility_timeout_s=vt,
+            max_attempts=ma,
         )
         self._queues[name] = q
         return q
 
     def stream(self, name: str) -> Stream:
+        """Get (or lazily create) the durable stream named `name`.
+
+        Handles are cached per name. Unlike :meth:`queue`, stream construction
+        does not run a schema-init transaction, so it is safe to call inside an
+        open ``with db.transaction()`` block. The common pattern is still to
+        construct the handle up front and pass ``tx=`` to
+        :meth:`Stream.publish` so the event commits atomically with the work.
+        """
         existing = self._streams.get(name)
         if existing is not None:
             return existing
@@ -1155,12 +1327,27 @@ class Database:
         self,
         name: str,
         delivery: Callable,
-        max_attempts: int = 5,
-        base_backoff_s: int = 5,
-        visibility_timeout_s: int = 60,
+        max_attempts: int = DEFAULT_OUTBOX_MAX_ATTEMPTS,
+        base_backoff_s: int = DEFAULT_OUTBOX_BASE_BACKOFF_S,
+        visibility_timeout_s: int = DEFAULT_OUTBOX_VISIBILITY_TIMEOUT_S,
     ) -> Outbox:
+        max_attempts = int(max_attempts)
+        base_backoff_s = int(base_backoff_s)
+        visibility_timeout_s = int(visibility_timeout_s)
+        if not callable(delivery):
+            raise TypeError("delivery must be callable")
         existing = self._outboxes.get(name)
         if existing is not None:
+            if (
+                existing.max_attempts != max_attempts
+                or existing.base_backoff_s != base_backoff_s
+                or existing._queue.visibility_timeout_s != visibility_timeout_s
+                or existing.delivery is not delivery
+            ):
+                raise ValueError(
+                    f"outbox {name!r} already opened with different options "
+                    f"or a different delivery callable"
+                )
             return existing
         o = Outbox(
             self,

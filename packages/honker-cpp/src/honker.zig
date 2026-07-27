@@ -424,9 +424,10 @@ export fn honker_cpp_scheduler_register(
     payload_z: [*:0]const u8,
     priority: i64,
     expires_sec: i64,
+    max_attempts: i64,
 ) callconv(.c) i64 {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6)";
+    const sql = "SELECT honker_scheduler_register(?1, ?2, ?3, ?4, ?5, ?6, ?7)";
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
     defer _ = c.sqlite3_finalize(stmt);
 
@@ -440,6 +441,7 @@ export fn honker_cpp_scheduler_register(
     } else {
         _ = c.sqlite3_bind_int64(stmt, 6, expires_sec);
     }
+    _ = c.sqlite3_bind_int64(stmt, 7, max_attempts);
 
     return step_scalar_int64(stmt);
 }
@@ -531,9 +533,11 @@ export fn honker_cpp_scheduler_update(
     touch_priority: i64,
     expires_sec: i64,
     touch_expires: i64,
+    max_attempts: i64,
+    touch_max_attempts: i64,
 ) callconv(.c) i64 {
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql = "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6)";
+    const sql = "SELECT honker_scheduler_update(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
     defer _ = c.sqlite3_finalize(stmt);
     bind_text(stmt, 1, name_z);
@@ -558,6 +562,12 @@ export fn honker_cpp_scheduler_update(
         _ = c.sqlite3_bind_null(stmt, 5);
     }
     _ = c.sqlite3_bind_int64(stmt, 6, touch_expires);
+    if (touch_max_attempts != 0) {
+        _ = c.sqlite3_bind_int64(stmt, 7, max_attempts);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 7);
+    }
+    _ = c.sqlite3_bind_int64(stmt, 8, touch_max_attempts);
     return step_scalar_int64(stmt);
 }
 
@@ -629,12 +639,9 @@ export fn honker_cpp_lock_heartbeat(
     owner_z: [*:0]const u8,
     ttl_sec: i64,
 ) callconv(.c) i64 {
-    // honker_lock_acquire uses INSERT OR IGNORE, so a pure heartbeat
-    // needs a direct UPDATE on _honker_locks to refresh expires_at.
+    // honker_lock_renew refreshes expires_at for this owner only.
     var stmt: ?*c.sqlite3_stmt = null;
-    const sql =
-        "UPDATE _honker_locks SET expires_at = unixepoch() + ?3 " ++
-        "WHERE name = ?1 AND owner = ?2 RETURNING 1";
+    const sql = "SELECT honker_lock_renew(?1, ?2, ?3)";
     if (c.sqlite3_prepare_v2(db, sql, -1, &stmt, null) != c.SQLITE_OK) return HONKER_ERR_SQL;
     defer _ = c.sqlite3_finalize(stmt);
 
@@ -642,9 +649,7 @@ export fn honker_cpp_lock_heartbeat(
     bind_text(stmt, 2, owner_z);
     _ = c.sqlite3_bind_int64(stmt, 3, ttl_sec);
 
-    const rc = c.sqlite3_step(stmt);
-    if (rc == c.SQLITE_ROW) return 1;
-    return 0;
+    return step_scalar_int64(stmt);
 }
 
 // ---------------------------------------------------------------------

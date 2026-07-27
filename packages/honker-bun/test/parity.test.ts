@@ -208,6 +208,34 @@ maybe("honker-bun parity — Stream", () => {
   );
 
   test(
+    "breaking mid-stream resumes after the last delivered event",
+    withDb(async (db) => {
+      const s = db.stream("orders");
+      s.publish({ i: 1 });
+      s.publish({ i: 2 });
+
+      // Consume one event, then break — the on-close flush must save
+      // the offset of the event actually delivered, not the one
+      // before it (regression: the yield preceded the offset advance,
+      // so the final event was re-delivered on the next subscribe).
+      for await (const ev of s.subscribe("billing")) {
+        expect((ev.payload as any).i).toBe(1);
+        break;
+      }
+      expect(s.getOffset("billing")).toBe(1);
+
+      const resumed = s.subscribe("billing")[Symbol.asyncIterator]();
+      try {
+        const next = await resumed.next();
+        expect(next.done).toBe(false);
+        expect((next.value.payload as any).i).toBe(2);
+      } finally {
+        await resumed.return?.();
+      }
+    }),
+  );
+
+  test(
     "publishTx + saveOffsetTx respect rollback",
     withDb((db) => {
       const s = db.stream("orders");

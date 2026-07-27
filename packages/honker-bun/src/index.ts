@@ -117,6 +117,7 @@ export interface ScheduledTask {
   payload: unknown;
   priority?: number;
   expiresS?: number | null;
+  maxAttempts?: number;
 }
 
 export interface ScheduledFire {
@@ -136,6 +137,7 @@ export interface ScheduleRow {
   expires_s: number | null;
   next_fire_at: number;
   enabled: boolean;
+  max_attempts: number;
 }
 
 export interface ScheduleUpdate {
@@ -144,6 +146,7 @@ export interface ScheduleUpdate {
   payload?: unknown;
   priority?: number | null;
   expiresS?: number | null;
+  maxAttempts?: number | null;
 }
 
 export interface JobRow {
@@ -1027,7 +1030,11 @@ async function* subscribeImpl(
         continue;
       }
       for (const ev of events) {
-        yield ev;
+        // Advance BEFORE the yield: if the consumer breaks or throws
+        // after receiving this event, the offset (and any periodic
+        // save) must already reflect it — otherwise the finally-flush
+        // saves the previous offset and the event is re-delivered on
+        // the next subscribe.
         lastOffset = ev.offset;
         const enoughEvents = saveEveryN > 0 && lastOffset - lastSaved >= saveEveryN;
         const enoughTime = saveEveryS > 0 && Date.now() - lastSaveAt >= saveEveryS * 1000;
@@ -1036,6 +1043,7 @@ async function* subscribeImpl(
           lastSaved = lastOffset;
           lastSaveAt = Date.now();
         }
+        yield ev;
       }
     }
   } finally {
@@ -1106,9 +1114,9 @@ export class Scheduler {
     this.db.raw
       .query<
         { v: number },
-        [string, string, string, string, number, number | null]
+        [string, string, string, string, number, number | null, number]
       >(
-        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?) AS v",
+        "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?) AS v",
       )
       .get(
         task.name,
@@ -1117,6 +1125,7 @@ export class Scheduler {
         payloadJson,
         task.priority ?? 0,
         task.expiresS ?? null,
+        task.maxAttempts ?? 3,
       );
     this.db._markUpdated();
   }
@@ -1194,11 +1203,13 @@ export class Scheduler {
     const priorityArg = has("priority") ? (opts.priority as number) : null;
     const touchExpires = has("expiresS") ? 1 : 0;
     const expiresArg = has("expiresS") ? (opts.expiresS as number | null) : null;
+    const touchMaxAttempts = has("maxAttempts") ? 1 : 0;
+    const maxAttemptsArg = has("maxAttempts") ? (opts.maxAttempts as number | null) : null;
     const row = this.db.raw
-      .query<{ v: number }, [string, string | null, string | null, number | null, number | null, number]>(
-        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?) AS v",
+      .query<{ v: number }, [string, string | null, string | null, number | null, number | null, number, number | null, number]>(
+        "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?) AS v",
       )
-      .get(name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires)!;
+      .get(name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires, maxAttemptsArg, touchMaxAttempts)!;
     if (row.v > 0) this.db._markUpdated();
     return row.v > 0;
   }
@@ -1245,13 +1256,10 @@ export class Scheduler {
   ): Promise<void> {
     let lastHeartbeat = Date.now();
     while (!signal.aborted) {
+      const stillOurs = lock.heartbeat(SCHEDULER_LOCK_TTL_S);
+      if (!stillOurs) return; // lost — exit leader loop, re-contest
+      lastHeartbeat = Date.now();
       this.tick();
-      const now = Date.now();
-      if (now - lastHeartbeat >= SCHEDULER_HEARTBEAT_MS) {
-        const stillOurs = lock.heartbeat(SCHEDULER_LOCK_TTL_S);
-        if (!stillOurs) return; // lost — exit leader loop, re-contest
-        lastHeartbeat = now;
-      }
       let waitMs = Math.max(0, SCHEDULER_HEARTBEAT_MS - (Date.now() - lastHeartbeat));
       const nextFire = this.soonest();
       if (nextFire && nextFire > 0) {
@@ -1334,17 +1342,12 @@ export class Lock {
    * directly, matching the Elixir binding.
    */
   heartbeat(ttlS: number): boolean {
-    const stmt = this.db.raw.query<
-      unknown,
-      [number, string, string]
-    >(
-      "UPDATE _honker_locks SET expires_at = unixepoch() + ? " +
-        "WHERE name = ? AND owner = ?",
-    );
-    stmt.run(ttlS, this.name, this.owner);
-    return this.db.raw.query<{ c: number }, []>(
-      "SELECT changes() AS c",
-    ).get()!.c > 0;
+    // honker_lock_renew refreshes expires_at for this owner only.
+    // honker_lock_acquire uses INSERT OR IGNORE and does not extend TTL.
+    const row = this.db.raw.query<{ r: number }, [string, string, number]>(
+      "SELECT honker_lock_renew(?, ?, ?) AS r",
+    ).get(this.name, this.owner, ttlS);
+    return (row?.r ?? 0) > 0;
   }
 }
 

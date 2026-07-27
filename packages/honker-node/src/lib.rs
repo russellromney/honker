@@ -414,12 +414,19 @@ impl Drop for UpdateEvents {
 #[napi]
 impl UpdateEvents {
     /// Await the next database update. Resolves on every DB commit.
+    /// Rejects with a "watcher died or was closed" message when the
+    /// subscription's channel closes — either because the watcher
+    /// thread died (e.g. the db file was replaced) or because close()
+    /// unsubscribed. Callers can match on "watcher died" to decide
+    /// whether to reopen the database.
     #[napi]
     pub async fn next(&self) -> Result<()> {
         let rx = self.rx.clone();
         tokio::task::spawn_blocking(move || {
             let r = rx.lock();
-            r.recv().map_err(napi_err)
+            r.recv().map_err(|_| {
+                napi_err("honker update watcher died or was closed (subscription channel closed)")
+            })
         })
         .await
         .map_err(napi_err)??;

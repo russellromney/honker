@@ -1,6 +1,6 @@
 [package]
 name = "honker-core"
-version = "0.2.4"
+version = "0.4.0"
 edition = "2024"
 description = "Shared Rust foundation for Honker bindings (SQLite loadable extension, PyO3, napi-rs, and friends). Not intended for direct use."
 license = "MIT OR Apache-2.0"
@@ -28,6 +28,7 @@ name = "honker_core"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12.5"
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
+serde_json = "1"
 thiserror = "2.0.18"
 # Optional: kernel-watch backend.
 # macos_kqueue: on macOS, use kqueue (RecommendedWatcher = KqueueWatcher) instead of

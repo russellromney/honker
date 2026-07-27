@@ -620,9 +620,13 @@ def test_extension_result_interops_with_python(ext_db_path):
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
-def test_extension_enqueue_returns_id_and_fires_notify(ext_db_path):
-    """`honker_enqueue` INSERTs a row, returns its id, and pushes a
-    'new' notification on `honker:<queue>` so waiting workers wake.
+def test_extension_enqueue_returns_id_without_wake_row(ext_db_path):
+    """`honker_enqueue` INSERTs a live row and returns its id.
+
+    It must NOT write a synthetic `_honker_notifications` wake row —
+    the live INSERT advances data_version on commit, which is what
+    update watchers observe. Per-enqueue wake rows used to grow the
+    notifications table without bound.
     """
     conn = _open_ext(ext_db_path)
     # Seven args: queue, payload, run_at_or_null, delay_or_null,
@@ -639,11 +643,11 @@ def test_extension_enqueue_returns_id_and_fires_notify(ext_db_path):
     ).fetchone()
     assert row == (rid, "q", '{"x":1}', "pending")
 
-    # Notify fired on the queue's channel.
+    # No synthetic wake row on honker:<queue>.
     notif = conn.execute(
-        "SELECT channel, payload FROM _honker_notifications ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    assert notif == ("honker:q", "new")
+        "SELECT COUNT(*) FROM _honker_notifications WHERE channel='honker:q'"
+    ).fetchone()[0]
+    assert notif == 0
     conn.close()
 
 
@@ -707,9 +711,10 @@ def test_extension_ack_singular(ext_db_path):
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
-def test_extension_retry_flips_back_and_fires_wake(ext_db_path):
-    """honker_retry flips the claim back to pending with run_at pushed,
-    and notifies the queue's channel so waiting workers re-poll."""
+def test_extension_retry_flips_back_without_wake_row(ext_db_path):
+    """honker_retry flips the claim back to pending with run_at pushed.
+    No synthetic notification row — wake is data_version from the UPDATE.
+    """
     conn = _open_ext(ext_db_path)
     conn.execute("SELECT honker_enqueue('rq', '{}', NULL, NULL, 0, 5, NULL)")
     conn.commit()
@@ -719,7 +724,6 @@ def test_extension_retry_flips_back_and_fires_wake(ext_db_path):
     conn.commit()
     rid = json.loads(claimed)[0]["id"]
 
-    # Truncate earlier notifications so we can assert on the retry one.
     conn.execute("DELETE FROM _honker_notifications")
     conn.commit()
 
@@ -740,9 +744,9 @@ def test_extension_retry_flips_back_and_fires_wake(ext_db_path):
     assert 58 <= ra - now <= 62
 
     notif = conn.execute(
-        "SELECT channel, payload FROM _honker_notifications"
-    ).fetchone()
-    assert notif == ("honker:rq", "new")
+        "SELECT COUNT(*) FROM _honker_notifications"
+    ).fetchone()[0]
+    assert notif == 0
     conn.close()
 
 

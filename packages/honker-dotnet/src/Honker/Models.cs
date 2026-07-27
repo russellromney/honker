@@ -22,7 +22,8 @@ public sealed record ScheduledTask(
     string? Schedule = null,
     string? Cron = null,
     long Priority = 0,
-    long? ExpiresSeconds = null
+    long? ExpiresSeconds = null,
+    int MaxAttempts = 3
 );
 
 public sealed record ScheduledFire(
@@ -58,6 +59,9 @@ public sealed record ScheduleRow
 
     [System.Text.Json.Serialization.JsonPropertyName("enabled")]
     public bool Enabled { get; init; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("max_attempts")]
+    public long MaxAttempts { get; init; }
 }
 
 /// <summary>
@@ -76,11 +80,15 @@ public sealed class ScheduleUpdate
     public bool HasPriority { get; private set; }
     public long? ExpiresSeconds { get; private set; }
     public bool HasExpires { get; private set; }
+    public int? MaxAttempts { get; private set; }
+    public bool HasMaxAttempts { get; private set; }
 
     public ScheduleUpdate WithCron(string? cron) { Cron = cron; HasCron = true; return this; }
     public ScheduleUpdate WithPayload(object? payload) { Payload = payload; HasPayload = true; return this; }
     public ScheduleUpdate WithPriority(long? priority) { Priority = priority; HasPriority = true; return this; }
     public ScheduleUpdate WithExpiresSeconds(long? value) { ExpiresSeconds = value; HasExpires = true; return this; }
+    /// <summary>Set the attempt budget for future fired jobs. Passing null resets to default 3.</summary>
+    public ScheduleUpdate WithMaxAttempts(int? value) { MaxAttempts = value; HasMaxAttempts = true; return this; }
 }
 
 public sealed record JobRow

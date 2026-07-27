@@ -1,16 +1,12 @@
-name: Release · crates.io
+name: Proof · crates.io package
 
-# Publishes honker-core + honker-extension to crates.io when a tag
-# matching `core-v*` or `ext-v*` is pushed. Keeps crate versions
-# independent so we can ship a point release of one without the other.
+# Proves honker-core + honker-extension release packaging when a tag
+# matching `core-v*` or `ext-v*` is pushed. Publishing is done locally.
 #
 # Usage:
 #   git tag core-v0.1.1 && git push origin core-v0.1.1
 #   git tag ext-v0.1.1  && git push origin ext-v0.1.1
 #
-# Requires repo secret CARGO_REGISTRY_TOKEN (crates.io API token with
-# publish scope for the honker-* crates).
-
 on:
   push:
     tags:
@@ -29,27 +25,20 @@ on:
 # Source-tree hash pinning lives per-job (hashFiles() can't run at
 # workflow level before checkout). See ci.yml for context.
 
-# Drop the default-write GITHUB_TOKEN — this workflow publishes via
-# CARGO_REGISTRY_TOKEN (env var below), not the GitHub token. Pure
-# `contents: read` is enough for checkout.
 permissions:
   contents: read
 
 jobs:
-  publish:
+  package-proof:
     runs-on: ubuntu-latest
     steps:
-      # Actions are pinned to commit SHAs — this workflow has the
-      # crates.io publish token in scope. A compromised tag (the
-      # tj-actions/changed-files class of attack) on any of these
-      # actions would otherwise be able to exfiltrate the token.
-      # Bump the SHAs intentionally; Dependabot will open PRs.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
         with:
           # Don't leave the GITHUB_TOKEN in `.git/config` for later
           # steps to scoop up.
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Set up Rust
+        run: rustup default stable
       # No rust-cache here. Releases run on tag-push (rare), so the
       # ~60s saved by sharing ci.yml's cache isn't worth the cache-
       # poisoning surface area: a compromised PR run could populate
@@ -80,11 +69,12 @@ jobs:
       - name: Verify test suite before publish
         run: cargo test -p honker-core --locked --release --lib
 
-      - name: Publish to crates.io
+      - name: Package crate
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           CRATE: ${{ steps.crate.outputs.name }}
         run: |
-          # --locked: publish exactly the dependency graph in the
-          # committed Cargo.lock, not whatever resolves at publish time.
-          cargo publish --locked -p "$CRATE"
+          # --locked: package against exactly the dependency graph in the
+          # committed Cargo.lock, so this proof reflects what a local
+          # publish would actually ship rather than whatever resolves at
+          # packaging time.
+          cargo package --locked -p "$CRATE"

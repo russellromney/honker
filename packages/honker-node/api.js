@@ -36,28 +36,50 @@ function aborted(signal) {
 }
 
 function abortPromise(signal) {
-  if (!signal) return new Promise(() => {});
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
+  // Every caller must cancel() once its race settles: an { once: true }
+  // listener is only removed by the platform when abort actually fires,
+  // so without cancel() each poll timeout would leak one listener on
+  // the signal until it aborts (issue #67).
+  if (!signal) return { promise: new Promise(() => {}), cancel() {} };
+  if (signal.aborted) return { promise: Promise.resolve(), cancel() {} };
+  let onAbort;
+  const promise = new Promise((resolve) => {
+    onAbort = resolve;
     signal.addEventListener('abort', resolve, { once: true });
   });
+  return {
+    promise,
+    cancel() {
+      signal.removeEventListener('abort', onAbort);
+    },
+  };
 }
 
 async function waitForUpdateOrTimeout(updateEvents, signal, timeoutMs) {
   if (aborted(signal)) return;
-  if (timeoutMs == null) {
-    await Promise.race([
-      updateEvents.next().catch(() => undefined),
-      abortPromise(signal),
-    ]);
-    return;
+  // A dead watcher never fires again (UpdateEvents._settle records
+  // native-wait failures): skip the event wait and degrade to plain
+  // poll cadence instead of hot-looping on instantly-rejecting waits.
+  const wait = updateEvents._dead == null ? updateEvents._subscribe() : null;
+  // An event-only wait (timeoutMs == null) on a dead watcher could
+  // never settle — not even close() would wake it, since there is no
+  // parked waiter left to reject. Degrade it to a 1 s cadence so the
+  // wait loops keep re-checking their closed/abort flags.
+  const effectiveMs = wait == null && timeoutMs == null ? 1000 : timeoutMs;
+  const onAbort = abortPromise(signal);
+  try {
+    // Waiter promises reject on watcher death / close(); internal wait
+    // loops treat that as an ordinary wake (they re-check their closed
+    // flags and exit), so swallow it here.
+    const racers = [];
+    if (wait) racers.push(wait.promise.catch(() => undefined));
+    if (effectiveMs != null) racers.push(delay(Math.max(0, effectiveMs)));
+    racers.push(onAbort.promise);
+    await Promise.race(racers);
+  } finally {
+    if (wait) wait.cancel();
+    onAbort.cancel();
   }
-  const ms = Math.max(0, timeoutMs);
-  await Promise.race([
-    updateEvents.next().catch(() => undefined),
-    delay(ms),
-    abortPromise(signal),
-  ]);
 }
 
 function unwrapTx(tx) {
@@ -98,15 +120,86 @@ class UpdateEvents {
   constructor(ev) {
     this._ev = ev;
     this._closed = false;
+    // One pending native wait shared by every concurrent waiter. The
+    // native next() parks a Tokio blocking-pool thread on recv() until
+    // the next commit or close(), and it cannot be cancelled — so every
+    // abandoned next() (Promise.race losers, in particular) would pin
+    // one more OS thread for the life of an idle database. Sharing the
+    // wait means N concurrent next() calls cost one thread total.
+    //
+    // While no commit arrives, the single pending wait holds its one
+    // thread even between waker.next() calls (e.g. during job
+    // processing). That residual thread is deliberate: the native wait
+    // has no cancellation, and the alternative is a thread per wait.
+    this._pending = null;
+    this._waiters = new Set();
+    // Set when the native wait fails (watcher death — close() is
+    // checked first and takes precedence). The subscription can never
+    // fire again: the shared watcher's sender is gone, and a fresh
+    // native next() would reject instantly. Internal wait loops check
+    // this to degrade to poll cadence instead of hot-looping.
+    this._dead = null;
   }
 
   raw() {
     return this._ev;
   }
 
+  // Internal: subscribe to the shared native wait. The promise
+  // RESOLVES on the next update and REJECTS when the native wait fails
+  // (watcher death, close()) — same contract as awaiting next().
+  // Callers that race the returned promise MUST cancel() when their
+  // race settles another way — otherwise each abandoned race leaves
+  // its waiter in the set until the wait settles (bounded by poll
+  // rate × idle time; waitForUpdateOrTimeout cancels, keeping the set
+  // at one entry per in-flight wait).
+  _subscribe() {
+    if (this._closed) {
+      return { promise: Promise.resolve(), cancel() {} };
+    }
+    if (this._dead != null) {
+      return { promise: Promise.reject(this._dead), cancel() {} };
+    }
+    if (!this._pending) {
+      const pending = this._ev.next().then(
+        () => this._settle(pending, null),
+        (err) => this._settle(pending, err),
+      );
+      this._pending = pending;
+    }
+    let waiter;
+    const promise = new Promise((resolve, reject) => {
+      waiter = { resolve, reject };
+    });
+    this._waiters.add(waiter);
+    return {
+      promise,
+      cancel: () => {
+        this._waiters.delete(waiter);
+      },
+    };
+  }
+
+  _settle(pending, err) {
+    if (this._pending !== pending) return;
+    this._pending = null;
+    if (err != null) this._dead = err;
+    const waiters = [...this._waiters];
+    this._waiters.clear();
+    for (const w of waiters) {
+      if (err == null) w.resolve();
+      else w.reject(err);
+    }
+  }
+
+  /** Wait for the next database update. Resolves on the next commit;
+   *  rejects when the watcher dies or close() cuts the subscription.
+   *  Concurrent calls share one native wait and settle together — a
+   *  wake is a "go re-read state" hint, not a per-caller event — so
+   *  racing next() against your own timeout never starts extra native
+   *  waits. */
   async next() {
-    if (this._closed) return;
-    await this._ev.next();
+    await this._subscribe().promise;
   }
 
   close() {
@@ -133,8 +226,10 @@ class Lock {
   }
 
   heartbeat(ttlS) {
+    // honker_lock_acquire uses INSERT OR IGNORE and does not refresh
+    // expires_at for an existing owner. Use honker_lock_renew.
     return (
-      this._db._callScalar('SELECT honker_lock_acquire(?, ?, ?)', [
+      this._db._callScalar('SELECT honker_lock_renew(?, ?, ?)', [
         this.name,
         this.owner,
         ttlS,
@@ -454,7 +549,11 @@ class StreamSubscription {
         this._maybeSaveOffset();
         return { done: false, value: event };
       }
-      await this._updates.next().catch(() => undefined);
+      // 1 s fallback poll: while the watcher is live the event wait
+      // wins every race, so this costs nothing; when the watcher is
+      // dead it bounds the loop to poll cadence instead of spinning
+      // on instantly-rejecting waits.
+      await waitForUpdateOrTimeout(this._updates, null, 1000);
     }
     return { done: true, value: undefined };
   }
@@ -604,16 +703,17 @@ class Scheduler {
     this._db = db;
   }
 
-  add({ name, queue, schedule = null, cron = null, payload, priority = 0, expiresS = null }) {
+  add({ name, queue, schedule = null, cron = null, payload, priority = 0, expiresS = null, maxAttempts = 3 }) {
     const expr = schedule ?? cron;
     if (!expr) throw new Error('must provide schedule or cron');
-    this._db._callScalar('SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)', [
+    this._db._callScalar('SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)', [
       name,
       queue,
       expr,
       jsonText(payload),
       priority,
       expiresS,
+      maxAttempts,
     ]);
   }
 
@@ -647,9 +747,11 @@ class Scheduler {
     const priorityArg = has('priority') ? opts.priority : null;
     const touchExpires = has('expiresS') ? 1 : 0;
     const expiresArg = has('expiresS') ? opts.expiresS : null;
+    const touchMaxAttempts = has('maxAttempts') ? 1 : 0;
+    const maxAttemptsArg = has('maxAttempts') ? opts.maxAttempts : null;
     const n = this._db._callScalar(
-      'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)',
-      [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires],
+      'SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, cronArg, payloadArg, priorityArg, expiresArg, touchExpires, maxAttemptsArg, touchMaxAttempts],
     );
     return n > 0;
   }
@@ -689,11 +791,9 @@ class Scheduler {
     const heartbeatMs = 20_000;
     let lastHeartbeat = monotonicMs();
     while (!aborted(signal)) {
+      if (!lock.heartbeat(60)) return;
+      lastHeartbeat = monotonicMs();
       this.tick();
-      if (monotonicMs() - lastHeartbeat >= heartbeatMs) {
-        if (!lock.heartbeat(60)) return;
-        lastHeartbeat = monotonicMs();
-      }
 
       let waitMs = Math.max(0, heartbeatMs - (monotonicMs() - lastHeartbeat));
       const nextFire = this.soonest();

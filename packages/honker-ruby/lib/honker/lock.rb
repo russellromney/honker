@@ -56,11 +56,11 @@ module Honker
 
     # Extend the TTL. Returns true if we still hold the lock; false if
     # it was stolen (the TTL elapsed and another owner acquired it).
-    # The underlying SQL is the same as `try_lock`, but keyed on our
-    # existing `(name, owner)` pair so it refreshes rather than blocks.
+    # Uses honker_lock_renew — honker_lock_acquire does not refresh
+    # expires_at for an existing (name, owner) row.
     def heartbeat(ttl_s:)
       @db.db.get_first_row(
-        "SELECT honker_lock_acquire(?, ?, ?)",
+        "SELECT honker_lock_renew(?, ?, ?)",
         [@name, @owner, ttl_s],
       )[0] == 1
     end

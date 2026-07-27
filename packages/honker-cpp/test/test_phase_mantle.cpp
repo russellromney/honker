@@ -77,12 +77,14 @@ void test_update_mutates_and_noop(const char* ext) {
     assert(payload["v"] == 99);
     assert(rows[0]["priority"] == 5);
 
-    // Cron change recomputes next_fire_at.
-    int64_t before = rows[0]["next_fire_at"].get<int64_t>();
-    assert(sched.update("t", std::string_view{"*/5 * * * *"}, std::nullopt, std::nullopt, std::nullopt));
+    // Cron change recomputes next_fire_at from now.
+    const auto update_started = static_cast<int64_t>(std::time(nullptr));
+    assert(sched.update("t", std::string_view{"@every 1s"}, std::nullopt, std::nullopt, std::nullopt));
     rows = json::parse(sched.list_json());
-    assert(rows[0]["cron_expr"] == "*/5 * * * *");
-    assert(rows[0]["next_fire_at"].get<int64_t>() != before);
+    assert(rows[0]["cron_expr"] == "@every 1s");
+    const auto next_fire_at = rows[0]["next_fire_at"].get<int64_t>();
+    assert(next_fire_at >= update_started + 1);
+    assert(next_fire_at <= update_started + 5);
 
     // Empty update is a no-op.
     assert(sched.update("t", std::nullopt, std::nullopt, std::nullopt, std::nullopt) == false);

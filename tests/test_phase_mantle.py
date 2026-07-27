@@ -59,12 +59,12 @@ def test_schedule_update_mutates_fields(tmp_path):
     assert json.loads(row["payload"]) == {"v": 99}
     assert row["priority"] == 5
 
-    # Changing cron_expr recomputes next_fire_at.
-    before = row["next_fire_at"]
-    assert sched.update("t", schedule=crontab("*/5 * * * *")) is True
+    # Changing cron_expr recomputes next_fire_at from now.
+    update_started = int(time.time())
+    assert sched.update("t", schedule=every_s(1)) is True
     after = [s for s in sched.list() if s["name"] == "t"][0]
-    assert after["cron_expr"] == "*/5 * * * *"
-    assert after["next_fire_at"] != before
+    assert after["cron_expr"] == "@every 1s"
+    assert update_started + 1 <= after["next_fire_at"] <= update_started + 5
 
     assert sched.update("missing", payload={}) is False
 

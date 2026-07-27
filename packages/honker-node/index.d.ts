@@ -59,7 +59,14 @@ export declare class Transaction {
 }
 
 export declare class UpdateEvents {
-  /** Await the next database update. Resolves on every DB commit. */
+  /**
+   * Await the next database update. Resolves on every DB commit.
+   * Rejects with a "watcher died or was closed" message when the
+   * subscription's channel closes — either because the watcher
+   * thread died (e.g. the db file was replaced) or because close()
+   * unsubscribed. Callers can match on "watcher died" to decide
+   * whether to reopen the database.
+   */
   next(): Promise<void>
   /** Stop this subscription eagerly. Idempotent. */
   close(): void
