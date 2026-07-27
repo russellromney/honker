@@ -36,9 +36,9 @@ git tag ext-v0.1.1
 git push origin ext-v0.1.1
 ```
 
-GitHub Actions (`.github/workflows/release-crates.yml`) picks up tags matching `core-v*` / `ext-v*` and runs `cargo publish`.
+GitHub Actions (`.github/workflows/release-crates.yml`) picks up tags matching `core-v*` / `ext-v*` and builds, verifies, and smoke-tests the crate artifacts. It does not publish — `cargo publish` is a manual step after the proof job is green. The same holds for every other ecosystem's release workflow.
 
-Each language binding lives in its own submodule repo and has its own release process; see each binding's README.
+Each language binding lives in `packages/` in this repo and has its own release tag prefix; see each binding's README.
 
 ## Making changes
 

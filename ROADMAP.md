@@ -1,7 +1,9 @@
 # ROADMAP
 
 Roadmap items are future work. Completed phases move to
-`CHANGELOG.md`; this file should not carry shipped history.
+`CHANGELOG.md`; this file should not carry shipped history as its own
+section. A phase that shipped partially may keep a short note saying so,
+but only as context for the work that is genuinely still open.
 
 ## Phase naming
 
@@ -25,8 +27,10 @@ Replace Honker's internal named-lock lease implementation with
   `bouncer_core::claim` / `claim_in_tx`.
 - Reimplement `honker_lock_release(name, owner)` using
   `bouncer_core::release` / `release_in_tx`.
-- Add a Honker renew path for scheduler and binding heartbeats,
-  backed by `bouncer_core::renew` / `renew_in_tx`.
+- Re-back the existing renew path on `bouncer_core::renew` /
+  `renew_in_tx`. `honker_lock_renew(name, owner, ttl_s)` already ships
+  and binding lock/scheduler heartbeats already use it, so this is a
+  swap of the implementation, not a new API.
 - Preserve Python `db.lock(...)`, Rust `db.try_lock(...)`, and SQL
   `honker_lock_*` return shapes.
 - Keep Bouncer fencing tokens internal for now; Honker's lock API can
@@ -90,47 +94,9 @@ change.
 - Add follow-up watcher timing tests if Windows still shows
   platform-specific drift.
 
-## Completed — Time-trigger scheduler and wake parity
-
-Shipped in PR #29, with follow-up release prep in PR #33.
-
-- `run_at` jobs now wake workers at their deadline instead of waiting
-  for a later fallback poll.
-- Reclaim deadlines now wake sleeping workers on time too.
-- Scheduler expressions now support 5-field cron, 6-field cron, and
-  `@every <n><unit>`.
-- Maintained bindings converged on the same basic time-trigger shape:
-  update wake or next deadline, with fallback polling only as backup.
-- Canonical recurring name is now `schedule`, with legacy `cron` kept
-  as a compatibility alias where needed.
-- Ruby and Elixir expose extension-backed `notify` and table APIs but do
-  not yet expose async listen/update-watcher APIs.
-
-### Scope
-
-- Add binding docs that name whether each package uses update events or
-  timer polling.
-- Add Bun `updateEvents()` / listen bridge, or explicitly defer it with
-  tests proving current poll behavior.
-- Add Ruby and Elixir listener APIs only if their runtime integrations
-  can support a clean cancellation story.
-- Decide whether Go and C++ should keep local watcher implementations or
-  grow a shared C ABI around the core watcher.
-- Add parity tests that exercise a cross-process notification wake in
-  every binding with a listener API.
-
-### Non-goals
-
-- Do not make the SQLite loadable extension itself push events. Plain SQL
-  clients can write/read the shared tables, but need a host-language
-  watcher to sleep efficiently.
-- Do not block 1.0 on bindings that are explicitly marked poll-based or
-  partial, as long as the docs and tests say so.
-
-
 ## Phase Echo — Experimental Watcher Backends Across All Bindings
 
-> After: Phase Wake Parity · Before: 1.0 release prep
+> Before: 1.0 release prep
 
 > **Status:** core + Python + Node shipped in PR #30 (universal polling
 > SQLITE_BUSY fix, opt-in `kernel`/`shm` backends behind Cargo features,
@@ -248,6 +214,14 @@ feature-parity phase should either port those task APIs to every core
 binding or define explicit API tiers so "core binding" has a precise
 meaning before 1.0.
 
+Two listener-surface gaps carry over from the shipped wake-parity work:
+
+- Ruby and Elixir expose extension-backed `notify` and table APIs but
+  still have no async listen / update-watcher API. Add one only if the
+  runtime integration can support a clean cancellation story.
+- Add parity tests exercising a cross-process notification wake in every
+  binding that has a listener API.
+
 ## Phase Atlas — Map Experimental Backend Edge-Case Behavior
 
 > After: Phase Echo · Before: 1.0 release prep
@@ -341,72 +315,37 @@ the default either way; "available in wheels" is the only flip.
 - Don't ship a feature that fails any platform's CI. If one OS
   earns it and another doesn't, ship neither.
 
-## Phase Mantle — Schedule Lifecycle + Cancel
+## Phase Mantle Follow-Ups — Schedule Lifecycle Residuals
 
-> After: Phase Echo · Before: 1.0 release prep
+> Before: 1.0 release prep
 
-Mickey Mantle was a switch-hitter — pause / resume from one side to
-the other. This phase makes schedules and pending jobs *manageable* at
-runtime: pause, resume, modify, unschedule, list, cancel. Today an
-operator (or CLI tool, or MCP wrapper) has to UPDATE / DELETE
-`_honker_scheduler_tasks` and `_honker_live` directly. After Mantle
-they call methods.
+Phase Mantle itself shipped in PR #42 (see `CHANGELOG.md`): the
+`enabled` column, the seven `honker_scheduler_*` / `honker_cancel` /
+`honker_get_job` SQL functions, scheduler `pause` / `resume` / `remove`
+/ `list` / `update`, and queue `cancel` / `get_job` across every
+maintained binding. Two acceptance items were never met and are the
+only work left here.
 
-This is the answer to issue #25 / #26. `max_runs` is deliberately NOT
-in scope — see Non-goals — but the rest of sahuguet's wishlist
-(pause, resume, modify, list, unschedule, cancel) is. Closest prior
-art: pg-boss (`schedule`, `unschedule`, `getSchedules`, `cancel`).
-pg-boss also lacks `max_runs`; honker matches its shape.
+- [ ] Cross-process proof: `pause` from process A observed by the
+      scheduler in process B within ≤ 1 s; `resume` re-emits within
+      ≤ 1 s. Current coverage in `tests/test_phase_mantle.py` is
+      single-process, including `test_paused_schedule_does_not_emit`.
+- [ ] Write the "deterministic wrapper for max_runs" recipe at
+      `docs/recipes/bounded-schedules.mdx` — a worker that checks its
+      own counter and calls `remove()` when the bound is hit. This is
+      the documented answer to the `max_runs` requests in issue #25, so
+      the stance is only half-shipped without it.
 
-### Scope
-
-Schedule lifecycle:
-- [ ] Add `enabled BOOLEAN NOT NULL DEFAULT 1` to `_honker_scheduler_tasks`.
-- [ ] `db.unschedule(name)` — DELETE the row. Idempotent on missing.
-- [ ] `db.pause_schedule(name)` / `db.resume_schedule(name)` — toggle
-      `enabled`. Scheduler skips emitting from disabled rows.
-- [ ] `db.list_schedules()` — return all rows with current state +
-      `next_fire_at`. Useful for admin UIs and "what's scheduled?"
-      MCP tools.
-- [ ] `db.update_schedule(name, *, cron_expr=None, payload=None,
-      priority=None, expires_s=None)` — mutate in place. Recompute
-      `next_fire_at` if `cron_expr` changed.
-
-Job lifecycle:
-- [ ] `db.queue("emails").cancel(job_id)` — DELETE a pending or
-      processing row. Returns true if a row was removed. Idempotent.
-- [ ] `db.queue("emails").get_job(job_id)` — return the row (or
-      None). Pure read.
-
-Bindings:
-- [ ] Wire all methods through Python + Node + Rust. Other bindings
-      tracked under Phase Echo.
-
-### Acceptance
-
-- [ ] One round-trip test per method per binding (Python + Node + Rust).
-- [ ] Cross-process: `pause` from process A is observed by scheduler
-      in process B within ≤ 1 s; `resume` re-emits within ≤ 1 s.
-- [ ] `list_schedules` round-trips all fields including the new `enabled`.
-- [ ] `cancel()` of a pending job removes it before any worker claims.
-- [ ] `cancel()` of a claimed-but-not-ack'd job removes it; the
-      worker's subsequent `ack()` returns 0 (no-op, same as expired claim).
-- [ ] Documented "deterministic-wrapper for max_runs" pattern in
-      `docs/recipes/bounded-schedules.mdx` — uses `unschedule()` from
-      inside the worker after a counter check.
-
-### Non-goals
+### Non-goals (unchanged, and still the reason `max_runs` has no column)
 
 - **No `max_runs` column.** It looks like a scheduler primitive but the
   semantic ambiguity (fires vs claims vs successful completions) is
   business logic. Apps that need bounded recurrences either insert N
   concrete `run_at` jobs at registration time, or maintain their own
-  counter and call `unschedule()` when the bound is hit. pg-boss
-  reached the same conclusion. Issue #25 thread covers the reasoning.
+  counter and call `remove()` when the bound is hit. pg-boss reached
+  the same conclusion. Issue #25 thread covers the reasoning.
 - No `end_at` (time-based bound) yet — different semantics from
-  `max_runs`, separate phase if demand surfaces. The clean version of
-  the same idea (measured at the emit boundary, no downstream-state
-  dependency).
+  `max_runs`, separate phase if demand surfaces.
 - No "cancel by predicate" / "cancel all in queue" — too easy to shoot
   a foot. Write the SQL if you need it.
 - No "modify all running jobs spawned from this schedule" — schedules
@@ -415,7 +354,7 @@ Bindings:
 
 ## Phase Mays — Pg-Boss Parity (Singleton, State Events, Queue Stats)
 
-> After: Phase Mantle · Before: 1.0 release prep
+> Before: 1.0 release prep
 
 Willie Mays was a five-tool player — hit, hit for power, run, field,
 throw. This phase is five-ish small features that together close most
@@ -498,7 +437,7 @@ Queue stats:
 
 ## Phase Gehrig — Per-Queue Config Defaults
 
-> After: Phase Mantle · Phase Mays · Before: 1.0 release prep
+> After: Phase Mays · Before: 1.0 release prep
 
 Today every `enqueue()` accepts (and may require) `max_attempts`,
 `expires_s`, `priority`. For production deployments this is repetitive
@@ -524,7 +463,7 @@ intentionally last in the sequence after the easier wins.
 - [ ] `enqueue()` merges per-call args over per-queue defaults over
       hard-coded defaults. Per-call wins.
 - [ ] `db.list_queues()` — return all configured queues with their
-      defaults + sizes (composes with Phase Ledger).
+      defaults + sizes (composes with Phase Mays queue stats).
 - [ ] Migration: existing databases work unchanged; queues without a
       `_honker_queues` row use hard-coded defaults exactly as today.
 
@@ -555,10 +494,16 @@ intentionally last in the sequence after the easier wins.
 > After: Phase Echo · Before: 1.0 release prep
 
 DiMaggio's hitting streak was 56 games of consistent contact — pace
-matching context. The default polling backend currently runs at a
-fixed 1 ms cadence regardless of activity: idle databases burn the
-same CPU as busy ones. Recurring HN ask: "wind back the polling to
-once a second when nothing is happening."
+matching context. The default polling backend holds one cadence
+regardless of activity: an idle database burns the same CPU as a busy
+one. Recurring HN ask: "wind back the polling to once a second when
+nothing is happening."
+
+`WatcherConfig::poll_interval` already exists and is threaded through
+every binding, so the cadence is configurable — but it is a single
+static value the user has to pick up front. This phase makes the
+default backend pick it automatically from observed activity, which is
+the part users actually asked for.
 
 This is a change to the **default** backend (not the experimental
 ones). Affects everyone, no opt-in. Addresses both the polling-
@@ -566,15 +511,20 @@ overhead critique and the mobile / battery concern in one move.
 
 ### Scope
 
-- [ ] Track `time_since_last_wake` in `run_poll_loop`.
-- [ ] If > `IDLE_THRESHOLD_S` (default 5 s), scale poll interval up
-      geometrically (1 ms → 2 → 4 → ... cap at `MAX_POLL_INTERVAL_MS`,
-      default 1000 ms).
-- [ ] Reset to 1 ms on any wake (commit observed via PRAGMA, or any
-      conservative-wake path).
-- [ ] Configurable via `WatcherConfig::idle_threshold_s` and
-      `max_poll_interval_ms` (defaults sensible; users don't need
-      to think about it).
+- [ ] Track `time_since_last_wake` in the poll loop.
+- [ ] If > `idle_threshold` (default 5 s), scale the interval up
+      geometrically from the configured `poll_interval` (1 ms → 2 → 4
+      → ... capped at `max_poll_interval`, default 1000 ms).
+- [ ] Reset to the configured `poll_interval` on any wake (commit
+      observed via PRAGMA, or any conservative-wake path).
+- [ ] Extend `WatcherConfig` with `idle_threshold` and
+      `max_poll_interval` alongside the existing `poll_interval`,
+      following the same validated-builder shape as
+      `with_poll_interval`. Defaults sensible; users don't need to
+      think about it.
+- [ ] Treat an explicitly configured `poll_interval` as the floor of
+      the curve, not an opt-out — existing callers keep their latency
+      when busy and only relax when idle.
 - [ ] Wire through Python + Node bindings (other bindings track
       under Phase Echo).
 
@@ -604,7 +554,7 @@ overhead critique and the mobile / battery concern in one move.
 
 ## Phase Berra — HN-Feedback Docs Sweep
 
-> After: Phase Mantle · Before: 1.0 release prep
+> Before: 1.0 release prep
 
 Yogi Berra called pitches; this phase calls out the docs that need
 fixing now that the second HN front-page hit + 970 stars + the JVM
@@ -622,16 +572,20 @@ adoption.
       measured. The "no benchmarks" criticism (raised by
       @andrewstuart on HN) is fair — we have data, we just haven't
       surfaced it.
-- [ ] **"When NOT to use" section** in README and docs index. At
-      minimum: mobile / battery context (raised by @ncruces on HN),
-      and a clear statement of the multi-process WAL story to
-      defang the "SQLite isn't concurrent" critique.
-- [ ] **JVM binding mention** in README + docs site nav. Currently
-      shipped but not visible. Update the "Bindings:" line and add
-      to honker.dev nav.
+- [ ] **"When NOT to use" section** in README and docs index. The
+      single-machine / NFS paragraph now in the README covers part of
+      this; it still needs a real heading, the mobile / battery context
+      (raised by @ncruces on HN), and a clear statement of the
+      multi-process WAL story to defang the "SQLite isn't concurrent"
+      critique.
+- [x] **JVM binding mention** in README. Shipped — the JVM and Kotlin
+      bindings appear in both the feature list and the bindings table.
+      The honker.dev nav lives in the `site` repo and is tracked there.
 - [ ] **Cross-link to docs.honker.dev/reference/watcher-backends**
       from any README mention of polling, so the polling-overhead
-      thread on HN has a concrete answer in our README.
+      thread on HN has a concrete answer in our README. The README
+      currently points at `BINDINGS.md` instead, which says which
+      bindings expose the options but not why polling is the default.
 
 ### Non-goals
 
@@ -641,27 +595,39 @@ adoption.
 
 ## Release Automation
 
-
 This is not 1.0 prep. The goal is simpler: make normal releases boring.
 
-- One tag should drive extension artifacts and package publishes.
-- Build and attach loadable extension binaries for supported platforms.
-- Publish Python wheels with maturin for the supported Python/platform
-  matrix.
-- Publish npm/Bun packages with native artifacts where needed.
-- Publish crates for `honker-core`, `honker-extension`, and
-  `honker-rs`.
-- Publish NuGet, Ruby, and other maintained binding packages from the
-  in-tree `packages/` directories.
-- Keep release notes tied to `CHANGELOG.md`.
+The build-and-verify half is done, for every ecosystem. Seven
+per-ecosystem workflows fire on their own tag prefix — `core-v*` /
+`ext-v*`, `py-v*`, `node-v*`, `bun-v*`, `rb-v*`, `ex-v*`, `dotnet-v*` —
+and each builds the artifact, checks it contains the bundled extension
+or native binary, and smoke-tests a consumer install. A separate
+registry install gauntlet installs published versions from the real
+registries on demand. The per-ecosystem split is the design now, not a
+stopgap: binding versions move independently and a single tag would
+force lockstep bumps.
+
+The publish half is deliberately absent. Every one of those workflows
+is named `Proof · ...` and stops at uploading artifacts; the actual
+`cargo publish` / `twine upload` / `npm publish` / `gem push` /
+`dotnet nuget push` / `mix hex.publish` steps were removed on purpose.
+Publishing is a human step today, for all seven.
+
+Remaining:
+
+- [ ] Decide whether publish stays manual. Proof-only is a defensible
+      end state — the tag proves the artifact, a human pushes the
+      button — but it should be a written decision rather than an
+      accident of the workflows having been stripped. If it stays,
+      say so in `CONTRIBUTING.md`; if it doesn't, the proof jobs
+      already produce exactly the artifacts a publish step needs.
+- [ ] Decide whether the in-tree bindings without a package registry
+      story (Go, C++, JVM, Kotlin) need release automation at all, or
+      whether tag-and-go is the whole contract for them.
+- [ ] Keep release notes tied to `CHANGELOG.md`.
 
 ## Later 1.0 Prep
 
-- Maturin wheels: Python 3.11 / 3.12 / 3.13 across Linux, macOS, and
-  Windows where supported.
-- npm publish with napi-rs prebuilds.
-- Crate publish flow for `honker-core`, `honker-extension`, and
-  `honker-rs`.
 - Health / observability primitives: claim depth, DLQ rate, update
   watcher firing rate, and optional OpenTelemetry integration.
 - Crash-recovery tests beyond writer kills: listener-process kills,
