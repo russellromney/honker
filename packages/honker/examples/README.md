@@ -8,6 +8,7 @@ PYTHONPATH=packages .venv/bin/python packages/honker/examples/atomic.py
 
 | File | What it shows |
 |---|---|
+| [`quickstart.py`](quickstart.py) | **Start here.** The README quickstart end to end in one process: atomic write + enqueue, then claim and ack. |
 | [`tasks.py`](tasks.py) | **Huey-style `@queue.task()` decorators.** `add(2, 3)` returns a `TaskResult`; `.get()` waits for the worker. Includes a timeout-to-dead-letter path. |
 | [`atomic.py`](atomic.py) | `INSERT INTO orders` + `queue.enqueue(...)` committed in one transaction. Rollback drops both. |
 | [`worker.py`](worker.py) | Low-level async worker loop with retry → dead-letter (no decorators). |
