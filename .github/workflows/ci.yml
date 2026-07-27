@@ -14,6 +14,32 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: lint · rustfmt + clippy
+    timeout-minutes: 8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-lint-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The kernel-watcher / shm-fast-path code is cfg-gated, so the
+      # default-feature run above never type-checks it. Lint it too —
+      # same reasoning as the experimental test steps in the `rust` job.
+      - name: cargo clippy (experimental wake backends)
+        run: |
+          cargo clippy --workspace --all-targets --locked \
+            --features honker-core/kernel-watcher,honker-core/shm-fast-path \
+            -- -D warnings
+
   rust:
     name: rust · honker-core + extension
     timeout-minutes: 8
@@ -36,17 +62,17 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test -p honker-core --release --lib --features bundled-sqlite
+            cargo test -p honker-core --locked --release --lib --features bundled-sqlite
           else
-            cargo test -p honker-core --release --lib
+            cargo test -p honker-core --locked --release --lib
           fi
       - name: Run honker-core tests (debug)
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test -p honker-core --lib --features bundled-sqlite
+            cargo test -p honker-core --locked --lib --features bundled-sqlite
           else
-            cargo test -p honker-core --lib
+            cargo test -p honker-core --locked --lib
           fi
       # Experimental wake backends — see Phase Lighthouse in ROADMAP.md.
       # These features are NOT compiled into published wheels yet, but
@@ -57,20 +83,20 @@ jobs:
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test -p honker-core --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
+            cargo test -p honker-core --locked --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
           else
-            cargo test -p honker-core --lib --features kernel-watcher,shm-fast-path
+            cargo test -p honker-core --locked --lib --features kernel-watcher,shm-fast-path
           fi
       - name: Run honker-core tests (experimental wake backends, release)
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test -p honker-core --release --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
+            cargo test -p honker-core --locked --release --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
           else
-            cargo test -p honker-core --release --lib --features kernel-watcher,shm-fast-path
+            cargo test -p honker-core --locked --release --lib --features kernel-watcher,shm-fast-path
           fi
       - name: Build loadable extension
-        run: cargo build --release -p honker-extension
+        run: cargo build --locked --release -p honker-extension
       - name: Sanity-load via Python sqlite3
         shell: bash
         run: |
@@ -125,7 +151,7 @@ jobs:
           prefix-key: "v1-bench-${{ hashFiles('bench/wal_index_methods/Cargo.toml', 'bench/wal_index_methods/src/**/*.rs') }}"
       - name: Run wal_index_methods bench
         working-directory: bench/wal_index_methods
-        run: cargo run --release | tee /tmp/bench.out
+        run: cargo run --locked --release | tee /tmp/bench.out
       - name: Assert mmap-shm beats cached PRAGMA by >=50x
         run: |
           set -euo pipefail
@@ -177,7 +203,7 @@ jobs:
       - name: Build honker-extension
         shell: bash
         run: |
-          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+          cargo build --locked --release -p honker-extension --features kernel-watcher,shm-fast-path
           scripts/copy-python-extension.sh
       - name: Build PyO3 _honker_native (maturin develop)
         working-directory: packages/honker
@@ -228,7 +254,7 @@ jobs:
         with:
           dotnet-version: "10.0.x"
       - name: Build honker-extension
-        run: cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+        run: cargo build --locked --release -p honker-extension --features kernel-watcher,shm-fast-path
       - name: Build .NET queue helper
         run: dotnet build packages/honker-dotnet/tests/Honker.QueueHelper/Honker.QueueHelper.csproj -c Release
       - name: Run .NET binding tests
@@ -292,7 +318,7 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: |
-          npm install
+          npm ci
           npx napi build --platform --release --features kernel-watcher,shm-fast-path
       - name: Test (basic — node only)
         working-directory: packages/honker-node
@@ -358,10 +384,12 @@ jobs:
         with:
           enable-cache: true
       - name: Install C++ binding deps
-        run: sudo apt-get install -y libsqlite3-dev nlohmann-json3-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev nlohmann-json3-dev
       - name: Build honker-extension
         run: |
-          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+          cargo build --locked --release -p honker-extension --features kernel-watcher,shm-fast-path
       - name: Build Python binding
         shell: bash
         run: |
@@ -373,7 +401,7 @@ jobs:
       - name: Rust wrapper
         env:
           HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
-        run: cargo test --manifest-path packages/honker-rs/Cargo.toml --features kernel-watcher,shm-fast-path
+        run: cargo test --locked --manifest-path packages/honker-rs/Cargo.toml --features kernel-watcher,shm-fast-path
       - name: Go
         working-directory: packages/honker-go
         env:
@@ -427,3 +455,65 @@ jobs:
         run: |
           . .venv/bin/activate
           python -m pytest tests/test_ruby_python_interop.py -q --tb=short
+
+  ci-ok:
+    # THE required status check. Point branch protection at this job and
+    # nothing else.
+    #
+    # Why an aggregate instead of listing the real jobs: `python` and
+    # `node` build their matrices with fromJson and deliberately run a
+    # smaller set on pull_request than on push. That means their job
+    # names differ by event, so any hand-maintained required-checks list
+    # is either wrong on PRs or wrong on main. Worse, a required check
+    # that never reports is indistinguishable from one that hasn't
+    # started — a job silently dropped from the matrix would look like a
+    # pending check forever, or (if the name is removed from protection)
+    # like a pass. This job has one stable name and inspects results
+    # directly, so neither failure mode is reachable.
+    #
+    # `if: always()` is load-bearing: without it the job is skipped when
+    # any dependency fails, and a skipped required check reads as
+    # success to branch protection.
+    name: ci · all green
+    if: always()
+    needs:
+      - lint
+      - rust
+      - perf-regression
+      - python
+      - dotnet
+      - node
+      - binding-smoke
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert every required job succeeded
+        env:
+          # Passed through env rather than interpolated into the script
+          # body — same template-injection rule zizmor enforces on the
+          # release workflows.
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          # perf-regression is gated on `github.event_name != 'pull_request'`,
+          # so it legitimately reports "skipped" on every PR. Nothing else
+          # is allowed to skip.
+          MAY_SKIP = {"perf-regression"}
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          blocking = []
+          for name, info in sorted(needs.items()):
+              result = info["result"]
+              ok = result == "success" or (result == "skipped" and name in MAY_SKIP)
+              print(f"{'ok  ' if ok else 'FAIL'}  {name}: {result}")
+              if not ok:
+                  blocking.append(f"{name} ({result})")
+
+          if blocking:
+              sys.exit("blocking jobs not green: " + ", ".join(blocking))
+          print("\nall required jobs green")
+          PY

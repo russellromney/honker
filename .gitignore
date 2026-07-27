@@ -9,7 +9,12 @@ build/
 # Node
 node_modules/
 *.node
-package-lock.json
+# package-lock.json / bun.lock are deliberately NOT ignored — CI installs
+# with `npm ci` / `bun install --frozen-lockfile`, which need a committed
+# lockfile to pin against. Lockfiles are ignored by npm/bun when the
+# package is consumed as a dependency, so committing them costs consumers
+# nothing.
+bun.lockb
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/

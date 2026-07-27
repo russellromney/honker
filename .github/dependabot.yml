@@ -1,0 +1,148 @@
+# Dependabot configuration.
+#
+# The immediate reason this file exists: release-crates.yml,
+# release-python.yml, release-dotnet.yml, release-ruby.yml,
+# package-proof.yml, scary-nightly.yml, and zizmor.yml pin every action
+# to a commit SHA because those workflows hold publish tokens. Pinning is
+# the right call, but it only works if something prompts the upgrade —
+# otherwise the pins quietly rot and we sit on known-bad action versions
+# indefinitely. Dependabot rewrites the SHA and keeps the `# vN` comment
+# in sync, so the audit trail survives the bump.
+#
+# ci.yml uses floating `@v4`-style refs on purpose (see .github/zizmor.yml
+# for the rationale); Dependabot still bumps the major when one lands.
+#
+# Cadence is weekly for the things that carry security weight (actions,
+# Cargo) and monthly for the binding ecosystems, which mostly move on
+# their own upstream schedules. Everything is grouped so a quiet week
+# produces one PR rather than nine.
+
+version: 2
+
+updates:
+  # ---- GitHub Actions -------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # ---- Rust -----------------------------------------------------------
+  # The workspace (honker-core + honker-extension) is what ships to
+  # crates.io, so it gets its own weekly slot. The three excluded binding
+  # crates resolve independently and are listed separately.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: cargo
+    directories:
+      - "/packages/honker"
+      - "/packages/honker-node"
+      - "/packages/honker-rs"
+      - "/bench/wal_index_methods"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      binding-cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # ---- Language bindings ----------------------------------------------
+  - package-ecosystem: npm
+    directory: "/packages/honker-node"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      npm:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: bun
+    directory: "/packages/honker-bun"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      bun:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: nuget
+    directory: "/packages/honker-dotnet"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      nuget:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: bundler
+    directory: "/packages/honker-ruby"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      bundler:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: mix
+    directory: "/packages/honker-ex"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      mix:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: gomod
+    directory: "/packages/honker-go"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      gomod:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # honker-jvm and honker-kotlin have no CI job yet, so Dependabot is the
+  # only thing watching them. Keep the PRs coming even though nothing
+  # gates them — they at least surface CVEs.
+  - package-ecosystem: maven
+    directories:
+      - "/packages/honker-jvm"
+      - "/packages/honker-kotlin"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      maven:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"

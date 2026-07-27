@@ -1,6 +1,6 @@
 # zizmor configuration. See https://docs.zizmor.sh/configuration/
 #
-# Two scope decisions worth knowing:
+# Three scope decisions worth knowing:
 #
 #  1. ci.yml's actions are NOT SHA-pinned. This is intentional. ci.yml
 #     runs with `permissions: contents: read`, so a compromised action
@@ -13,6 +13,14 @@
 #
 #  2. artipacked (credential persistence in checkout) is similarly
 #     allowed in ci.yml — the persisted token is read-only.
+#
+#  3. adhoc-packages is allowed in release-ruby.yml. The two flagged
+#     `gem install "$RUNNER_TEMP/honker.gem"` steps install the gem this
+#     workflow just built, from a local path, as a consumer smoke test.
+#     The audit is aimed at pulling unpinned packages off a registry;
+#     there is no registry and no lockfile to pin here — the artifact
+#     under test IS the input. Suppressing it keeps the workflow lint
+#     actionable instead of permanently two-findings-red.
 
 rules:
   unpinned-uses:
@@ -23,3 +31,6 @@ rules:
     ignore:
       - ci.yml
       - zizmor.yml
+  adhoc-packages:
+    ignore:
+      - release-ruby.yml

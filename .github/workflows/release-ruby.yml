@@ -47,7 +47,7 @@ jobs:
         env:
           HONKER_GEM_PLATFORM: ${{ matrix.gem_platform }}
         run: |
-          cargo build --release -p honker-extension
+          cargo build --locked --release -p honker-extension
           scripts/copy-ruby-extension.sh
           cd packages/honker-ruby
           gem build honker.gemspec --output "$RUNNER_TEMP/honker.gem"

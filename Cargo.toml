@@ -15,3 +15,21 @@ exclude = [
     "packages/honker-rs",
 ]
 resolver = "2"
+
+# Lint policy shared by every workspace member, so `cargo clippy` locally
+# and the `lint` job in CI agree. CI runs clippy with `-D warnings`, which
+# turns everything left at `warn` into a hard failure.
+#
+# The three allows below are clippy's design opinions, not correctness
+# findings, and each would cost more than it buys right now:
+#
+#   too_many_arguments — `honker_ops::enqueue` takes 8. Collapsing them
+#     into a params struct is a breaking change to a published crate's
+#     API; it belongs in a deliberate 0.3, not in a lint sweep.
+#   type_complexity — the two sites are SQL row tuples destructured
+#     straight out of `query_row`/`query_map`. Naming them adds a type
+#     alias that has to be kept in sync with the SELECT column list by
+#     hand, which is more to get wrong than the inline tuple.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

@@ -88,8 +88,8 @@ impl CronSchedule {
         self.seconds.contains(&dt.second())
             && self.minutes.contains(&dt.minute())
             && self.hours.contains(&dt.hour())
-            && self.days.contains(&(dt.day() as u32))
-            && self.months.contains(&(dt.month() as u32))
+            && self.days.contains(&dt.day())
+            && self.months.contains(&dt.month())
             && self.dows.contains(&cron_dow)
     }
 }
@@ -187,7 +187,7 @@ fn cron_day_matches(sched: &CronSchedule, dt: &NaiveDateTime) -> bool {
         Weekday::Fri => 5,
         Weekday::Sat => 6,
     };
-    sched.days.contains(&(dt.day() as u32)) && sched.dows.contains(&cron_dow)
+    sched.days.contains(&dt.day()) && sched.dows.contains(&cron_dow)
 }
 
 fn make_dt(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> NaiveDateTime {

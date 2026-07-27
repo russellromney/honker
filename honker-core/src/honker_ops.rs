@@ -23,10 +23,7 @@ use rusqlite::functions::FunctionFlags;
 
 /// Wrap a Displayable error for SQLite scalar-function returns.
 fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
-    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        e.to_string(),
-    )))
+    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(e.to_string())))
 }
 
 /// Register all `honker_*` honker scalar functions on `conn`. Idempotent

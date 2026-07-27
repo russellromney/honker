@@ -1509,9 +1509,10 @@ mod tests {
                 // try_recv returns Err(Empty) for "alive but no msg",
                 // Err(Disconnected) for "watcher died, sender cleared".
                 // Use blocking recv with a poll instead.
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    _ => {}
+                if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
+                    rx.recv_timeout(Duration::from_millis(100))
+                {
+                    break;
                 }
             }
             if std::time::Instant::now() > deadline {
@@ -1867,7 +1868,7 @@ mod tests {
                     .map(|s| s.success())
                     .unwrap_or(false)
             })
-            .map(|s| *s);
+            .copied();
         let Some(python) = python else {
             eprintln!(
                 "writer_killed_mid_workload_leaves_db_consistent: \
@@ -1945,11 +1946,10 @@ while True:
                 );
             }
             if let Ok(c) = read_conn.query_row("SELECT count(*) FROM q", [], |r| r.get::<_, i64>(0))
+                && c > 0
             {
-                if c > 0 {
-                    high_water = c;
-                    break;
-                }
+                high_water = c;
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }

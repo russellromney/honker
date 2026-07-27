@@ -47,3 +47,6 @@ file-id = "0.2.3"
 # chrono-tz only in tests — lets us exercise DST edge cases with a
 # fixed timezone (US/Eastern) regardless of where tests run.
 chrono-tz = "0.10"
+
+[lints]
+workspace = true

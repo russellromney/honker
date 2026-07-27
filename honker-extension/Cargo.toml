@@ -32,3 +32,6 @@ rusqlite = { version = "0.39.0", features = ["functions", "hooks", "loadable_ext
 default = []
 kernel-watcher = ["honker-core/kernel-watcher"]
 shm-fast-path = ["honker-core/shm-fast-path"]
+
+[lints]
+workspace = true

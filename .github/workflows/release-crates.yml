@@ -78,11 +78,13 @@ jobs:
           fi
 
       - name: Verify test suite before publish
-        run: cargo test -p honker-core --release --lib
+        run: cargo test -p honker-core --locked --release --lib
 
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           CRATE: ${{ steps.crate.outputs.name }}
         run: |
-          cargo publish -p "$CRATE"
+          # --locked: publish exactly the dependency graph in the
+          # committed Cargo.lock, not whatever resolves at publish time.
+          cargo publish --locked -p "$CRATE"
