@@ -33,6 +33,30 @@ stance recorded in the phase entry that drove it.
 
 ## Unreleased — correctness priority fixes
 
+Experimental wake backends:
+
+- **`kernel-watcher` no longer drops SQLite's POSIX locks (#80).** On
+  macOS the kqueue backend held an `O_EVTONLY` descriptor on the main
+  database file and `-shm`, and closed it on `NOTE_DELETE` pruning, on
+  attach failure, and at watcher shutdown. Closing any descriptor for an
+  inode releases every advisory lock the *process* holds on it, and those
+  two files are exactly the ones SQLite locks in WAL mode. The result was
+  a live connection whose `-wal`/`-shm` another process could delete —
+  making the next `COMMIT` return `SQLITE_OK` into an unlinked WAL, where
+  it was silently and permanently lost — or a `-shm` truncated under a
+  live mapping, which is the SIGBUS (exit 138) seen in CI. The backend
+  now watches only the parent directory, `-wal`, and `-journal`: files
+  SQLite opens with `UNIXFILE_NOLOCK` and therefore never locks. WAL
+  commit detection is unchanged. Also applied on the BSDs, where
+  `notify`'s recommended watcher is kqueue-based; Linux (inotify) and
+  Windows are unaffected and unchanged.
+- **`shm-fast-path` has the same defect and is not yet fixed.** Its
+  `probe()` opens and closes `-shm` on every `honker.open()`, and the
+  watcher's own `File` is closed on reopen and at shutdown — each of
+  which releases the process's WAL-index locks, on Linux as well as
+  macOS. Reproduces at 7/20 in the .NET multi-process queue test. Do not
+  select `watcher_backend="shm"`. Tracked separately.
+
 Core (all bindings via `honker_*` SQL / shared extension):
 
 - **Claim/reclaim honors `max_attempts`.** Exhausted reclaimable jobs
