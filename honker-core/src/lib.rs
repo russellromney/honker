@@ -2476,6 +2476,194 @@ while True:
         }
     }
 
+    // -----------------------------------------------------------------
+    // Issue #80 — the kernel backend must not release SQLite's locks
+    // -----------------------------------------------------------------
+
+    /// Child-process half of the issue-#80 regression test. Inert unless
+    /// `HONKER_ISSUE80_REAP_DB` is set; the parent re-execs this test
+    /// binary with that variable so the open/close happens in a *separate
+    /// process*. That matters: in WAL mode the last connection to close
+    /// deletes `-wal` and `-shm`, but only if it can take an EXCLUSIVE
+    /// lock on the main database file — which the parent's live connection
+    /// is supposed to prevent.
+    #[test]
+    #[cfg(all(unix, feature = "kernel-watcher", feature = "bundled-sqlite"))]
+    fn issue_80_reaper_child() {
+        let Ok(path) = std::env::var("HONKER_ISSUE80_REAP_DB") else {
+            return;
+        };
+        let conn = Connection::open(&path).expect("reaper child: open");
+        let _: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .expect("reaper child: read");
+    }
+
+    #[cfg(all(unix, feature = "kernel-watcher", feature = "bundled-sqlite"))]
+    fn run_issue_80_reaper_child(db_path: &std::path::Path) {
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tests::issue_80_reaper_child",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("HONKER_ISSUE80_REAP_DB", db_path)
+            .output()
+            .expect("spawn reaper child");
+        assert!(
+            out.status.success(),
+            "reaper child failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[cfg(all(unix, feature = "kernel-watcher", feature = "bundled-sqlite"))]
+    enum Issue80Perturbation {
+        /// Reproduce what the pre-fix kqueue backend did: raw
+        /// `open(O_EVTONLY)` + `close()` on the two files SQLite locks.
+        RawCloseLockBearingFiles,
+        /// Spawn the real kernel-watch backend, let it attach, then shut
+        /// it down — while this process's SQLite connection is still open.
+        ///
+        /// Shutdown is the case that matters. The kqueue backend holds its
+        /// descriptors for the watcher's lifetime, so nothing is released
+        /// until something closes them: `WatchedPath::drop` on shutdown,
+        /// `prune_deleted` on `NOTE_DELETE`, or the `attach_path` error
+        /// path. A test that only spawns the watcher and never stops it
+        /// passes against the broken code.
+        RealKernelWatcherThenShutdown,
+    }
+
+    /// Hold a live WAL connection, apply `perturbation`, then let a
+    /// separate process open and close the database. Returns whether
+    /// `-wal` and `-shm` survived — i.e. whether this process still held
+    /// the SQLite locks that are supposed to protect them.
+    #[cfg(all(unix, feature = "kernel-watcher", feature = "bundled-sqlite"))]
+    fn wal_survives_foreign_last_close(perturbation: Issue80Perturbation) -> bool {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-issue80-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wal = PathBuf::from(format!("{}-wal", tmp.display()));
+        let shm = PathBuf::from(format!("{}-shm", tmp.display()));
+        for p in [&tmp, &wal, &shm] {
+            let _ = std::fs::remove_file(p);
+        }
+
+        // Live WAL connection: takes a SHARED lock on the db file and the
+        // DMS read lock on -shm, and holds both for its whole lifetime.
+        let conn = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        conn.execute_batch("CREATE TABLE t (x INT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        let _: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert!(wal.exists() && shm.exists(), "setup: -wal/-shm not created");
+
+        match perturbation {
+            Issue80Perturbation::RawCloseLockBearingFiles => {
+                for path in [&tmp, &shm] {
+                    let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+                        path.as_os_str(),
+                    ))
+                    .unwrap();
+                    // O_RDONLY, not O_EVTONLY: this arm must compile and
+                    // behave identically on every unix, and the lock-drop
+                    // does not depend on the open mode.
+                    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+                    assert!(fd >= 0, "control: could not open {path:?}");
+                    unsafe { libc::close(fd) };
+                }
+            }
+            Issue80Perturbation::RealKernelWatcherThenShutdown => {
+                let watcher = UpdateWatcher::spawn_with_config(
+                    tmp.clone(),
+                    || {},
+                    WatcherConfig::with_backend(WatcherBackend::KernelWatch),
+                );
+                // Let it finish its first attach / reattach passes.
+                std::thread::sleep(Duration::from_millis(200));
+                // Stop it and wait for the thread to exit, so every
+                // descriptor it opened has actually been closed by the
+                // time the reaper runs. `conn` is still open throughout.
+                watcher.join().expect("watcher thread panicked");
+            }
+        }
+
+        assert!(
+            wal.exists() && shm.exists(),
+            "precondition: -wal/-shm vanished before the reaper ran"
+        );
+        run_issue_80_reaper_child(&tmp);
+
+        let survived = wal.exists() && shm.exists();
+
+        drop(conn);
+        for p in [&tmp, &wal, &shm] {
+            let _ = std::fs::remove_file(p);
+        }
+        survived
+    }
+
+    /// Issue #80: the kernel-watch backend must never release this
+    /// process's SQLite POSIX locks.
+    ///
+    /// When it does, another process's last-connection close deletes
+    /// `-wal`/`-shm` out from under our live connection. The connection
+    /// keeps working against unlinked files, so its next `COMMIT` returns
+    /// `SQLITE_OK` and is then invisible to every other process — a
+    /// successful commit that never lands. The SIGBUS seen in CI is the
+    /// same lock loss taking the other branch, where a fresh connection
+    /// wins the DMS race and `ftruncate`s `-shm` under a live mapping.
+    ///
+    /// # This test proves its own sensitivity
+    ///
+    /// It only means something where SQLite uses *process-scoped* POSIX
+    /// locks (`fcntl(F_SETLK)`). Apple's system libsqlite3 uses
+    /// `fcntl(F_OFD_SETLK)` instead — open-file-description locks, which a
+    /// foreign `close()` cannot release — so on a macOS build linked
+    /// against the system library the property is unfalsifiable and a
+    /// green result would mean nothing. The control arm below asserts the
+    /// defect *is* reproducible in this build before trusting the real
+    /// arm. Build with `--features bundled-sqlite` on macOS.
+    ///
+    /// That is why the whole issue-#80 proof is gated on `bundled-sqlite`:
+    /// it is the only feature that guarantees an upstream amalgamation,
+    /// whose `os_unix.c` uses `fcntl(F_SETLK)`. CI runs the experimental
+    /// backends with that feature on macOS and Windows.
+    #[test]
+    #[cfg(all(unix, feature = "kernel-watcher", feature = "bundled-sqlite"))]
+    fn kernel_watcher_does_not_release_sqlite_wal_locks() {
+        let control =
+            wal_survives_foreign_last_close(Issue80Perturbation::RawCloseLockBearingFiles);
+        assert!(
+            !control,
+            "control arm did not reproduce the defect: a raw open()+close() on \
+             the database file and -shm left -wal/-shm intact, so this build \
+             cannot detect issue #80 at all. SQLite {} is linked; Apple's \
+             system libsqlite3 uses F_OFD_SETLK, whose locks survive a foreign \
+             close. Re-run with --features bundled-sqlite.",
+            rusqlite::version()
+        );
+
+        let with_watcher =
+            wal_survives_foreign_last_close(Issue80Perturbation::RealKernelWatcherThenShutdown);
+        assert!(
+            with_watcher,
+            "kernel-watch backend released this process's SQLite locks: another \
+             process deleted -wal/-shm while a live WAL connection was open. \
+             The backend must not hold a descriptor on the database file or \
+             -shm — see kernel_watcher::macos::candidate_paths and issue #80."
+        );
+    }
+
     /// Prove that the shm fast path fires on the same commits as the
     /// baseline `PRAGMA data_version` poller.
     ///
