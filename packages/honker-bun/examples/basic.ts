@@ -4,7 +4,7 @@ import { open } from "../src/index.ts";
 const EXT_PATH =
   process.env.HONKER_EXTENSION_PATH ??
   new URL(
-    "../../../target/release/libhonker_extension.dylib",
+    "../../../target/release/libhonker_ext.dylib",
     import.meta.url,
   ).pathname;
 
