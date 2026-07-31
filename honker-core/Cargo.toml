@@ -45,6 +45,11 @@ libc = { version = "0.2", optional = true }
 file-id = "0.2.3"
 
 [dev-dependencies]
+# libc in tests regardless of feature selection: the issue-#80 lock-survival
+# tests probe SQLite's POSIX locks with fcntl(F_GETLK) from a child process,
+# and must run for the shm-fast-path build too (where `libc` is not a
+# regular dependency).
+libc = "0.2"
 # chrono-tz only in tests — lets us exercise DST edge cases with a
 # fixed timezone (US/Eastern) regardless of where tests run.
 chrono-tz = "0.10"
