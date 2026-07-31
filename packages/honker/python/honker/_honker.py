@@ -1213,18 +1213,19 @@ class Database:
             conditions.append("created_at < unixepoch() - ?")
             params.append(int(older_than_s))
         if max_keep is not None:
-            # Use a subquery so MAX(id) is evaluated atomically
-            # inside the DELETE, avoiding a TOCTOU race where rows
-            # inserted between a separate SELECT and the DELETE
-            # would cause the wrong number of rows to be removed.
-            # COALESCE handles an empty table (MAX returns NULL)
-            # and when max_keep >= row count the subtraction goes
-            # negative, matching zero rows — both are safe no-ops.
+            max_keep = int(max_keep)
+            if max_keep < 0:
+                raise ValueError("max_keep must not be negative")
+            # Select the (N + 1)th-newest row by rank. Unlike
+            # MAX(id) - N, this remains correct when IDs contain gaps.
+            # The subquery and DELETE are one statement, so inserts
+            # committed before the write transaction starts are part
+            # of the same pruning decision.
             conditions.append(
-                "id <= (SELECT COALESCE(MAX(id), 0) - ? "
-                "FROM _honker_notifications)"
+                "id <= (SELECT id FROM _honker_notifications "
+                "ORDER BY id DESC LIMIT 1 OFFSET ?)"
             )
-            params.append(int(max_keep))
+            params.append(max_keep)
         if not conditions:
             return 0
         with self.transaction() as tx:

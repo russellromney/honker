@@ -173,8 +173,13 @@ public sealed class Database : IDisposable
 
         if (maxKeep is not null)
         {
+            if (maxKeep.Value < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxKeep), "maxKeep must not be negative");
+            }
             var index = args.Count;
-            clauses.Add($"id <= (SELECT COALESCE(MAX(id), 0) FROM _honker_notifications) - @p{index}");
+            clauses.Add(
+                $"id <= (SELECT id FROM _honker_notifications ORDER BY id DESC LIMIT 1 OFFSET @p{index})");
             args.Add(maxKeep.Value);
         }
 
