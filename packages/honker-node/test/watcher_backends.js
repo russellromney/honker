@@ -95,15 +95,24 @@ for (const backend of [null, 'kernel', 'shm']) {
       if (!db) return;
       const n = 4;
       const counted = await driveCommitsAndCountWakes(db, n, 30);
-      const minWakes = backend === 'kernel' && process.platform === 'win32' ? 1 : n;
-      assert.ok(
-        counted >= minWakes,
-        `watcherBackend=${label}: only ${counted} wakes for ${n} commits`,
-      );
       const maxWakes = backend === 'kernel' ? n * 4 : n + 2;
       assert.ok(
         counted <= maxWakes,
         `watcherBackend=${label}: ${counted} wakes for ${n} commits exceeds bound ${maxWakes}`,
+      );
+      // ReadDirectoryChangesW may drop or coalesce every event in a burst.
+      // Keep the upper-bound assertion above active on Windows, but match
+      // the Rust and Python proofs by recording under-delivery as an explicit
+      // platform limitation instead of pretending one wake is guaranteed.
+      if (backend === 'kernel' && process.platform === 'win32' && counted < n) {
+        t.todo(
+          `kernel-watcher not proven on Windows: ${counted} wakes for ${n} commits`,
+        );
+        return;
+      }
+      assert.ok(
+        counted >= n,
+        `watcherBackend=${label}: only ${counted} wakes for ${n} commits`,
       );
     } finally {
       cleanup();

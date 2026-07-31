@@ -64,7 +64,6 @@ pub(crate) fn run_kernel_watch_loop<F>(
     #[cfg(target_os = "macos")]
     {
         run_kqueue_loop(db_path, on_change, stop, ready);
-        return;
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -187,7 +186,7 @@ fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) -> bool {
 pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        return probe_kqueue(db_path);
+        probe_kqueue(db_path)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -227,7 +226,7 @@ mod macos {
         }
 
         fn add_vnode(&self, fd: libc::c_int) -> Result<(), String> {
-            let mut event = libc::kevent {
+            let event = libc::kevent {
                 ident: fd as libc::uintptr_t,
                 filter: libc::EVFILT_VNODE,
                 flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
@@ -240,8 +239,7 @@ mod macos {
                 data: 0,
                 udata: ptr::null_mut(),
             };
-            let n =
-                unsafe { libc::kevent(self.fd, &mut event, 1, ptr::null_mut(), 0, ptr::null()) };
+            let n = unsafe { libc::kevent(self.fd, &event, 1, ptr::null_mut(), 0, ptr::null()) };
             if n < 0 {
                 Err(format!(
                     "kevent add failed: {}",
