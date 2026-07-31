@@ -2391,15 +2391,19 @@ while True:
     fn kernel_watcher_detects_all_commits() {
         use std::sync::atomic::{AtomicU32, Ordering as AO};
 
-        let tmp = std::env::temp_dir().join(format!(
-            "honker-kernel-watcher-{}-{}",
+        // The kernel backend watches the database's parent directory.
+        // Give this test an isolated directory so parallel tests and
+        // unrelated /tmp activity cannot inflate the runaway-wake count.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "honker-kernel-watcher-dir-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .subsec_nanos()
         ));
-        let _ = std::fs::remove_file(&tmp);
+        std::fs::create_dir(&tmp_dir).unwrap();
+        let tmp = tmp_dir.join("app.db");
 
         let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
         writer.execute_batch("CREATE TABLE t (x INT)").unwrap();
@@ -2441,9 +2445,11 @@ while True:
 
         let observed = count.load(AO::SeqCst);
         drop(watcher);
+        drop(writer);
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // Experimental contract: spurious wakes are allowed (the backend
         // fires on every filesystem event, and SQLite produces several
@@ -2619,8 +2625,11 @@ while True:
     /// detects every committed insert. Tolerates +1 wake (a commit
     /// straddling the drain boundary) but does not tolerate misses.
     fn watcher_works_in_journal_mode(backend: WatcherBackend, mode: &str) {
-        let tmp = std::env::temp_dir().join(format!(
-            "honker-watcher-{}-{}-{}-{}",
+        // Kernel watchers observe every entry event in the parent
+        // directory. Isolate the database so upper bounds measure this
+        // watcher, not unrelated files created by parallel tests.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "honker-watcher-dir-{}-{}-{}-{}",
             mode.to_ascii_lowercase(),
             std::process::id(),
             std::time::SystemTime::now()
@@ -2635,7 +2644,8 @@ while True:
                 WatcherBackend::ShmFastPath => "shm",
             },
         ));
-        let _ = std::fs::remove_file(&tmp);
+        std::fs::create_dir(&tmp_dir).unwrap();
+        let tmp = tmp_dir.join("app.db");
 
         // Watcher inherits the file's journal mode, so set it before opening.
         let setup = Connection::open(&tmp).unwrap();
@@ -2676,6 +2686,7 @@ while True:
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-journal", tmp.display()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
 
         // Polling/shm dedupe → ~1 wake per commit. Kernel fires per
         // filesystem event (inotify is granular) → upper bound is just
