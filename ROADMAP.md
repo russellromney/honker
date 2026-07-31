@@ -600,15 +600,17 @@ adoption.
 
 This is not 1.0 prep. The goal is simpler: make normal releases boring.
 
-The build-and-verify half is done for seven release workflow families.
-Those workflows fire on their own tag prefix — `core-v*` /
+Seven release workflow families now build package artifacts from their
+own tag prefix — `core-v*` /
 `ext-v*`, `py-v*`, `node-v*`, `bun-v*`, `rb-v*`, `ex-v*`, `dotnet-v*` —
-and each builds the artifact, checks it contains the bundled extension
-or native binary, and smoke-tests a consumer install. A separate
-registry install gauntlet installs published versions from the real
-registries on demand. The per-ecosystem split is the design now, not a
-stopgap: binding versions move independently and a single tag would
-force lockstep bumps.
+but their proof depth is not uniform. Node, Ruby, and .NET smoke-test
+the packaged artifact; Node and .NET also inspect bundled native
+contents. The crates workflow relies on `cargo package` verification,
+Bun and Elixir test the source tree before packing, and Python currently
+only builds and uploads its wheels. A separate registry install gauntlet
+installs published versions from the real registries on demand. The
+per-ecosystem split is the design now, not a stopgap: binding versions
+move independently and a single tag would force lockstep bumps.
 
 The publish half is deliberately absent. Every one of those workflows
 is named `Proof · ...` and stops at uploading artifacts; the actual
@@ -624,6 +626,10 @@ Remaining:
       accident of the workflows having been stripped. If it stays,
       say so in `CONTRIBUTING.md`; if it doesn't, the proof jobs
       already produce exactly the artifacts a publish step needs.
+- [ ] Standardize the desired proof depth. Python still needs an
+      installed-wheel smoke test; Bun and Elixir test before packing
+      rather than from a clean consumer; crates rely on Cargo's package
+      verification rather than a separate consumer project.
 - [ ] Decide the release contract for `honker-rs` and the in-tree
       bindings without dedicated proof workflows (Go, C++, JVM,
       Kotlin): add workflows and tag prefixes, or document the intended
