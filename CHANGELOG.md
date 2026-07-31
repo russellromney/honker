@@ -50,12 +50,26 @@ Experimental wake backends:
   commit detection is unchanged. Also applied on the BSDs, where
   `notify`'s recommended watcher is kqueue-based; Linux (inotify) and
   Windows are unaffected and unchanged.
-- **`shm-fast-path` has the same defect and is not yet fixed.** Its
-  `probe()` opens and closes `-shm` on every `honker.open()`, and the
-  watcher's own `File` is closed on reopen and at shutdown — each of
-  which releases the process's WAL-index locks, on Linux as well as
-  macOS. Reproduces at 7/20 in the .NET multi-process queue test. Do not
-  select `watcher_backend="shm"`. Tracked separately.
+- **`shm-fast-path` no longer releases SQLite's WAL-index locks (#80).**
+  Same root cause, different code path. Its `probe()` opened and closed
+  `-shm` on every `honker.open()` — after the writer connection already
+  existed, so it dropped the process's WAL-index locks once per open with
+  no churn needed — and the watcher's own descriptor was closed on reopen
+  and at shutdown. Losing those locks doesn't reap the WAL (the database
+  file's SHARED lock still blocks that); it lets a fresh connection win
+  the deadman race and truncate `-shm` under a live mapping, which is the
+  SIGBUS. `-shm` descriptors now come from a registry that opens each
+  inode once and only closes one whose `st_nlink` is 0 — provably
+  unreferenced, so there is no lock left to drop. PR #43's bounded-read
+  protection is unchanged.
+- **The shm fast path is slower than its docs claimed, and is no longer
+  recommended.** PR #43 replaced the mmap load with a bounded read to
+  stop the watcher SIGBUS-ing itself, which was correct but removed the
+  backend's reason to exist. Measured on macOS/arm64 against SQLite
+  3.51.3: `pread` of the WAL-index header ~1.2 us versus ~2.3 us for
+  `PRAGMA data_version`, and both backends sleep 1 ms, so **wake latency
+  is identical**. The remaining win is ~1 us of CPU per millisecond per
+  watched database. Prefer polling unless you have measured otherwise.
 
 Core (all bindings via `honker_*` SQL / shared extension):
 
