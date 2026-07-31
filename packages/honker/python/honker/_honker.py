@@ -1216,16 +1216,23 @@ class Database:
             max_keep = int(max_keep)
             if max_keep < 0:
                 raise ValueError("max_keep must not be negative")
+            # SQLite bind parameters are signed 64-bit integers. Any
+            # larger count necessarily exceeds the maximum possible
+            # notification row count, so it contributes no DELETE
+            # condition (while an older_than_s condition still applies).
+            if max_keep > (1 << 63) - 1:
+                max_keep = None
             # Select the (N + 1)th-newest row by rank. Unlike
             # MAX(id) - N, this remains correct when IDs contain gaps.
             # The subquery and DELETE are one statement, so inserts
             # committed before the write transaction starts are part
             # of the same pruning decision.
-            conditions.append(
-                "id <= (SELECT id FROM _honker_notifications "
-                "ORDER BY id DESC LIMIT 1 OFFSET ?)"
-            )
-            params.append(max_keep)
+            if max_keep is not None:
+                conditions.append(
+                    "id <= (SELECT id FROM _honker_notifications "
+                    "ORDER BY id DESC LIMIT 1 OFFSET ?)"
+                )
+                params.append(max_keep)
         if not conditions:
             return 0
         with self.transaction() as tx:

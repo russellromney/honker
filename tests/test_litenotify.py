@@ -246,6 +246,7 @@ def test_prune_notifications_max_keep_uses_row_rank(db_path):
         )
 
     assert db.prune_notifications(max_keep=5) == 0
+    assert db.prune_notifications(max_keep=10**100) == 0
     assert db.prune_notifications(max_keep=2) == 0
     assert db.prune_notifications(max_keep=1) == 1
     assert [
