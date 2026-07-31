@@ -322,10 +322,13 @@ the default either way; "available in wheels" is the only flip.
 Phase Mantle itself shipped in PR #42 (see `CHANGELOG.md`): the
 `enabled` column, the six new `honker_scheduler_*` / `honker_cancel` /
 `honker_get_job` SQL functions, scheduler `pause` / `resume` / `remove`
-/ `list` / `update`, and queue `cancel` / `get_job` across every
-maintained binding. Two acceptance items were never met and are the
-only work left here.
+/ `list` / `update`, and queue `cancel` / `get_job` across nine
+bindings. Three items remain:
 
+- [ ] Add the lifecycle methods to the JVM binding and expose them
+      through Kotlin, with binding-local round-trip proofs. These two
+      maintained bindings shipped after PR #42 and do not yet expose
+      `pause` / `resume` / `list` / `update` or `cancel` / `get_job`.
 - [ ] Cross-process proof: `pause` from process A observed by the
       scheduler in process B within ≤ 1 s; `resume` re-emits within
       ≤ 1 s. Current coverage in `tests/test_phase_mantle.py` is
@@ -597,8 +600,8 @@ adoption.
 
 This is not 1.0 prep. The goal is simpler: make normal releases boring.
 
-The build-and-verify half is done, for every ecosystem. Seven
-per-ecosystem workflows fire on their own tag prefix — `core-v*` /
+The build-and-verify half is done for seven release workflow families.
+Those workflows fire on their own tag prefix — `core-v*` /
 `ext-v*`, `py-v*`, `node-v*`, `bun-v*`, `rb-v*`, `ex-v*`, `dotnet-v*` —
 and each builds the artifact, checks it contains the bundled extension
 or native binary, and smoke-tests a consumer install. A separate
@@ -621,9 +624,10 @@ Remaining:
       accident of the workflows having been stripped. If it stays,
       say so in `CONTRIBUTING.md`; if it doesn't, the proof jobs
       already produce exactly the artifacts a publish step needs.
-- [ ] Decide whether the in-tree bindings without a package registry
-      story (Go, C++, JVM, Kotlin) need release automation at all, or
-      whether tag-and-go is the whole contract for them.
+- [ ] Decide the release contract for `honker-rs` and the in-tree
+      bindings without dedicated proof workflows (Go, C++, JVM,
+      Kotlin): add workflows and tag prefixes, or document the intended
+      manual/tag-and-go process.
 - [ ] Keep release notes tied to `CHANGELOG.md`.
 
 ## Later 1.0 Prep
