@@ -26,9 +26,10 @@ stance recorded in the phase entry that drove it.
   or processing row and returns whether one was removed; `get_job(job_id)`
   is a pure read. Cancelling a claimed-but-unacked job makes the worker's
   later `ack()` a no-op, matching expired-claim semantics.
-- Wired through every maintained binding — Python, Node, Rust, Go, Bun,
-  Ruby, Elixir, C++, and .NET — each with a binding-local round-trip
-  proof, not just the three bindings originally scoped.
+- Wired through nine bindings — Python, Node, Rust, Go, Bun, Ruby,
+  Elixir, C++, and .NET — each with a binding-local round-trip proof,
+  not just the three bindings originally scoped. JVM and Kotlin do not
+  yet expose the Mantle lifecycle methods.
 
 ## Unreleased — correctness priority fixes
 
