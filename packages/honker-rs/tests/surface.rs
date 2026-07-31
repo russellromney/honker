@@ -450,14 +450,31 @@ fn prune_notifications_keep_latest() {
 
     let deleted = db.prune_notifications_keep_latest(3).unwrap();
     assert_eq!(deleted, 7);
+    assert_eq!(db.prune_notifications_keep_latest(3).unwrap(), 0);
+    assert_eq!(db.prune_notifications_keep_latest(10).unwrap(), 0);
+    assert_eq!(db.prune_notifications_keep_latest(0).unwrap(), 3);
+    assert!(db.prune_notifications_keep_latest(-1).is_err());
 
-    let count: i64 = db.with_conn(|c| {
-        c.query_row("SELECT COUNT(*) FROM _honker_notifications", [], |r| {
-            r.get(0)
-        })
-        .unwrap()
+    db.with_conn(|c| {
+        c.execute_batch(
+            "INSERT INTO _honker_notifications
+             (id, channel, payload, created_at) VALUES
+             (90, 'c', '\"old\"', unixepoch()),
+             (100, 'c', '\"new\"', unixepoch())",
+        )
+        .unwrap();
     });
-    assert_eq!(count, 3);
+    assert_eq!(db.prune_notifications_keep_latest(5).unwrap(), 0);
+    assert_eq!(db.prune_notifications_keep_latest(1).unwrap(), 1);
+    let ids: Vec<i64> = db.with_conn(|c| {
+        c.prepare("SELECT id FROM _honker_notifications ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    });
+    assert_eq!(ids, vec![100]);
 }
 
 #[test]

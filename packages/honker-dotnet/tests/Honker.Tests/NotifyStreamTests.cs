@@ -191,6 +191,40 @@ public sealed class NotifyStreamTests
     }
 
     [Fact]
+    public void PruneNotificationsMaxKeepUsesRowRankAndOrSemantics()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+
+        db.Execute(
+            "INSERT INTO _honker_notifications " +
+            "(id, channel, payload, created_at) VALUES " +
+            "(90, 'ch', '\"old\"', unixepoch()), " +
+            "(100, 'ch', '\"new\"', unixepoch())");
+
+        Assert.Equal(0, db.PruneNotifications(maxKeep: 5));
+        Assert.Equal(0, db.PruneNotifications(maxKeep: 2));
+        Assert.Equal(1, db.PruneNotifications(maxKeep: 1));
+        Assert.Equal(100, Scalar(db, "SELECT id AS c FROM _honker_notifications"));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            db.PruneNotifications(maxKeep: -1));
+        Assert.Equal(1, db.PruneNotifications(maxKeep: 0));
+
+        foreach (var payload in new[] { "fresh-1", "fresh-2", "fresh-3", "old-newest" })
+        {
+            db.Notify("ch", payload);
+        }
+        db.Execute(
+            "UPDATE _honker_notifications SET created_at=0 " +
+            "WHERE payload='\"old-newest\"'");
+
+        Assert.Equal(3, db.PruneNotifications(olderThanSeconds: 1, maxKeep: 2));
+        var rows = db.Query("SELECT payload FROM _honker_notifications");
+        Assert.Single(rows);
+        Assert.Equal("\"fresh-3\"", rows[0]["payload"]);
+    }
+
+    [Fact]
     public void PruneNotificationsNoArgsIsNoOp()
     {
         using var harness = TestHarness.Create();

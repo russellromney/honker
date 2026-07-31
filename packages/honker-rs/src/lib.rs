@@ -334,14 +334,15 @@ impl Database {
     /// Keep only the most recent `max_keep` notifications. Returns
     /// the number of rows deleted.
     pub fn prune_notifications_keep_latest(&self, max_keep: i64) -> Result<i64> {
+        if max_keep < 0 {
+            return Err(Error::Core("max_keep must not be negative".into()));
+        }
         let n = self.inner.with_conn(|c| {
             c.execute(
                 "DELETE FROM _honker_notifications
-                 WHERE id < (
-                   SELECT COALESCE(MIN(id), 0) FROM (
-                     SELECT id FROM _honker_notifications
-                     ORDER BY id DESC LIMIT ?1
-                   )
+                 WHERE id <= (
+                   SELECT id FROM _honker_notifications
+                   ORDER BY id DESC LIMIT 1 OFFSET ?1
                  )",
                 params![max_keep],
             )

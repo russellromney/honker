@@ -58,6 +58,10 @@ Core (all bindings via `honker_*` SQL / shared extension):
   hardcoded 3.
 - **JSON returns** from claim/get_job/scheduler/stream built with
   `serde_json` (wire shape for string payloads unchanged).
+- **Notification `max_keep` pruning is gap-safe** in Python, Node,
+  Rust, JVM, and .NET. The bindings now retain the newest N rows by
+  rank instead of assuming notification IDs are contiguous;
+  `max_keep=0` deletes all rows and negative values are rejected.
 
 Python:
 

@@ -242,3 +242,58 @@ test('pruneNotifications by max_keep', () => {
     cleanup();
   }
 });
+
+test('pruneNotifications maxKeep is gap-safe and validates bounds', () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  let db;
+  try {
+    db = open(dbPath);
+    {
+      const tx = db.transaction();
+      tx.execute(
+        "INSERT INTO _honker_notifications " +
+        "(id, channel, payload, created_at) VALUES " +
+        "(90, 'ch', '\"old\"', unixepoch()), " +
+        "(100, 'ch', '\"new\"', unixepoch())"
+      );
+      tx.commit();
+    }
+
+    assert.equal(db.pruneNotifications(null, 5), 0);
+    assert.equal(db.pruneNotifications(null, 2), 0);
+    assert.equal(db.pruneNotifications(null, 1), 1);
+    assert.deepEqual(
+      db.query('SELECT id FROM _honker_notifications ORDER BY id')
+        .map((row) => row.id),
+      [100]
+    );
+    assert.throws(
+      () => db.pruneNotifications(null, -1),
+      /maxKeep must not be negative/
+    );
+    assert.equal(db.pruneNotifications(null, 0), 1);
+
+    for (const payload of ['fresh-1', 'fresh-2', 'fresh-3', 'old-newest']) {
+      const tx = db.transaction();
+      tx.notify('ch', payload);
+      tx.commit();
+    }
+    {
+      const tx = db.transaction();
+      tx.execute(
+        "UPDATE _honker_notifications SET created_at=0 " +
+        "WHERE payload='\"old-newest\"'"
+      );
+      tx.commit();
+    }
+    assert.equal(db.pruneNotifications(1, 2), 3);
+    assert.deepEqual(
+      db.query('SELECT payload FROM _honker_notifications ORDER BY id')
+        .map((row) => JSON.parse(row.payload)),
+      ['fresh-3']
+    );
+  } finally {
+    db?.close();
+    cleanup();
+  }
+});

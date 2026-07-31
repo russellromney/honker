@@ -218,7 +218,13 @@ impl Database {
             params.push(SqlValue::Integer(secs));
         }
         if let Some(k) = max_keep {
-            conditions.push("id <= (SELECT MAX(id) - ? FROM _honker_notifications)");
+            if k < 0 {
+                return Err(napi_err("maxKeep must not be negative"));
+            }
+            conditions.push(
+                "id <= (SELECT id FROM _honker_notifications \
+                 ORDER BY id DESC LIMIT 1 OFFSET ?)",
+            );
             params.push(SqlValue::Integer(k));
         }
         if conditions.is_empty() {

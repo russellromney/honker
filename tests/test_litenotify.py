@@ -235,6 +235,83 @@ def test_prune_notifications_by_max_keep(db_path):
     assert after == 10
 
 
+def test_prune_notifications_max_keep_uses_row_rank(db_path):
+    db = honker.open(db_path)
+    with db.transaction() as tx:
+        tx.execute(
+            "INSERT INTO _honker_notifications "
+            "(id, channel, payload, created_at) VALUES "
+            "(90, 'ch', '\"old\"', unixepoch()), "
+            "(100, 'ch', '\"new\"', unixepoch())",
+        )
+
+    assert db.prune_notifications(max_keep=5) == 0
+    assert db.prune_notifications(max_keep=10**100) == 0
+    assert db.prune_notifications(max_keep=2) == 0
+    assert db.prune_notifications(max_keep=1) == 1
+    assert [
+        row["id"]
+        for row in db.query(
+            "SELECT id FROM _honker_notifications ORDER BY id"
+        )
+    ] == [100]
+
+    with pytest.raises(ValueError, match="max_keep must not be negative"):
+        db.prune_notifications(max_keep=-1)
+    assert db.prune_notifications(max_keep=0) == 1
+
+
+def test_prune_notifications_combines_age_and_max_keep_with_or(db_path):
+    db = honker.open(db_path)
+    for payload in ("fresh-1", "fresh-2", "fresh-3", "old-newest"):
+        with db.transaction() as tx:
+            tx.notify("ch", payload)
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_notifications SET created_at=0 "
+            "WHERE payload='\"old-newest\"'"
+        )
+
+    assert db.prune_notifications(older_than_s=1, max_keep=2) == 3
+    rows = db.query(
+        "SELECT payload FROM _honker_notifications ORDER BY id"
+    )
+    assert [row["payload"] for row in rows] == ['"fresh-3"']
+
+
+def test_prune_notifications_sees_insert_before_write_transaction(
+    db_path, monkeypatch
+):
+    """Regression for #81: MAX(id) must not be read before the write."""
+    db = honker.open(db_path)
+    other = honker.open(db_path)
+    for payload in ("one", "two", "three"):
+        with db.transaction() as tx:
+            tx.notify("ch", payload)
+
+    original_transaction = db.transaction
+    inserted = False
+
+    def transaction_after_competing_insert():
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            with other.transaction() as tx:
+                tx.notify("ch", "four")
+        return original_transaction()
+
+    monkeypatch.setattr(db, "transaction", transaction_after_competing_insert)
+    try:
+        assert db.prune_notifications(max_keep=2) == 2
+        assert inserted
+        rows = db.query(
+            "SELECT payload FROM _honker_notifications ORDER BY id"
+        )
+        assert [row["payload"] for row in rows] == ['"three"', '"four"']
+    finally:
+        other.close()
+
+
 def test_prune_notifications_by_age(db_path):
     db = honker.open(db_path)
 

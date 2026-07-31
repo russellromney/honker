@@ -204,6 +204,50 @@ class HonkerJvmTest {
     }
 
     @Test
+    void pruneNotificationsMaxKeepUsesRowRankAndOrSemantics() {
+        try (Database db = open()) {
+            db.transactionVoid(tx -> tx.execute(
+                "INSERT INTO _honker_notifications " +
+                "(id, channel, payload, created_at) VALUES " +
+                "(90, 'ch', '\"old\"', unixepoch()), " +
+                "(100, 'ch', '\"new\"', unixepoch())"
+            ));
+
+            assertEquals(0, db.pruneNotifications(
+                NotificationPruneOptions.builder().maxKeep(5).build()));
+            assertEquals(0, db.pruneNotifications(
+                NotificationPruneOptions.builder().maxKeep(2).build()));
+            assertEquals(1, db.pruneNotifications(
+                NotificationPruneOptions.builder().maxKeep(1).build()));
+            assertEquals(100L, db.query(
+                "SELECT id FROM _honker_notifications").get(0).getLong("id"));
+            assertThrows(HonkerInvalidOptionException.class, () ->
+                NotificationPruneOptions.builder().maxKeep(-1));
+            assertEquals(1, db.pruneNotifications(
+                NotificationPruneOptions.builder().maxKeep(0).build()));
+
+            for (String payload : List.of(
+                "\"fresh-1\"", "\"fresh-2\"", "\"fresh-3\"", "\"old-newest\""
+            )) {
+                db.notify("ch", payload);
+            }
+            db.transactionVoid(tx -> tx.execute(
+                "UPDATE _honker_notifications SET created_at=0 " +
+                "WHERE payload='\"old-newest\"'"
+            ));
+            assertEquals(3, db.pruneNotifications(
+                NotificationPruneOptions.builder()
+                    .olderThan(Duration.ofSeconds(1))
+                    .maxKeep(2)
+                    .build()
+            ));
+            assertEquals("\"fresh-3\"", db.query(
+                "SELECT payload FROM _honker_notifications"
+            ).get(0).getString("payload"));
+        }
+    }
+
+    @Test
     void listenerAndStreamCallbackFailuresAreObservable() {
         try (Database db = open()) {
             try (ListenHandle listen = db.listen(

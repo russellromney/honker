@@ -135,13 +135,11 @@ public final class Database implements AutoCloseable {
             params.add(Durations.seconds(options.olderThan(), "olderThan"));
         }
         if (options.maxKeep() != null) {
-            long maxId = query("SELECT COALESCE(MAX(id), 0) AS m FROM _honker_notifications")
-                .get(0).getLong("m");
-            long threshold = maxId - options.maxKeep();
-            if (threshold >= 1L) {
-                conditions.add("id <= ?");
-                params.add(threshold);
-            }
+            conditions.add(
+                "id <= (SELECT id FROM _honker_notifications " +
+                "ORDER BY id DESC LIMIT 1 OFFSET ?)"
+            );
+            params.add(options.maxKeep());
         }
         if (conditions.isEmpty()) {
             return 0;
