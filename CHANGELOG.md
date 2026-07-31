@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## Unreleased — schedule lifecycle + job cancel (Phase Mantle)
+
+Shipped in PR #42. Closes issue #25, with the deliberate "no `max_runs`"
+stance recorded in the phase entry that drove it.
+
+- New `enabled` column on `_honker_scheduler_tasks`. Both the scheduler
+  tick and `soonest()` filter on `enabled = 1`, so a paused schedule
+  neither emits nor holds the wake deadline.
+- New SQL functions: `honker_scheduler_pause`, `honker_scheduler_resume`,
+  `honker_scheduler_list`, `honker_scheduler_update`, `honker_cancel`,
+  and `honker_get_job`. (`remove()` goes through the pre-existing
+  `honker_scheduler_unregister`.)
+  Lifecycle methods go through these rather than binding-local state, so
+  they operate on rows registered by another process (CLI tool, admin
+  script, MCP wrapper).
+- Scheduler lifecycle methods, namespaced on the scheduler handle rather
+  than flattened onto the database handle: `pause(name)`,
+  `resume(name)`, `remove(name)`, `list()`, and
+  `update(name, *, schedule=None, payload=..., priority=None,
+  expires=...)`. `update` recomputes `next_fire_at` from now when the
+  schedule expression changes, and distinguishes "set to JSON null"
+  from "leave unchanged" by omitted kwarg.
+- Job lifecycle on the queue handle: `cancel(job_id)` removes a pending
+  or processing row and returns whether one was removed; `get_job(job_id)`
+  is a pure read. Cancelling a claimed-but-unacked job makes the worker's
+  later `ack()` a no-op, matching expired-claim semantics.
+- Wired through every maintained binding — Python, Node, Rust, Go, Bun,
+  Ruby, Elixir, C++, and .NET — each with a binding-local round-trip
+  proof, not just the three bindings originally scoped.
+
 ## Unreleased — correctness priority fixes
 
 Core (all bindings via `honker_*` SQL / shared extension):

@@ -6,7 +6,7 @@ Short notes on repo layout, tests, and releases.
 
 - `honker-core/` — shared Rust crate (rlib). Published to crates.io.
 - `honker-extension/` — SQLite loadable extension (cdylib). Published to crates.io.
-- `packages/honker-{py,node,rs,go,ruby,bun,ex,cpp}/` — language bindings. Each lives in its own GitHub repo and is git-submoduled here.
+- `packages/` — language bindings, maintained in-tree: `honker` (Python), `honker-node`, `honker-rs`, `honker-go`, `honker-ruby`, `honker-bun`, `honker-ex`, `honker-cpp`, `honker-dotnet`, `honker-jvm`, `honker-kotlin`.
 - `site/` — honker.dev (Astro Starlight; git submodule).
 - `tests/` — cross-binding integration tests.
 
@@ -18,7 +18,7 @@ make test-python-slow   # soak + real-time cron (~2 min)
 make test-all       # everything
 ```
 
-Submodule bindings have their own test runners; see each repo's README for language-specific commands (`cargo test`, `bun test`, `mix test`, `bundle exec ruby spec/*.rb`, etc.).
+Bindings under `packages/` have their own test runners; see each binding's README for language-specific commands (`cargo test`, `bun test`, `mix test`, `bundle exec ruby spec/*.rb`, etc.).
 
 ## Releases
 
@@ -37,9 +37,9 @@ git tag ext-v0.1.1
 git push origin ext-v0.1.1
 ```
 
-GitHub Actions (`.github/workflows/release-crates.yml`) picks up tags matching `core-v*` / `ext-v*` and runs `cargo publish`.
+GitHub Actions (`.github/workflows/release-crates.yml`) picks up tags matching `core-v*` / `ext-v*` and builds, verifies, and smoke-tests the crate artifacts. It does not publish — `cargo publish` is a manual step after the proof job is green. The same holds for every other ecosystem's release workflow.
 
-Each language binding lives in its own submodule repo and has its own release process; see each binding's README.
+Each language binding lives in `packages/` in this repo and has its own release tag prefix; see each binding's README.
 
 ## Making changes
 
