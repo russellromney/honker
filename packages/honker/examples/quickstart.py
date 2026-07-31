@@ -18,9 +18,13 @@ import tempfile
 import honker
 
 
-async def main():
-    with tempfile.TemporaryDirectory() as d:
-        db = honker.open(os.path.join(d, "app.db"))
+async def main(db_path=None):
+    temporary = None
+    if db_path is None:
+        temporary = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temporary.name, "app.db")
+    try:
+        db = honker.open(db_path)
         try:
             emails = db.queue("emails")
 
@@ -57,7 +61,10 @@ async def main():
             # Release SQLite's db/WAL/SHM handles before TemporaryDirectory
             # removes them. Windows cannot unlink files with open handles.
             db.close()
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(os.environ.get("HONKER_QUICKSTART_DB")))
