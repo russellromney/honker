@@ -46,7 +46,7 @@ jobs:
       - name: Build native package
         working-directory: packages/honker-node
         run: |
-          npm install
+          npm ci
           npm exec -- napi build \
             --platform \
             --release \
@@ -96,7 +96,7 @@ jobs:
       - name: Pack and smoke test
         working-directory: packages/honker-node
         run: |
-          npm install
+          npm ci
           npm exec -- napi artifacts --output-dir . --npm-dir npm
           ../../scripts/proof/check-node-native-artifacts.sh honker.*.node npm/*/*.node
           node -e "require('./npm/linux-x64-gnu/honker.linux-x64-gnu.node'); console.log('linux-x64 native load ok')"

@@ -49,7 +49,7 @@ jobs:
         env:
           RUST_TARGET: ${{ matrix.rust_target }}
         run: |
-          cargo_args=(--release -p honker-extension --features kernel-watcher,shm-fast-path)
+          cargo_args=(--locked --release -p honker-extension --features kernel-watcher,shm-fast-path)
           target_dir="target/release"
           if [[ -n "$RUST_TARGET" ]]; then
             rustup target add "$RUST_TARGET"

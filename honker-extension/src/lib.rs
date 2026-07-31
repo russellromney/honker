@@ -363,17 +363,15 @@ pub unsafe extern "C" fn honker_watcher_wait(
     if handle.is_null() {
         return -1;
     }
-    match catch_unwind(AssertUnwindSafe(|| {
+    catch_unwind(AssertUnwindSafe(|| {
         let handle = unsafe { &mut *handle };
         match handle.rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(()) => 1,
             Err(RecvTimeoutError::Timeout) => 0,
             Err(RecvTimeoutError::Disconnected) => -1,
         }
-    })) {
-        Ok(code) => code,
-        Err(_) => -2,
-    }
+    }))
+    .unwrap_or(-2)
 }
 
 /// Close a watcher opened by `honker_watcher_open`.

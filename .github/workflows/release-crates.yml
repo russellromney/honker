@@ -67,9 +67,14 @@ jobs:
           fi
 
       - name: Verify test suite before publish
-        run: cargo test -p honker-core --release --lib
+        run: cargo test -p honker-core --locked --release --lib
 
       - name: Package crate
         env:
           CRATE: ${{ steps.crate.outputs.name }}
-        run: cargo package -p "$CRATE"
+        run: |
+          # --locked: package against exactly the dependency graph in the
+          # committed Cargo.lock, so this proof reflects what a local
+          # publish would actually ship rather than whatever resolves at
+          # packaging time.
+          cargo package --locked -p "$CRATE"

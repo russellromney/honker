@@ -33,7 +33,7 @@ jobs:
 
       - name: Build extension and Python interop package
         run: |
-          cargo build --release -p honker-extension --features kernel-watcher,shm-fast-path
+          cargo build --locked --release -p honker-extension --features kernel-watcher,shm-fast-path
           uv venv --python "3.14" .venv
           . .venv/bin/activate
           uv pip install pytest pytest-xdist maturin

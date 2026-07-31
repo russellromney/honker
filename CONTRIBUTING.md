@@ -22,11 +22,12 @@ Submodule bindings have their own test runners; see each repo's README for langu
 
 ## Releases
 
-Crate releases are tag-triggered. Bump the version in the crate's `Cargo.toml`, commit, then tag:
+Crate releases are tag-triggered. Bump the version in the crate's `Cargo.toml`, refresh `Cargo.lock`, commit, then tag. The lock refresh is not optional: CI and the release workflow pass `--locked` everywhere, so a commit that bumps `Cargo.toml` without the matching `Cargo.lock` line fails with "the lock file needs to be updated but --locked was passed" — after the tag is already pushed.
 
 ```bash
 # honker-core
 # edit honker-core/Cargo.toml → version = "0.1.1"
+cargo check --workspace   # refreshes Cargo.lock with the new version
 git commit -am "honker-core v0.1.1: <summary>"
 git tag core-v0.1.1
 git push origin main core-v0.1.1

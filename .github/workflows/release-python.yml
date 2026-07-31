@@ -48,7 +48,7 @@ jobs:
           RUNNER_OS_NAME: ${{ runner.os }}
           RUST_TARGET: ${{ matrix.rust_target }}
         run: |
-          cargo_args=(--release -p honker-extension)
+          cargo_args=(--locked --release -p honker-extension)
           maturin_args=(build --release --manifest-path packages/honker/Cargo.toml --out dist)
           if [[ -n "$RUST_TARGET" ]]; then
             rustup target add "$RUST_TARGET"

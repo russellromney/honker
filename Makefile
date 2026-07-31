@@ -1,4 +1,5 @@
 .PHONY: help test test-rust test-python test-python-slow test-node test-jvm test-kotlin test-jvm-consumer test-all \
+        lint lint-fix \
         build build-pyo3 build-ext \
         coverage coverage-rust coverage-python coverage-python-all \
         install-coverage-deps clean \
@@ -17,6 +18,10 @@ help:
 	@echo "  make test-kotlin    - Maven test in packages/honker-kotlin"
 	@echo "  make test-jvm-consumer - clean Maven consumer proof for JVM/Kotlin"
 	@echo "  make test-all       - everything, including slow marks"
+	@echo ""
+	@echo "Lint (same checks as the CI 'lint' job):"
+	@echo "  make lint           - cargo fmt --check + clippy -D warnings"
+	@echo "  make lint-fix       - apply cargo fmt and clippy --fix"
 	@echo ""
 	@echo "Builds:"
 	@echo "  make build          - build both PyO3 + loadable extension"
@@ -63,6 +68,26 @@ test-jvm-consumer:
 
 test-all: test test-python-slow
 	@echo "all tests passed (including slow marks)"
+
+# ---- lint ----
+#
+# Mirrors the `lint` job in .github/workflows/ci.yml exactly. The lint
+# policy itself lives in the root Cargo.toml `[workspace.lints.clippy]`
+# table, so local and CI agree on what counts as a warning.
+#
+# The second clippy pass covers the cfg-gated kernel-watcher /
+# shm-fast-path code, which the default-feature pass never type-checks.
+
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets --locked -- -D warnings
+	cargo clippy --workspace --all-targets --locked \
+		--features honker-core/kernel-watcher,honker-core/shm-fast-path \
+		-- -D warnings
+
+lint-fix:
+	cargo fmt --all
+	cargo clippy --fix --workspace --all-targets --locked --allow-dirty
 
 # ---- builds ----
 

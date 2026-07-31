@@ -7,18 +7,25 @@ name: zizmor · workflow lint
 # excessive default permissions, cache poisoning, etc.).
 #
 # Failing this job blocks the PR — fix the flagged issue or add a
-# zizmor ignore comment with a reason.
+# zizmor ignore comment with a reason. That only holds if `zizmor` is
+# actually one of the required status checks in branch protection
+# (alongside `ci · all green`; ci.yml's aggregate cannot cover a job in
+# another workflow).
+#
+# Being required is why the `pull_request` trigger carries no `paths`
+# filter. A required check that never reports is not treated as a pass
+# — it pins the PR in "Expected — waiting for status" forever — so a
+# path-filtered workflow cannot safely be required. Running zizmor on
+# every PR costs a few seconds of runner time and removes that trap.
+# It also still covers the case the filter was written for: a PR that
+# weakens `.github/zizmor.yml` is linted either way.
+#
+# The `push` trigger keeps its filter — branch protection only
+# evaluates checks from `pull_request` runs, and on main this is just
+# a post-merge backstop.
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/**"
-      # Watch the zizmor config too — otherwise a PR could weaken
-      # `.github/zizmor.yml` (the file that decides which rules
-      # block) without ever triggering this lint. With the config
-      # path included, any change that touches the policy is gated
-      # by the same lint that enforces it.
-      - ".github/zizmor.yml"
   push:
     branches: [main]
     paths:

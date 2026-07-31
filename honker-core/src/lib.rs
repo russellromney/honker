@@ -1556,9 +1556,10 @@ mod tests {
                 // try_recv returns Err(Empty) for "alive but no msg",
                 // Err(Disconnected) for "watcher died, sender cleared".
                 // Use blocking recv with a poll instead.
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    _ => {}
+                if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
+                    rx.recv_timeout(Duration::from_millis(100))
+                {
+                    break;
                 }
             }
             if std::time::Instant::now() > deadline {
@@ -1914,7 +1915,7 @@ mod tests {
                     .map(|s| s.success())
                     .unwrap_or(false)
             })
-            .map(|s| *s);
+            .copied();
         let Some(python) = python else {
             eprintln!(
                 "writer_killed_mid_workload_leaves_db_consistent: \
@@ -1992,11 +1993,10 @@ while True:
                 );
             }
             if let Ok(c) = read_conn.query_row("SELECT count(*) FROM q", [], |r| r.get::<_, i64>(0))
+                && c > 0
             {
-                if c > 0 {
-                    high_water = c;
-                    break;
-                }
+                high_water = c;
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -2377,8 +2377,21 @@ while True:
     /// Run the wake/listen suite against the kernel-watch backend.
     /// Each commit separated by 20 ms ensures both the 1 ms poller
     /// and the kernel-watch loop have time to fire before the next.
+    ///
+    /// Windows: ReadDirectoryChangesW coalesces and drops notifications,
+    /// so the no-missed-commit assertion below does not hold there —
+    /// observed 3 wakes for 5 commits on a CI runner. kernel_watcher.rs
+    /// documents missed wakes as permitted, and this backend has no
+    /// data_version verification or safety-net poll behind it, so there
+    /// is nothing to recover the lost event. The backend is not proven
+    /// on Windows; say so rather than loosening the threshold until it
+    /// passes. Linux and macOS deliver reliably and stay gated.
     #[test]
     #[cfg(feature = "kernel-watcher")]
+    #[cfg_attr(
+        windows,
+        ignore = "ReadDirectoryChangesW drops/coalesces events; missed wakes are permitted by the backend contract"
+    )]
     fn kernel_watcher_detects_all_commits() {
         use std::sync::atomic::{AtomicU32, Ordering as AO};
 
@@ -2708,12 +2721,19 @@ while True:
     // attach to db + journal + dir to maximize coverage, and ship the
     // backend with documented "missed wakes possible" semantics, but
     // we don't gate CI on a behavior the kernel won't reliably deliver.
-    // WAL-mode kernel coverage stays mandatory (kernel_watcher_works_in_wal).
+    //
+    // Windows hits the same wall for a different reason:
+    // ReadDirectoryChangesW coalesces and drops notifications, so the
+    // `observed >= n` assertion in watcher_works_in_journal_mode is not
+    // sound there either. Same call: don't gate CI on it.
+    //
+    // Linux remains gated on all three modes, and every platform except
+    // Windows stays gated on WAL via kernel_watcher_detects_all_commits.
     #[test]
     #[cfg(feature = "kernel-watcher")]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "kqueue: in-place writes don't fire dir events"
+        any(target_os = "macos", windows),
+        ignore = "kqueue: in-place writes don't fire dir events; ReadDirectoryChangesW drops/coalesces them"
     )]
     fn kernel_watcher_works_in_delete() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "DELETE");
@@ -2722,8 +2742,8 @@ while True:
     #[test]
     #[cfg(feature = "kernel-watcher")]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "kqueue: in-place writes don't fire dir events"
+        any(target_os = "macos", windows),
+        ignore = "kqueue: in-place writes don't fire dir events; ReadDirectoryChangesW drops/coalesces them"
     )]
     fn kernel_watcher_works_in_truncate() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "TRUNCATE");
@@ -2732,8 +2752,8 @@ while True:
     #[test]
     #[cfg(feature = "kernel-watcher")]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "kqueue: in-place writes don't fire dir events"
+        any(target_os = "macos", windows),
+        ignore = "kqueue: in-place writes don't fire dir events; ReadDirectoryChangesW drops/coalesces them"
     )]
     fn kernel_watcher_works_in_persist() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "PERSIST");
