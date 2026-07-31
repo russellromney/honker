@@ -18,37 +18,53 @@ import tempfile
 import honker
 
 
-async def main():
-    with tempfile.TemporaryDirectory() as d:
-        db = honker.open(os.path.join(d, "app.db"))
-        emails = db.queue("emails")
+async def main(db_path=None):
+    temporary = None
+    if db_path is None:
+        temporary = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temporary.name, "app.db")
+    try:
+        db = honker.open(db_path)
+        try:
+            emails = db.queue("emails")
 
-        # A plain business table. Nothing honker-specific.
-        with db.transaction() as tx:
-            tx.execute(
-                "CREATE TABLE orders "
-                "(id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)"
-            )
+            # A plain business table. Nothing honker-specific.
+            with db.transaction() as tx:
+                tx.execute(
+                    "CREATE TABLE orders "
+                    "(id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)"
+                )
 
-        # The order INSERT and the job enqueue commit together. A worker
-        # in another process wakes when this transaction commits.
-        with db.transaction() as tx:
-            tx.execute(
-                "INSERT INTO orders (user_id, amount) VALUES (?, ?)", [42, 19.99]
-            )
-            emails.enqueue(
-                {"to": "alice@example.com", "body": "Receipt for 19.99"}, tx=tx
-            )
+            # The order INSERT and the job enqueue commit together. A worker
+            # in another process wakes when this transaction commits.
+            with db.transaction() as tx:
+                tx.execute(
+                    "INSERT INTO orders (user_id, amount) VALUES (?, ?)",
+                    [42, 19.99],
+                )
+                emails.enqueue(
+                    {"to": "alice@example.com", "body": "Receipt for 19.99"}, tx=tx
+                )
 
-        async def worker():
-            async for job in emails.claim("w1"):
-                print(f"sending email to {job.payload['to']}: {job.payload['body']}")
-                assert job.ack()
-                return
+            async def worker():
+                async for job in emails.claim("w1"):
+                    print(
+                        f"sending email to {job.payload['to']}: {job.payload['body']}"
+                    )
+                    if not job.ack():
+                        raise RuntimeError("failed to acknowledge claimed job")
+                    return
 
-        await asyncio.wait_for(worker(), timeout=5.0)
-        print("done")
+            await asyncio.wait_for(worker(), timeout=5.0)
+            print("done")
+        finally:
+            # Release SQLite's db/WAL/SHM handles before TemporaryDirectory
+            # removes them. Windows cannot unlink files with open handles.
+            db.close()
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(os.environ.get("HONKER_QUICKSTART_DB")))
