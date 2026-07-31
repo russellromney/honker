@@ -88,6 +88,8 @@ lint:
 lint-fix:
 	cargo fmt --all
 	cargo clippy --fix --workspace --all-targets --locked --allow-dirty
+	cargo clippy --fix --workspace --all-targets --locked --allow-dirty \
+		--features honker-core/kernel-watcher,honker-core/shm-fast-path
 
 # ---- builds ----
 

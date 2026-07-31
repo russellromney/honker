@@ -2383,15 +2383,11 @@ while True:
     /// observed 3 wakes for 5 commits on a CI runner. kernel_watcher.rs
     /// documents missed wakes as permitted, and this backend has no
     /// data_version verification or safety-net poll behind it, so there
-    /// is nothing to recover the lost event. The backend is not proven
-    /// on Windows; say so rather than loosening the threshold until it
-    /// passes. Linux and macOS deliver reliably and stay gated.
+    /// is nothing to recover the lost event. Windows still runs the test
+    /// and enforces the runaway-wake bound; only its lower bound is waived.
+    /// Linux and macOS deliver reliably and stay gated.
     #[test]
     #[cfg(feature = "kernel-watcher")]
-    #[cfg_attr(
-        windows,
-        ignore = "ReadDirectoryChangesW drops/coalesces events; missed wakes are permitted by the backend contract"
-    )]
     fn kernel_watcher_detects_all_commits() {
         use std::sync::atomic::{AtomicU32, Ordering as AO};
 
@@ -2451,13 +2447,27 @@ while True:
 
         // Experimental contract: spurious wakes are allowed (the backend
         // fires on every filesystem event, and SQLite produces several
-        // events per commit). The thing that must not happen is a *missed*
-        // commit — assert at least n wakes.
+        // events per commit). Keep a generous upper bound on every platform
+        // so a runaway watcher cannot hide behind a Windows test carve-out.
+        let upper = n * 200;
+        assert!(
+            observed <= upper,
+            "kernel watcher detected {observed} wakes for {n} commits, \
+             upper bound {upper} (runaway watcher?)"
+        );
+        #[cfg(not(windows))]
         assert!(
             observed >= n,
             "kernel watcher detected {observed} wakes for {n} commits — \
              missed at least one"
         );
+        #[cfg(windows)]
+        if observed < n {
+            eprintln!(
+                "kernel watcher under-delivered on Windows: \
+                 {observed} wakes for {n} commits"
+            );
+        }
     }
 
     /// Prove that the shm fast path fires on the same commits as the
@@ -2678,15 +2688,26 @@ while True:
             WatcherBackend::ShmFastPath => n + 1,
         };
         assert!(
-            observed >= n,
-            "journal_mode={mode}: observed {observed} wakes for {n} commits \
-             (missed at least one)"
-        );
-        assert!(
             observed <= upper,
             "journal_mode={mode}: observed {observed} wakes for {n} commits, \
              upper bound {upper} (runaway watcher?)"
         );
+        #[cfg(feature = "kernel-watcher")]
+        let allows_missed_wakes = cfg!(windows) && matches!(backend, WatcherBackend::KernelWatch);
+        #[cfg(not(feature = "kernel-watcher"))]
+        let allows_missed_wakes = false;
+        if allows_missed_wakes && observed < n {
+            eprintln!(
+                "journal_mode={mode}: kernel watcher under-delivered on Windows: \
+                 {observed} wakes for {n} commits"
+            );
+        } else {
+            assert!(
+                observed >= n,
+                "journal_mode={mode}: observed {observed} wakes for {n} commits \
+                 (missed at least one)"
+            );
+        }
     }
 
     // ---- Polling × every supported journal mode (regression coverage) ----
@@ -2732,8 +2753,8 @@ while True:
     #[test]
     #[cfg(feature = "kernel-watcher")]
     #[cfg_attr(
-        any(target_os = "macos", windows),
-        ignore = "kqueue: in-place writes don't fire dir events; ReadDirectoryChangesW drops/coalesces them"
+        target_os = "macos",
+        ignore = "kqueue: in-place writes don't fire dir events"
     )]
     fn kernel_watcher_works_in_delete() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "DELETE");
@@ -2742,8 +2763,8 @@ while True:
     #[test]
     #[cfg(feature = "kernel-watcher")]
     #[cfg_attr(
-        any(target_os = "macos", windows),
-        ignore = "kqueue: in-place writes don't fire dir events; ReadDirectoryChangesW drops/coalesces them"
+        target_os = "macos",
+        ignore = "kqueue: in-place writes don't fire dir events"
     )]
     fn kernel_watcher_works_in_truncate() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "TRUNCATE");
@@ -2752,8 +2773,8 @@ while True:
     #[test]
     #[cfg(feature = "kernel-watcher")]
     #[cfg_attr(
-        any(target_os = "macos", windows),
-        ignore = "kqueue: in-place writes don't fire dir events; ReadDirectoryChangesW drops/coalesces them"
+        target_os = "macos",
+        ignore = "kqueue: in-place writes don't fire dir events"
     )]
     fn kernel_watcher_works_in_persist() {
         watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "PERSIST");
@@ -2870,10 +2891,6 @@ while True:
         ignore = "notify/kqueue can drop the watcher thread under CI load; functional kernel watcher tests still run"
     )]
     #[cfg(feature = "kernel-watcher")]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "kqueue under CI load may deliver zero wakes"
-    )]
     fn kernel_watcher_wake_latency_is_event_driven() {
         let tmp = std::env::temp_dir().join(format!(
             "honker-kw-lat-{}-{}",

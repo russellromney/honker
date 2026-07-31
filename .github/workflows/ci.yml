@@ -151,7 +151,9 @@ jobs:
           prefix-key: "v1-bench-${{ hashFiles('bench/wal_index_methods/Cargo.toml', 'bench/wal_index_methods/src/**/*.rs') }}"
       - name: Run wal_index_methods bench
         working-directory: bench/wal_index_methods
-        run: cargo run --locked --release | tee /tmp/bench.out
+        run: |
+          set -o pipefail
+          cargo run --locked --release | tee /tmp/bench.out
       - name: Assert mmap-shm beats cached PRAGMA by >=50x
         run: |
           set -euo pipefail

@@ -73,7 +73,7 @@ echo "== node package install =="
 mkdir -p "$TMP/npm"
 (
   cd "$ROOT/packages/honker-node"
-  npm install
+  npm ci
   cp index.js "$TMP/node-index.js"
   npx napi build --platform --release
   cp "$TMP/node-index.js" index.js
