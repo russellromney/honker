@@ -63,13 +63,17 @@ Experimental wake backends:
   unreferenced, so there is no lock left to drop. PR #43's bounded-read
   protection is unchanged.
 - **The shm fast path is slower than its docs claimed, and is no longer
-  recommended.** PR #43 replaced the mmap load with a bounded read to
-  stop the watcher SIGBUS-ing itself, which was correct but removed the
-  backend's reason to exist. Measured on macOS/arm64 against SQLite
-  3.51.3: `pread` of the WAL-index header ~1.2 us versus ~2.3 us for
-  `PRAGMA data_version`, and both backends sleep 1 ms, so **wake latency
-  is identical**. The remaining win is ~1 us of CPU per millisecond per
-  watched database. Prefer polling unless you have measured otherwise.
+  recommended.** PR #43 replaced the mmap load with a bounded read,
+  citing SIGBUS risk. That risk was overstated for this particular read:
+  SQLite truncates `-shm` to 3 bytes rather than 0, and `iChange` at
+  offset 8 falls inside the partial page POSIX guarantees is readable.
+  The SIGBUS seen in CI came from SQLite's own mapping, because honker
+  was dropping SQLite's DMS lock — the bug fixed above. The bounded read
+  stays regardless, because restoring the mapping would not help:
+  `pread` of the header is ~1.2 us versus ~2.3 us for `PRAGMA
+  data_version` on macOS/arm64, and both backends sleep 1 ms, so **wake
+  latency is identical**. Trading CPU for latency is already available on
+  the polling backend via the poll-interval option. Prefer polling.
 
 Core (all bindings via `honker_*` SQL / shared extension):
 

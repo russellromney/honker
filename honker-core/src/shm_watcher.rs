@@ -39,17 +39,27 @@
 //!
 //! Less than its name suggests, and you should know that before enabling
 //! it. The original design mapped `-shm` and read `iChange` as a load,
-//! which was ~2000x cheaper than `PRAGMA data_version`. That mapping had
-//! to go: SQLite truncates `-shm` to 3 bytes when it re-attaches the WAL
-//! index, and a mapped read past the new end of file is SIGBUS, which
-//! kills the host process. Bounded positional reads replaced it.
+//! which was ~2000x cheaper than `PRAGMA data_version`. PR #43 replaced
+//! that mapping with bounded positional reads, citing SIGBUS risk.
 //!
-//! A bounded read is a syscall. Measured on macOS/arm64 against SQLite
-//! 3.51.3: `pread` of the header ~1.2 us, `PRAGMA data_version` ~2.3 us.
-//! Both backends then sleep 1 ms, so **wake latency is identical** — the
-//! only difference is roughly 1 us of CPU per millisecond per watched
-//! database, about 0.1% of a core. Prefer the polling backend unless you
-//! have measured a reason not to.
+//! That risk was overstated for *this* read. SQLite's only shrink of
+//! `-shm` truncates it to 3 bytes, not 0 — deliberately — and `iChange`
+//! sits at offset 8, inside the zero-filled partial page that POSIX
+//! guarantees is readable. Only whole pages past the end of the object
+//! fault, and this module never touches those. The SIGBUS actually seen
+//! in CI came from *SQLite's own* mapping, which spans regions at 32 KiB
+//! and beyond, and it happened because this crate was dropping SQLite's
+//! DMS lock — issue #80, fixed by the registry above.
+//!
+//! The bounded read stays anyway: it costs ~1 us, it removes the need to
+//! reason about page boundaries at all, and restoring the mapping would
+//! not help. A bounded read is a syscall (~1.2 us here versus ~2.3 us for
+//! `PRAGMA data_version` on macOS/arm64), but both backends then sleep
+//! 1 ms, so **wake latency is identical**. The mapping would only pay off
+//! paired with a much tighter poll interval — and that trade is already
+//! available on the polling backend via `WatcherConfig::poll_interval`,
+//! without a second backend. Prefer polling unless you have measured a
+//! reason not to.
 //!
 //! Tests assert that wakes fire with sub-millisecond latency in WAL
 //! mode. If a test fails, the backend is broken — not "fall back to
