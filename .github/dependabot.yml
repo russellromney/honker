@@ -17,13 +17,14 @@
 # their own upstream schedules. Everything is grouped so a quiet week
 # produces one PR rather than nine.
 #
-# Every entry carries the same `cooldown`: don't propose a version that
-# shipped in the last week. A compromised release is usually yanked
-# within days, so waiting out that window is most of the protection a
-# pin buys, and neither the weekly nor the monthly cadence here is
-# urgent enough to trade it away. Majors wait longer — they need a human
-# read regardless, so there is no cost to letting them settle. zizmor's
-# dependabot-cooldown audit enforces the floor.
+# Every entry carries at least the same default `cooldown`: don't propose
+# a version that shipped in the last week. A compromised release is
+# usually yanked within days, so waiting out that window is most of the
+# protection a pin buys, and neither the weekly nor the monthly cadence
+# here is urgent enough to trade it away. Ecosystems that support
+# semver-specific cooldowns let majors wait longer because they need a
+# human read regardless. zizmor's dependabot-cooldown audit enforces the
+# floor.
 
 version: 2
 
@@ -36,9 +37,6 @@ updates:
       day: monday
     cooldown:
       default-days: 7
-      semver-major-days: 30
-      semver-minor-days: 14
-      semver-patch-days: 7
     open-pull-requests-limit: 5
     groups:
       actions:
