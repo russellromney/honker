@@ -2580,14 +2580,15 @@ while True:
     //   backend.
     // -----------------------------------------------------------------
 
-    /// Drive `n` committed inserts through `writer`, spaced
-    /// `spacing_ms` apart, and return how many `on_change()` calls the
-    /// watcher observed (with the initial drain already deducted).
+    /// Drive `n` committed inserts through `writer`, giving the watcher
+    /// up to `observation_ms` to acknowledge each one before sending the
+    /// next, and return how many `on_change()` calls were observed (with
+    /// the initial drain already deducted).
     fn drive_and_count_wakes(
         backend: WatcherBackend,
         db_path: PathBuf,
         n: u32,
-        spacing_ms: u64,
+        observation_ms: u64,
     ) -> u32 {
         use std::sync::atomic::{AtomicU32, Ordering as AO};
 
@@ -2610,7 +2611,10 @@ while True:
             writer
                 .execute(&format!("INSERT INTO t VALUES ({i})"), [])
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(spacing_ms));
+            let deadline = std::time::Instant::now() + Duration::from_millis(observation_ms);
+            while count.load(AO::SeqCst) < i && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         // Drain the slowest safety net (kernel = 500 ms) + one cycle.
         std::thread::sleep(Duration::from_millis(700));
@@ -2679,7 +2683,10 @@ while True:
         };
 
         let n: u32 = 5;
-        let observed = drive_and_count_wakes(backend.clone(), tmp.clone(), n, 30);
+        // Wait for each wake before sending the next commit. The watcher is
+        // deliberately coalescing, so fixed delays can turn five distinct
+        // test commits into four valid wakes under a loaded scheduler.
+        let observed = drive_and_count_wakes(backend.clone(), tmp.clone(), n, 100);
 
         drop(_pinning);
         let _ = std::fs::remove_file(&tmp);
