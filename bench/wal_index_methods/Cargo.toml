@@ -9,7 +9,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rusqlite = "0.39.0"
+rusqlite = "0.40.1"
 memmap2 = "0.9"
 
 [workspace]
