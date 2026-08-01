@@ -24,7 +24,7 @@ shm-fast-path = ["honker-core/shm-fast-path"]
 # honker repo; `version` is what Cargo uses when honker-rs is
 # consumed from crates.io.
 honker-core = { path = "../../honker-core", version = "0.4.0" }
-rusqlite = { version = "0.39", features = ["functions"] }
+rusqlite = { version = "0.40.1", features = ["functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
