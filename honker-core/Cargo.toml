@@ -34,7 +34,7 @@ thiserror = "2.0.18"
 # macos_kqueue: on macOS, use kqueue (RecommendedWatcher = KqueueWatcher) instead of
 # FSEvents. FSEvents has a 1 s batching latency — worse than 1 ms polling. kqueue
 # delivers per-event notifications immediately, matching the intent of this backend.
-notify = { version = "6", optional = true, features = ["macos_kqueue"] }
+notify = { version = "8", optional = true, features = ["macos_kqueue"] }
 # Optional: shm fast path.
 memmap2 = { version = "0.9", optional = true }
 libc = { version = "0.2", optional = true }
