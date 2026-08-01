@@ -12,8 +12,8 @@
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <sqlite-jdbc.version>3.53.0.0</sqlite-jdbc.version>
-    <junit.version>5.11.4</junit.version>
+    <sqlite-jdbc.version>3.53.2.1</sqlite-jdbc.version>
+    <junit.version>6.1.1</junit.version>
     <honker.native.platform>linux-x64</honker.native.platform>
     <honker.native.name>libhonker_ext.so</honker.native.name>
   </properties>
@@ -44,7 +44,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-antrun-plugin</artifactId>
-        <version>3.1.0</version>
+        <version>3.2.0</version>
         <executions>
           <execution>
             <id>copy-native-extension</id>
@@ -66,7 +66,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.2</version>
+        <version>3.5.6</version>
         <configuration>
           <useModulePath>false</useModulePath>
         </configuration>

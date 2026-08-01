@@ -10,9 +10,9 @@
   <description>Kotlin convenience wrappers for Honker JVM.</description>
 
   <properties>
-    <kotlin.version>2.2.21</kotlin.version>
-    <coroutines.version>1.10.2</coroutines.version>
-    <junit.version>5.11.4</junit.version>
+    <kotlin.version>2.4.10</kotlin.version>
+    <coroutines.version>1.11.0</coroutines.version>
+    <junit.version>6.1.1</junit.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
 
@@ -75,7 +75,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.2</version>
+        <version>3.5.6</version>
         <configuration>
           <useModulePath>false</useModulePath>
         </configuration>
