@@ -2492,11 +2492,23 @@ while True:
     /// switch sits one past the eight lock slots, at 128. On the main
     /// database file, `SHARED_FIRST = PENDING_BYTE + 2` and
     /// `SHARED_SIZE = 510`.
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     const SHM_DMS_BYTE: libc::off_t = 128;
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     const DB_SHARED_FIRST: libc::off_t = 0x4000_0000 + 2;
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     const DB_SHARED_SIZE: libc::off_t = 510;
 
     /// Is any lock held on `[off, off+len)` of `path`?
@@ -2504,7 +2516,11 @@ while True:
     /// Asks for a write lock, so an existing read *or* write lock reports
     /// as a conflict. Must run in a different process than the lock holder:
     /// `F_GETLK` never reports the calling process's own locks.
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     fn lock_is_held(path: &std::path::Path, off: libc::off_t, len: libc::off_t) -> bool {
         let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
             .unwrap();
@@ -2528,7 +2544,11 @@ while True:
     /// the calling process's own locks — the probe *must* be out-of-process.
     /// Prints one line the parent parses.
     #[test]
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     fn issue_80_lock_probe_child() {
         let Ok(path) = std::env::var("HONKER_ISSUE80_PROBE_DB") else {
             return;
@@ -2541,7 +2561,11 @@ while True:
     }
 
     /// Which of SQLite's two lock-bearing files this process still holds.
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     #[derive(Debug, PartialEq, Eq)]
     struct SqliteLockState {
         /// The `-shm` deadman-switch lock. Held for a WAL connection's life.
@@ -2550,7 +2574,11 @@ while True:
         db_shared: bool,
     }
 
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     fn probe_sqlite_locks_from_another_process(db_path: &std::path::Path) -> SqliteLockState {
         let exe = std::env::current_exe().expect("current_exe");
         let out = std::process::Command::new(exe)
@@ -2585,7 +2613,11 @@ while True:
     /// The control perturbation: raw `open()` + `close()` on the two files
     /// SQLite locks, i.e. what the pre-fix backends did. Every "real
     /// backend" arm is compared against this.
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     fn issue_80_raw_close_lock_bearing_files(db: &std::path::Path) {
         let shm = PathBuf::from(format!("{}-shm", db.display()));
         for path in [db, shm.as_path()] {
@@ -2609,7 +2641,11 @@ while True:
     /// until something closes them. A test that only spawns the watcher
     /// and never stops it passes against the broken code — that mistake
     /// was made once already while writing these tests.
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     fn issue_80_run_backend_then_shutdown(backend: WatcherBackend, db: &std::path::Path) {
         let watcher = UpdateWatcher::spawn_with_config(
             db.to_path_buf(),
@@ -2630,7 +2666,11 @@ while True:
     /// fresh connection win the deadman race and `ftruncate` `-shm` under a
     /// live mapping. A test that watches for reaping alone is blind to the
     /// second, and the shm-fast-path defect is exactly the second.
-    #[cfg(all(unix, feature = "bundled-sqlite"))]
+    #[cfg(all(
+        unix,
+        feature = "bundled-sqlite",
+        any(feature = "kernel-watcher", feature = "shm-fast-path")
+    ))]
     fn sqlite_locks_after(perturb: impl FnOnce(&std::path::Path)) -> SqliteLockState {
         let tmp = std::env::temp_dir().join(format!(
             "honker-issue80-{}-{}",

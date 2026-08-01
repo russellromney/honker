@@ -542,6 +542,7 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use std::path::{Path, PathBuf};
 
     /// Structural guard for issue #80. The kqueue backend holds one
