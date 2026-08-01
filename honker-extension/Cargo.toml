@@ -26,7 +26,7 @@ crate-type = ["cdylib"]
 honker-core = { path = "../honker-core", version = "0.4.0", default-features = false }
 # "loadable_extension" feature makes rusqlite usable from inside a
 # sqlite3_extension_init entry point.
-rusqlite = { version = "0.39.0", features = ["functions", "hooks", "loadable_extension"] }
+rusqlite = { version = "0.40.1", features = ["functions", "hooks", "loadable_extension"] }
 
 [features]
 default = []
