@@ -33,6 +33,48 @@ stance recorded in the phase entry that drove it.
 
 ## Unreleased — correctness priority fixes
 
+Experimental wake backends:
+
+- **`kernel-watcher` no longer drops SQLite's POSIX locks (#80).** On
+  macOS the kqueue backend held an `O_EVTONLY` descriptor on the main
+  database file and `-shm`, and closed it on `NOTE_DELETE` pruning, on
+  attach failure, and at watcher shutdown. Closing any descriptor for an
+  inode releases every advisory lock the *process* holds on it, and those
+  two files are exactly the ones SQLite locks in WAL mode. The result was
+  a live connection whose `-wal`/`-shm` another process could delete —
+  making the next `COMMIT` return `SQLITE_OK` into an unlinked WAL, where
+  it was silently and permanently lost — or a `-shm` truncated under a
+  live mapping, which is the SIGBUS (exit 138) seen in CI. The backend
+  now watches only the parent directory, `-wal`, and `-journal`: files
+  SQLite opens with `UNIXFILE_NOLOCK` and therefore never locks. WAL
+  commit detection is unchanged. Also applied on the BSDs, where
+  `notify`'s recommended watcher is kqueue-based; Linux (inotify) and
+  Windows are unaffected and unchanged.
+- **`shm-fast-path` no longer releases SQLite's WAL-index locks (#80).**
+  Same root cause, different code path. Its `probe()` opened and closed
+  `-shm` on every `honker.open()` — after the writer connection already
+  existed, so it dropped the process's WAL-index locks once per open with
+  no churn needed — and the watcher's own descriptor was closed on reopen
+  and at shutdown. Losing those locks doesn't reap the WAL (the database
+  file's SHARED lock still blocks that); it lets a fresh connection win
+  the deadman race and truncate `-shm` under a live mapping, which is the
+  SIGBUS. `-shm` descriptors now come from a registry that opens each
+  inode once and only closes one whose `st_nlink` is 0 — provably
+  unreferenced, so there is no lock left to drop. PR #43's bounded-read
+  protection is unchanged.
+- **The shm fast path is slower than its docs claimed, and is no longer
+  recommended.** PR #43 replaced the mmap load with a bounded read,
+  citing SIGBUS risk. That risk was overstated for this particular read:
+  SQLite truncates `-shm` to 3 bytes rather than 0, and `iChange` at
+  offset 8 falls inside the partial page POSIX guarantees is readable.
+  The SIGBUS seen in CI came from SQLite's own mapping, because honker
+  was dropping SQLite's DMS lock — the bug fixed above. The bounded read
+  stays regardless, because restoring the mapping would not help:
+  `pread` of the header is ~1.2 us versus ~2.3 us for `PRAGMA
+  data_version` on macOS/arm64, and both backends sleep 1 ms, so **wake
+  latency is identical**. Trading CPU for latency is already available on
+  the polling backend via the poll-interval option. Prefer polling.
+
 Core (all bindings via `honker_*` SQL / shared extension):
 
 - **Claim/reclaim honors `max_attempts`.** Exhausted reclaimable jobs

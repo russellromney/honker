@@ -6,9 +6,15 @@
 //! # Contract
 //!
 //! `on_change()` fires on every relevant filesystem event observed on
-//! the database file, its parent directory, or SQLite sidecar files
-//! (`-wal`, `-shm`, `-journal`). **There is no `PRAGMA data_version`
-//! verification and no safety-net poll.** This means:
+//! the database's parent directory and its rollback/WAL sidecar files.
+//! **There is no `PRAGMA data_version` verification and no safety-net
+//! poll.** This means:
+//!
+//! Which paths are watched is a *safety* decision, not just a coverage
+//! one: any backend that holds a descriptor per watched file must never
+//! open the main database file or `-shm`, because closing that descriptor
+//! releases the whole process's SQLite POSIX locks on it. See
+//! [`macos::candidate_paths`] and issue #80.
 //!
 //! - **Spurious wakes are possible.** Any file change in the directory
 //!   (other apps writing nearby files, the OS touching metadata, etc.)
@@ -90,16 +96,18 @@ pub(crate) fn run_kernel_watch_loop<F>(
         let shm = PathBuf::from(format!("{}-shm", db_path.display()));
         let journal = PathBuf::from(format!("{}-journal", db_path.display()));
 
+        let targets = notify_watch_targets(&watch_dir, &db_path, &wal, &shm, &journal);
+
         let mut watched = HashSet::new();
         let mut attached = 0;
-        for path in [&watch_dir, &db_path, &wal, &shm, &journal] {
+        for path in &targets {
             if attach_watch(&mut watcher, &mut watched, path) {
                 attached += 1;
             }
         }
         if attached == 0 {
             eprintln!(
-                "honker: kernel-watcher couldn't attach to db dir or -wal/-shm. Backend disabled."
+                "honker: kernel-watcher couldn't attach to db dir or -wal/-journal. Backend disabled."
             );
             return;
         }
@@ -121,7 +129,7 @@ pub(crate) fn run_kernel_watch_loop<F>(
         while !stop.load(Ordering::Acquire) {
             match rx.recv_timeout(Duration::from_millis(RX_POLL_MS)) {
                 Ok(Ok(_event)) => {
-                    for path in [&db_path, &wal, &shm, &journal] {
+                    for path in &targets {
                         let _ = attach_watch(&mut watcher, &mut watched, path);
                     }
                     on_change();
@@ -134,7 +142,7 @@ pub(crate) fn run_kernel_watch_loop<F>(
                 _ => {}
             }
             if last_id_check.elapsed() >= Duration::from_millis(IDENTITY_CHECK_MS) {
-                for path in [&db_path, &wal, &shm, &journal] {
+                for path in &targets {
                     let _ = attach_watch(&mut watcher, &mut watched, path);
                 }
                 if check_db_identity(&db_path, initial_id) {
@@ -143,6 +151,64 @@ pub(crate) fn run_kernel_watch_loop<F>(
                 last_id_check = Instant::now();
             }
         }
+    }
+}
+
+/// Paths the `notify` backend attaches watches to.
+///
+/// Which files are safe depends on whether the platform's `notify` backend
+/// keeps a descriptor open per watched file:
+///
+/// * **inotify** (Linux/Android) registers a watch by path on the single
+///   inotify instance fd — it never holds a descriptor on the watched file,
+///   so nothing this crate does can release a SQLite lock. The database
+///   file and `-shm` stay in the set; dropping them would cost detection in
+///   TRUNCATE/PERSIST journal modes for no safety gain.
+/// * **`ReadDirectoryChangesW`** (Windows) watches directories and Windows
+///   does not use POSIX advisory locks at all.
+/// * **kqueue** (the BSDs) holds one `O_EVTONLY` descriptor per watched
+///   file and closes it on unwatch/drop — the same hazard as the hand-rolled
+///   macOS backend below. The database file and `-shm` are excluded there.
+///   See [`macos::candidate_paths`] for the full explanation and issue #80.
+#[cfg(not(target_os = "macos"))]
+fn notify_watch_targets(
+    watch_dir: &Path,
+    db_path: &Path,
+    wal: &Path,
+    shm: &Path,
+    journal: &Path,
+) -> Vec<PathBuf> {
+    // notify::RecommendedWatcher == KqueueWatcher on these targets.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "ios"
+    ))]
+    {
+        let _ = (db_path, shm);
+        vec![
+            watch_dir.to_path_buf(),
+            wal.to_path_buf(),
+            journal.to_path_buf(),
+        ]
+    }
+    #[cfg(not(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "ios"
+    )))]
+    {
+        vec![
+            watch_dir.to_path_buf(),
+            db_path.to_path_buf(),
+            wal.to_path_buf(),
+            shm.to_path_buf(),
+            journal.to_path_buf(),
+        ]
     }
 }
 
@@ -312,16 +378,55 @@ mod macos {
         }
     }
 
-    fn candidate_paths(db_path: &Path) -> Vec<PathBuf> {
-        let mut paths = Vec::with_capacity(5);
-        if let Some(parent) = db_path.parent() {
-            paths.push(parent.to_path_buf());
+    /// The db's parent directory, normalized. `Path::parent()` returns
+    /// `Some("")` for a bare relative filename like `"a.db"`, and
+    /// `open("")` fails with ENOENT — so map that to `"."`.
+    pub(super) fn watch_dir(db_path: &Path) -> PathBuf {
+        match db_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
         }
-        paths.push(db_path.to_path_buf());
-        paths.push(PathBuf::from(format!("{}-wal", db_path.display())));
-        paths.push(PathBuf::from(format!("{}-shm", db_path.display())));
-        paths.push(PathBuf::from(format!("{}-journal", db_path.display())));
-        paths
+    }
+
+    /// Paths kqueue may hold an open descriptor on.
+    ///
+    /// # LOCK-BEARING FILES MUST NEVER APPEAR HERE
+    ///
+    /// **Do not add the main database file or `-shm` to this list.**
+    /// kqueue's `EVFILT_VNODE` requires a descriptor per watched file, and
+    /// those descriptors get closed — on `NOTE_DELETE` pruning, on attach
+    /// failure, and at watcher shutdown. On POSIX, `close()` of *any*
+    /// descriptor for an inode releases *every* advisory lock the calling
+    /// process holds on that inode, including locks taken by unrelated
+    /// SQLite connections living in the same process. SQLite's
+    /// `unixInodeInfo` deferred-close list (`setPendingFd` in `os_unix.c`)
+    /// only defers closes of descriptors SQLite itself opened; it cannot
+    /// see ours.
+    ///
+    /// In WAL mode SQLite takes POSIX locks on exactly two files: the main
+    /// database file (a SHARED lock held for the connection's lifetime) and
+    /// `-shm` (the WAL-index locks plus the DMS byte). Dropping either one
+    /// lets another process delete `-wal`/`-shm` out from under a live
+    /// connection — whose next commit then lands in an unlinked WAL and is
+    /// silently lost — or re-run WAL-index recovery and `ftruncate` `-shm`
+    /// under a live mapping, which is SIGBUS. See issue #80.
+    ///
+    /// `-wal` and `-journal` are safe to watch: `os_unix.c` sets
+    /// `UNIXFILE_NOLOCK` for every file whose open type is not
+    /// `SQLITE_OPEN_MAIN_DB`, so they use `nolockIoMethods` and never carry
+    /// a lock. Directories are safe: SQLite opens them only to `fsync`.
+    ///
+    /// Detection is not weakened in WAL mode: every commit appends frames
+    /// to `-wal`, which is exactly what raises `NOTE_WRITE`/`NOTE_EXTEND`.
+    /// Rollback modes signal through `-journal` (DELETE unlinks it,
+    /// TRUNCATE truncates it, PERSIST zeroes its header) and through the
+    /// parent directory.
+    pub(super) fn candidate_paths(db_path: &Path) -> Vec<PathBuf> {
+        vec![
+            watch_dir(db_path),
+            PathBuf::from(format!("{}-wal", db_path.display())),
+            PathBuf::from(format!("{}-journal", db_path.display())),
+        ]
     }
 
     fn attach_path(kq: &Kqueue, path: PathBuf, watched: &mut Vec<WatchedPath>) -> bool {
@@ -378,7 +483,7 @@ mod macos {
         let attached = attach_existing(&kq, &db_path, &mut watched);
         if attached == 0 {
             eprintln!(
-                "honker: kqueue couldn't attach to db dir or database files. Backend disabled."
+                "honker: kqueue couldn't attach to db dir or -wal/-journal. Backend disabled."
             );
             return;
         }
@@ -419,14 +524,78 @@ mod macos {
         }
     }
 
+    /// Probe only the parent directory. Directories carry no SQLite locks,
+    /// so the `close()` below cannot release any — see [`candidate_paths`].
+    /// Probing the database file or `-shm` here would drop this process's
+    /// SQLite locks on every `honker.open()`.
     pub(super) fn probe_kqueue(db_path: &Path) -> Result<(), String> {
         let kq = Kqueue::new()?;
-        let dir = db_path.parent().unwrap_or(Path::new("."));
-        let dir_fd = open_event_fd(dir)?;
+        let dir = watch_dir(db_path);
+        let dir_fd = open_event_fd(&dir)?;
         let result = kq.add_vnode(dir_fd);
         unsafe {
             libc::close(dir_fd);
         }
         result.map_err(|e| format!("can't watch {dir:?}: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "macos")]
+    use std::path::{Path, PathBuf};
+
+    /// Structural guard for issue #80. The kqueue backend holds one
+    /// descriptor per watched path and closes it on prune, on attach
+    /// failure, and at shutdown; on POSIX that close releases every
+    /// advisory lock this process holds on the inode. SQLite locks the
+    /// main database file and `-shm`, so neither may ever be watched.
+    ///
+    /// The behavioral proof lives in
+    /// `lib.rs::tests::kernel_watcher_does_not_release_sqlite_wal_locks`.
+    /// This test is the cheap, platform-independent tripwire that fires
+    /// the moment someone adds a path back to the list.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn candidate_paths_excludes_every_file_sqlite_locks() {
+        let db = Path::new("/tmp/honker-cp/app.db");
+        let paths = super::macos::candidate_paths(db);
+
+        assert!(
+            !paths.contains(&db.to_path_buf()),
+            "the main database file carries SQLite's SHARED lock and must \
+             never be kqueue-watched: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&PathBuf::from("/tmp/honker-cp/app.db-shm")),
+            "-shm carries SQLite's WAL-index and DMS locks and must never \
+             be kqueue-watched: {paths:?}"
+        );
+        // And the wake signal we depend on in WAL mode is still there.
+        assert!(
+            paths.contains(&PathBuf::from("/tmp/honker-cp/app.db-wal")),
+            "-wal is the WAL-mode commit signal and must stay watched: {paths:?}"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("/tmp/honker-cp")),
+            "the parent directory must stay watched: {paths:?}"
+        );
+    }
+
+    /// `Path::parent()` yields `Some("")` for a bare relative filename,
+    /// and `open("")` is ENOENT. The directory watch is load-bearing now
+    /// that the database file itself is not watched, so this must resolve
+    /// to `"."` rather than silently failing to attach.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn bare_relative_db_path_watches_the_current_directory() {
+        assert_eq!(
+            super::macos::watch_dir(Path::new("app.db")),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            super::macos::watch_dir(Path::new("/var/db/app.db")),
+            PathBuf::from("/var/db")
+        );
     }
 }

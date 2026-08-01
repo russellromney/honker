@@ -75,25 +75,36 @@ jobs:
             cargo test -p honker-core --locked --lib
           fi
       # Experimental wake backends — see Phase Lighthouse in ROADMAP.md.
-      # These features are NOT compiled into published wheels yet, but
-      # we test them in CI on every platform so we know what's actually
-      # broken before users do. Failures here block Phase Lighthouse,
-      # not the wheel-building jobs below.
+      # Failures here block Phase Lighthouse, not the wheel-building jobs
+      # below.
+      #
+      # macOS uses bundled-sqlite here, and that is load-bearing rather
+      # than incidental. Apple's system libsqlite3 takes its advisory
+      # locks with fcntl(F_OFD_SETLK) — open-file-description locks, which
+      # a foreign close() cannot release. The bindings that ship on macOS
+      # (.NET/SQLitePCLRaw, Go, Ruby, and any bundled build) link an
+      # upstream SQLite that uses plain fcntl(F_SETLK) instead, where a
+      # foreign close drops every lock the process holds on that inode.
+      # Issue #80 is only reproducible — and therefore only *testable* —
+      # against the latter. Running macOS on the system library here would
+      # make kernel_watcher_does_not_release_sqlite_wal_locks pass
+      # vacuously. Linux's system libsqlite3 already uses F_SETLK, so it
+      # stays unbundled and keeps non-bundled build coverage.
       - name: Run honker-core tests (experimental wake backends, debug)
         shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test -p honker-core --locked --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
-          else
+          if [ "${{ runner.os }}" = "Linux" ]; then
             cargo test -p honker-core --locked --lib --features kernel-watcher,shm-fast-path
+          else
+            cargo test -p honker-core --locked --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
           fi
       - name: Run honker-core tests (experimental wake backends, release)
         shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test -p honker-core --locked --release --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
-          else
+          if [ "${{ runner.os }}" = "Linux" ]; then
             cargo test -p honker-core --locked --release --lib --features kernel-watcher,shm-fast-path
+          else
+            cargo test -p honker-core --locked --release --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
           fi
       - name: Build loadable extension
         run: cargo build --locked --release -p honker-extension
