@@ -12,6 +12,190 @@ new work without renumbering. Names are unique. Each phase header
 should include adjacency links (`After: ... · Before: ...`) when the
 ordering matters.
 
+## Phase Beavis — Extension Reach For Every Binding
+
+> Next up. Fixes #99.
+
+A user on Drizzle could not find `libhonker_ext`. They tried to
+`loadExtension()` the napi `.node` file and got
+`undefined symbol: sqlite3_honker_init`. They were not doing anything
+wrong. For Node there is no bundled extension, no path API, and no
+release artifact to download.
+
+That is one symptom of a repo-wide gap. Every binding was built so you
+can `open()` a database. Almost none was built so you can load Honker
+onto a connection you already own — which is what every ORM user needs,
+because enqueueing outside the app's transaction loses atomicity.
+
+### Current state
+
+Verified against published packages and the workflows, not the source
+tree:
+
+| Binding | Ships the extension | Path + entrypoint API | ORM doc uses it |
+| --- | --- | --- | --- |
+| Python | yes (`honker/_lib/`) | `extension_info()`, `load_extension(conn)` | no |
+| Ruby | yes (platform gems) | `Honker.extension_path`, `Honker.load_extension` | no |
+| .NET | yes (NuGet runtimes) | input only — `OpenOptions.ExtensionPath` | no |
+| JVM / Kotlin | yes (jar) | input only — `OpenOptions.extensionPath` | no |
+| Node | **no** | **no** | no |
+| Bun | **no** | caller must supply the path | no |
+| Go | no (not idiomatic) | caller must supply the path | no |
+| Elixir | no | caller must supply the path | no |
+
+Evidence:
+
+- `npm pack @russellthehippo/honker-node` ships 8 files, none of them
+  the extension. The platform packages ship exactly one `.node`.
+- `grep 'honker-extension\|cargo build' .github/workflows/release-node.yml`
+  returns nothing. No step could ever have produced it.
+- `gh release list` is empty. There are zero GitHub Releases, so the
+  three docs that promise release artifacts are wrong: the Go and Bun
+  tabs in `getting-started.mdx` and `packages/honker-node/README.md`.
+- Every one of the nine `guides/orm/*.mdx` pages says
+  `/path/to/libhonker_ext`. Not one calls the real API, including the
+  Python and Ruby pages where that API already ships.
+- `tests/test_extension_interop.py` loads the extension into stdlib
+  `sqlite3`, which is the right shape, but it reads
+  `target/release/` and **skips** when absent. It proves the build tree,
+  never the artifact that ships. That is how #99 got through.
+
+### The contract
+
+One rule, same in every language. A binding must answer "where is the
+extension and what is its entrypoint" without opening a database.
+
+- Resolution order: `HONKER_EXTENSION_PATH`, then the bundled copy,
+  then raise an error naming every path searched. Never fall back to a
+  guess.
+- The entrypoint is always `sqlite3_honkerext_init`.
+- The accessor must not require the native binding. An ORM user wants a
+  path string, not a second SQLite in the process.
+
+`packages/honker/python/honker/__init__.py` is the reference. Match it.
+
+### Slice Beavis-1 — Publish the artifact
+
+`release-extension.yml`, triggered on `ext-v*`. The five-target build
+matrix already exists in `release-dotnet.yml`; reuse it. Then
+`gh release create` and upload the binaries with checksums.
+
+Nothing downstream can be honest until this exists. Go, Bun, Elixir, and
+C++ have no other way to get the file.
+
+### Slice Beavis-2 — Write the contract down
+
+Add the resolution order and entrypoint above to `BINDINGS.md`, plus an
+"Extension path API" column in the truth table. Cheap, and it is what
+stops this drifting again.
+
+### Slice Beavis-3 — Node
+
+Closes #99.
+
+- New package family `@russellthehippo/honker-ext-<platform>`, one per
+  napi target, each shipping a single `libhonker_ext.{so,dylib}`. Keep
+  them version-locked to the binding packages.
+- `release-node.yml`: build `-p honker-extension` for the same
+  `--target` and the same `--features kernel-watcher,shm-fast-path` the
+  `.node` already gets, then pack each `honker-ext-*` alongside the
+  existing `npm/<platform>` packages.
+- `honker-node` lists the four `honker-ext-*` packages in
+  `optionalDependencies`, so the right one installs automatically. The
+  user runs no extra install step.
+- `packages/honker-node/extension.js` — pure JS, no addon load, exposing
+  `extensionPath()` and `extensionInfo()`. Subpath export
+  `@russellthehippo/honker-node/extension`.
+
+### Slice Beavis-4 — Bun
+
+The Bun package ships no binary at all. It takes the same four
+`honker-ext-*` packages as `optionalDependencies` and grows the same
+`extensionPath()` / `extensionInfo()` accessor. No second copy of the
+binary is published.
+
+### Slice Beavis-5 — .NET, JVM, Kotlin
+
+These bundle the extension but expose only an input option. The
+resolvers are private: `Database.ResolveExtensionPath` and
+`NativeLoader`. Promote each to a public accessor returning path and
+entrypoint. Small change, no new resolution logic.
+
+### Slice Beavis-6 — Go and Elixir
+
+Neither can bundle idiomatically. Give them the Beavis-1 download plus
+a checksum in the docs, and an `HONKER_EXTENSION_PATH` reader that
+errors clearly instead of failing at `load_extension`.
+
+### Slice Beavis-7 — Docs
+
+- Rewrite the wiring block on all nine `guides/orm/*.mdx` pages to call
+  the real API. Delete every `/path/to/libhonker_ext`.
+- Fix `packages/honker-node/README.md`: `open()` needs no extension, the
+  extension is only for the `loadExtension` path.
+- Fix the Go and Bun release-artifact claims in `getting-started.mdx`.
+- State the platform gaps instead of letting users discover them by
+  failing. Node and Bun have no Windows and no musl target; the Python
+  wheel ships windows-x64.
+
+### Traps
+
+- **Do not name the file anything but `libhonker_ext.{so,dylib}` /
+  `honker_ext.dll`.** SQLite derives the entrypoint from the filename:
+  strip `lib`, take characters up to the first `.`, keep only
+  alphabetic ones. `libhonker_ext.so` gives `honkerext`, which matches
+  the exported `sqlite3_honkerext_init`. `honker.linux-x64-gnu.node`
+  gives `honker`, which is the exact error in #99. If a name must
+  change, pass the entrypoint explicitly as the second argument.
+- **Do not resolve the extension path by requiring the native addon.**
+  The addon carries its own statically linked SQLite. A better-sqlite3
+  user already has one loaded. Keep the accessor pure.
+- **Do not write another proof that reads `target/release/` and skips
+  when absent.** That is the existing `test_extension_interop.py`
+  pattern and it is why this shipped broken. Install the packed
+  artifact, then load from it.
+
+### Verification
+
+Per binding, one consumer test that installs the **packaged** artifact
+into a clean project, loads the bundled extension into that language's
+ordinary SQLite client — better-sqlite3, stdlib `sqlite3`, the `sqlite3`
+gem, `Microsoft.Data.Sqlite`, `sqlite-jdbc`, `mattn/go-sqlite3`,
+`exqlite` — then runs `honker_bootstrap()` and an
+enqueue → claim → ack round trip in raw SQL.
+
+No skips. If the artifact is missing the test fails.
+
+Prove each one is load-bearing before landing it: point it at the
+`.node` instead of the extension and watch it fail with the
+`sqlite3_honker_init` symbol error, then restore it.
+
+`release-node.yml` already has a clean-consumer job that round-trips
+through `open()`. The new test is a second consumer job beside it, going
+through better-sqlite3.
+
+### Settled
+
+The extension ships as its own `@russellthehippo/honker-ext-<platform>`
+package family. Both `honker-node` and `honker-bun` pull it through
+`optionalDependencies`. One binary, published once, named for what it
+is. The rejected alternative was putting it inside
+`honker-node-<platform>` and having Bun depend on that; a Bun user
+should not install something called `honker-node-*`.
+
+The cost is another package family to keep version-aligned. The release
+workflow must publish all of them together or the
+`optionalDependencies` pin breaks.
+
+### Non-goals
+
+- Do not add Windows or musl targets to the napi build here. Name the
+  gap in the docs; adding targets is its own phase.
+- Do not change the `honker_*` SQL surface.
+- Do not rewrite `native.js` or `index.js`. They are napi-generated.
+- Do not change how `open()` works in any binding. This phase only adds
+  a second door for connections the user already owns.
+
 ## Phase Ranger — Delegate Locks To Bouncer
 
 > Later architecture work
@@ -99,7 +283,7 @@ change.
 > Before: 1.0 release prep
 
 > **Status:** core + Python + Node shipped in PR #30 (universal polling
-> SQLITE_BUSY fix, opt-in `kernel`/`shm` backends behind Cargo features,
+> SQLITE_BUSY fix, opt-in `kernel`/`shm` backends behind Beavis features,
 > sync baseline handshake, watcher-death propagation). Rust wrapper
 > parity is wired via `OpenOptions::watcher_backend`. Go, Bun, C++,
 > .NET, Ruby, and Elixir are core-backed too: extension consumers route
@@ -118,8 +302,8 @@ uses SQL watcher-handle functions registered by that extension.
 
 For each supported binding:
 
-- Add Cargo features `kernel-watcher` and `shm-fast-path` that forward
-  to `honker-core/<feature>` (where the binding has a Cargo.toml).
+- Add Beavis features `kernel-watcher` and `shm-fast-path` that forward
+  to `honker-core/<feature>` (where the binding has a Beavis.toml).
 - Accept a `watcher_backend` (or language-idiomatic equivalent) string
   parameter on the binding's `open()`.
 - Parse via `honker_core::WatcherBackend::parse` so the accepted
@@ -289,7 +473,7 @@ and no commit + deadline collision should double-fire.
 
 > After: Phase Atlas · Before: 1.0 release prep
 
-PR #30 shipped the experimental backends in source, gated by Cargo
+PR #30 shipped the experimental backends in source, gated by Beavis
 features. Published wheels still build polling-only. This phase
 decides when to enable the features in wheel builds. Polling stays
 the default either way; "available in wheels" is the only flip.
@@ -628,7 +812,7 @@ Remaining:
       already produce exactly the artifacts a publish step needs.
 - [ ] Standardize the desired proof depth. Python still needs an
       installed-wheel smoke test; Bun and Elixir test before packing
-      rather than from a clean consumer; crates rely on Cargo's package
+      rather than from a clean consumer; crates rely on Beavis's package
       verification rather than a separate consumer project.
 - [ ] Decide the release contract for `honker-rs` and the in-tree
       bindings without dedicated proof workflows (Go, C++, JVM,
