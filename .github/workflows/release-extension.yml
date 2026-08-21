@@ -1,0 +1,126 @@
+name: Release · SQLite extension
+
+# Builds libhonker_ext for every supported target and attaches the
+# binaries to a GitHub Release.
+#
+# Go, C++, and Elixir have no package that can bundle the extension, so
+# a download is the only way they get it. The docs have promised these
+# artifacts for a while; this is the workflow that makes that true.
+#
+# Usage:
+#   git tag ext-v0.4.0 && git push origin ext-v0.4.0
+
+on:
+  push:
+    tags:
+      - "ext-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: extension · ${{ matrix.target }}
+    timeout-minutes: 25
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            libname: libhonker_ext.so
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            libname: libhonker_ext.so
+          - target: macos-x64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+            libname: libhonker_ext.dylib
+          - target: macos-arm64
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+            libname: libhonker_ext.dylib
+          - target: windows-x64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            libname: honker_ext.dll
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: |
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
+
+      - name: Build extension
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          LIBNAME: ${{ matrix.libname }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release -p honker-extension \
+            --features kernel-watcher,shm-fast-path \
+            --target "$RUST_TARGET"
+          src="target/$RUST_TARGET/release/$LIBNAME"
+          test -f "$src"
+          mkdir -p dist
+          # Keep the honker_ext stem. SQLite derives the entry point from
+          # the file name, so a rename here would break load_extension()
+          # for anyone who does not pass sqlite3_honkerext_init by hand.
+          stem="${LIBNAME%.*}"
+          suffix="${LIBNAME##*.}"
+          cp "$src" "dist/${stem}-${TARGET}.${suffix}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: extension-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: extension-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksum
+        run: |
+          cd dist
+          ls -1
+          # Five targets in the matrix; anything less means a silent drop.
+          test "$(ls -1 | wc -l)" -eq 5
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/ext-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Honker SQLite extension $TAG" \
+            --generate-notes \
+            dist/*
