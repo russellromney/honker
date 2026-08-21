@@ -1,0 +1,23 @@
+{
+  "name": "@russellthehippo/honker-ext-darwin-arm64",
+  "version": "0.4.5",
+  "description": "Honker SQLite loadable extension for darwin-arm64.",
+  "files": [
+    "libhonker_ext.dylib"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "homepage": "https://honker.dev",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/russellromney/honker"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

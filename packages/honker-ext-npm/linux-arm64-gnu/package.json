@@ -1,0 +1,26 @@
+{
+  "name": "@russellthehippo/honker-ext-linux-arm64-gnu",
+  "version": "0.4.5",
+  "description": "Honker SQLite loadable extension for linux-arm64-gnu.",
+  "files": [
+    "libhonker_ext.so"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "os": [
+    "linux"
+  ],
+  "homepage": "https://honker.dev",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/russellromney/honker"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "libc": [
+    "glibc"
+  ]
+}
