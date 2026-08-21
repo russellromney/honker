@@ -65,11 +65,32 @@ jobs:
           }
           JS
 
+      - name: Build SQLite extension
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Same features the .node gets, so the extension and the addon
+          # agree on which watcher backends exist.
+          cargo build --locked --release -p honker-extension \
+            --features kernel-watcher,shm-fast-path \
+            --target "$RUST_TARGET"
+          case "$PLATFORM" in
+            darwin-*) libname=libhonker_ext.dylib ;;
+            *) libname=libhonker_ext.so ;;
+          esac
+          src="target/$RUST_TARGET/release/$libname"
+          test -f "$src"
+          cp "$src" "packages/honker-node/libhonker_ext.$PLATFORM.${libname##*.}"
+
       - name: Upload native artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: node-native-${{ matrix.platform }}
-          path: packages/honker-node/honker.${{ matrix.platform }}.node
+          path: |
+            packages/honker-node/honker.${{ matrix.platform }}.node
+            packages/honker-node/libhonker_ext.${{ matrix.platform }}.*
           if-no-files-found: error
 
   package:
@@ -98,10 +119,14 @@ jobs:
         run: |
           npm ci
           npm exec -- napi artifacts --output-dir . --npm-dir npm
+          ../../scripts/copy-node-extension.sh
           ../../scripts/proof/check-node-native-artifacts.sh honker.*.node npm/*/*.node
           node -e "require('./npm/linux-x64-gnu/honker.linux-x64-gnu.node'); console.log('linux-x64 native load ok')"
           for dir in npm/*; do
             test -f "$dir"/honker.*.node
+          done
+          for dir in ../honker-ext-npm/*; do
+            test -f "$dir"/libhonker_ext.*
           done
           package_dir="$RUNNER_TEMP/node-packages"
           mkdir -p "$package_dir"
@@ -109,6 +134,9 @@ jobs:
           npm pack --pack-destination "$package_dir"
           for dir in npm/*; do
             npm pack "./$dir" --pack-destination "$package_dir"
+          done
+          for dir in ../honker-ext-npm/*; do
+            npm pack "$dir" --pack-destination "$package_dir"
           done
           cd "$RUNNER_TEMP/node-consumer"
           npm init -y >/dev/null
@@ -133,6 +161,68 @@ jobs:
             assert.equal(job.payload.to, 'alice@example.com');
             assert.equal(job.ack(), true);
             db.close();
+          } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+          JS
+
+      - name: Prove the extension loads under better-sqlite3
+        working-directory: packages/honker-node
+        run: |
+          # The acceptance proof for #99: a foreign SQLite client, not
+          # the napi addon, loading the extension out of the *packaged*
+          # artifact. Nothing here reads target/release, and nothing
+          # skips — a missing extension fails the job.
+          package_dir="$RUNNER_TEMP/node-packages"
+          consumer="$RUNNER_TEMP/node-orm-consumer"
+          mkdir -p "$consumer"
+          cd "$consumer"
+          npm init -y >/dev/null
+          root_tgz=$(find "$package_dir" -maxdepth 1 -name 'russellthehippo-honker-node-[0-9]*.tgz' -print -quit)
+          platform_tgz=$(find "$package_dir" -maxdepth 1 -name 'russellthehippo-honker-node-linux-x64-gnu-*.tgz' -print -quit)
+          ext_tgz=$(find "$package_dir" -maxdepth 1 -name 'russellthehippo-honker-ext-linux-x64-gnu-*.tgz' -print -quit)
+          test -n "$root_tgz"
+          test -n "$platform_tgz"
+          test -n "$ext_tgz"
+          npm install "$root_tgz" "$platform_tgz" "$ext_tgz" better-sqlite3 >/dev/null
+          node - <<'JS'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const Database = require('better-sqlite3');
+          const { extensionPath, extensionInfo } = require('@russellthehippo/honker-node/extension');
+
+          const info = extensionInfo();
+          assert.equal(info.entrypoint, 'sqlite3_honkerext_init');
+          // Prove it resolved out of the published package rather than
+          // some stray build lying around the runner.
+          assert.match(info.path, /honker-ext-linux-x64-gnu/, `resolved from ${info.path}`);
+
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'honker-orm-'));
+          try {
+            const db = new Database(path.join(dir, 'app.db'));
+            db.loadExtension(extensionPath());
+            db.prepare('SELECT honker_bootstrap()').run();
+
+            const payload = JSON.stringify({ to: 'alice@example.com' });
+            const { id } = db
+              .prepare("SELECT honker_enqueue('emails', ?, NULL, NULL, 0, 3, NULL) AS id")
+              .get(payload);
+            assert.ok(id > 0);
+
+            const claimed = JSON.parse(
+              db.prepare("SELECT honker_claim_batch('emails', 'worker-1', 8, 300) AS jobs").get().jobs,
+            );
+            assert.equal(claimed.length, 1);
+            assert.equal(claimed[0].id, id);
+            assert.equal(JSON.parse(claimed[0].payload).to, 'alice@example.com');
+
+            const { ok } = db.prepare("SELECT honker_ack(?, 'worker-1') AS ok").get(id);
+            assert.equal(ok, 1);
+
+            db.close();
+            console.log('better-sqlite3 extension round trip ok');
           } finally {
             fs.rmSync(dir, { recursive: true, force: true });
           }
