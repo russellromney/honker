@@ -22,6 +22,49 @@ extension.
 | JVM `dev.honker:honker` | local + clean consumer | yes | yes | yes | yes | yes | shared JVM watcher |
 | Kotlin `dev.honker:honker-kotlin` | local + clean consumer | wrapper | Flow wrapper | wrapper | wrapper | wrapper | JVM wrapper |
 
+## Extension Reach
+
+Every binding can `open()` a database. A binding must also be able to
+say where the loadable extension is, so callers can load Honker onto a
+connection they already own. That is what ORM users need: enqueueing
+outside the application's transaction loses atomicity.
+
+| Binding | Ships the extension | Path accessor |
+| --- | --- | --- |
+| Python `honker` | wheel | `extension_info()`, `load_extension(conn)` |
+| Node `@russellthehippo/honker-node` | `honker-ext-*` npm packages | `extensionPath()`, `extensionInfo()` |
+| Bun `@russellthehippo/honker-bun` | `honker-ext-*` npm packages | `extensionPath()`, `extensionInfo()` |
+| Ruby `honker` | platform gems | `Honker.extension_path`, `Honker.load_extension` |
+| .NET `Honker` | NuGet native assets | `HonkerExtension.Locate()` |
+| JVM `dev.honker:honker` | jar resources | `HonkerExtension.path()` |
+| Kotlin `dev.honker:honker-kotlin` | jar resources | inherits the JVM class |
+| Go | no — download it | `honker.ExtensionPath()` |
+| Elixir `honker` | no — download it | `Honker.Extension.path/0` |
+| C++ | links the static lib | n/a |
+| Rust `honker` | crate dependency | n/a |
+
+Contract, identical in every language:
+
+- Resolution order is `HONKER_EXTENSION_PATH`, then the bundled copy,
+  then an error naming every path searched. Never guess, never fall
+  back silently.
+- The entry point is always `sqlite3_honkerext_init`.
+- The accessor must not require loading the binding's native code. A
+  caller asking for a path string already has their own SQLite in the
+  process and must not get a second one.
+
+`packages/honker/python/honker/__init__.py` is the reference
+implementation.
+
+The file name is load-bearing. SQLite derives the entry point from it:
+strip a leading `lib`, take characters up to the first `.`, keep only
+the alphabetic ones. `libhonker_ext.so` gives `honkerext`. Ship it as
+`libhonker_ext.{so,dylib}` / `honker_ext.dll` or pass the entry point
+explicitly.
+
+Go, Elixir, and C++ cannot bundle a binary idiomatically. They take it
+from a GitHub release, published by `.github/workflows/release-extension.yml`.
+
 ## Argument Types
 
 The `honker_*` SQL functions take their integer arguments the way
@@ -46,6 +89,7 @@ NaN, and values outside the range of a 64-bit integer. SQLite would
 truncate `2.7` to `2`; we do not. Rounding a job id or a retry count
 hides a caller's bug, and this is the one place being stricter than
 SQLite earns the inconsistency. The error names the value and why.
+
 
 ## Watcher Backends
 
