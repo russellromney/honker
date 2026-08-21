@@ -401,6 +401,11 @@ public sealed class Database : IDisposable
         command.ExecuteNonQuery();
     }
 
+    // Exposed through HonkerExtension.Locate so callers loading the
+    // extension onto their own connection resolve it exactly the way
+    // Open does.
+    internal static string LocateExtension(OpenOptions options) => ResolveExtensionPath(options);
+
     private static string ResolveExtensionPath(OpenOptions options)
     {
         if (!string.IsNullOrWhiteSpace(options.ExtensionPath))
