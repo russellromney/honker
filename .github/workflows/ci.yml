@@ -511,6 +511,61 @@ jobs:
         run: |
           mix deps.get
           mix test
+      # ---- Documented ORM recipes -------------------------------------
+      # One scenario per integration named in guides/orm/*.mdx, written
+      # the way the page shows it. These fail when a documented recipe
+      # stops working, which is the point: the docs promise these, so CI
+      # has to hold them to it.
+      - name: ORM · Go (database/sql, GORM)
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          work="$RUNNER_TEMP/orm-go"
+          mkdir -p "$work"
+          cp scripts/proof/orm/go/main.go "$work/"
+          cd "$work"
+          cat > go.mod <<'GOMOD'
+          module honkerormproof
+
+          go 1.25
+          GOMOD
+          go mod edit -replace github.com/russellromney/honker-go="$GITHUB_WORKSPACE/packages/honker-go"
+          go mod tidy
+          HONKER_TEST_DB="$work/orm.db" go run .
+
+      - name: ORM · Rust (sqlx)
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-sqlx.db" \
+            cargo run --release --manifest-path scripts/proof/orm/rust/Cargo.toml
+
+      - name: ORM · .NET (Microsoft.Data.Sqlite)
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-dotnet.db" \
+            dotnet run --project scripts/proof/orm/dotnet/OrmProof.csproj
+
+      - name: ORM · Elixir (Ecto)
+        working-directory: packages/honker-ex
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          mix compile
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-ecto.db" \
+            elixir -pa _build/dev/lib/honker/ebin \
+            "$GITHUB_WORKSPACE/scripts/proof/orm/elixir/ecto_proof.exs"
+
+      - name: ORM · Ruby (ActiveRecord)
+        working-directory: packages/honker-ruby
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          gem install --no-document activerecord sqlite3
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-ruby.db" \
+            ruby -Ilib "$GITHUB_WORKSPACE/scripts/proof/orm/ruby/active_record_proof.rb"
+
       - name: Run Ruby ↔ Python interop
         shell: bash
         env:

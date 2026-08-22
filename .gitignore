@@ -62,3 +62,9 @@ main.py
 packages/honker-ext-npm/*/libhonker_ext.*
 packages/honker-ext-npm/*/honker_ext.dll
 packages/honker-node/libhonker_ext.*
+
+# Standalone ORM proof project build output
+scripts/proof/orm/rust/target/
+scripts/proof/orm/rust/Cargo.lock
+scripts/proof/orm/dotnet/bin/
+scripts/proof/orm/dotnet/obj/
