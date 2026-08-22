@@ -12,6 +12,44 @@ new work without renumbering. Names are unique. Each phase header
 should include adjacency links (`After: ... · Before: ...`) when the
 ordering matters.
 
+## Phase Kernel-JVM — Kernel Watcher Fails On Linux
+
+> Known broken, excluded by name in CI
+
+`HonkerJvmTest.childJvmKernelListenerWakesWhenParentNotifies` fails on
+Linux. The test asks for the experimental `kernel` watcher backend with
+a 30s fallback poll and waits 5s, so a backend that quietly degrades to
+the fallback times out exactly this way.
+
+Surfaced when `honker-jvm` got a CI job for the first time. It had
+never run anywhere, so this is pre-existing, not a regression — the
+only JVM changes in that branch were a new `HonkerExtension` class and
+a fail-loud check on `HONKER_EXTENSION_PATH`, neither of which touches
+the watcher.
+
+### What is known
+
+- Passes on macOS with the extension built with *or* without
+  `kernel-watcher,shm-fast-path`, so the feature flag is not the cause
+  and whatever differs is Linux-specific.
+- Building the extension with the wake-backend features did not change
+  the Linux result.
+- The other 44 tests pass, including the four documented ORM recipes.
+
+### Scope
+
+- Find out whether the Linux kernel backend reaches the JVM listener at
+  all, or silently falls back to polling.
+- Fix it, or make requesting an unavailable backend an error rather
+  than a silent downgrade — `BINDINGS.md` already says the backend
+  contract is that unavailable backends are rejected, not substituted.
+- Remove the `-Dtest='!...'` exclusion in `ci.yml`'s `jvm` job.
+
+### Non-goals
+
+- Do not make the kernel backend the default anywhere.
+- Do not weaken the test to make it pass.
+
 ## Phase Ranger — Delegate Locks To Bouncer
 
 > Later architecture work
