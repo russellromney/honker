@@ -57,13 +57,28 @@ fn real_to_i64(f: f64, idx: usize) -> rusqlite::Result<i64> {
     // against the power of two and exclude the top end.
     const LIMIT: f64 = 9_223_372_036_854_775_808.0;
     if f.fract() == 0.0 && f >= -LIMIT && f < LIMIT {
-        Ok(f as i64)
-    } else {
-        Err(rusqlite::Error::InvalidFunctionParameterType(
-            idx,
-            Type::Real,
-        ))
+        return Ok(f as i64);
     }
+
+    // "Invalid function parameter type Real" is useless here: the type
+    // is fine, the value is not. Say which value and why, because the
+    // caller is often an ORM and the number came from somewhere else.
+    let why = if f.is_nan() {
+        "not a number".to_string()
+    } else if f.is_infinite() {
+        "infinite".to_string()
+    } else if f.fract() != 0.0 {
+        format!("{f} has a fractional part")
+    } else {
+        format!("{f:e} is outside the range of a 64-bit integer")
+    };
+    Err(rusqlite::Error::UserFunctionError(Box::new(
+        std::io::Error::other(format!(
+            "honker: argument {idx} must be a whole number, but {why}. \
+             Whole values bind fine even when the client sends them as \
+             REAL, which better-sqlite3 does for every JavaScript number."
+        )),
+    )))
 }
 
 /// Wrap a Displayable error for SQLite scalar-function returns.
@@ -1784,9 +1799,10 @@ mod real_arg_tests {
                 |r| r.get::<_, i64>(0),
             )
             .unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("Real"),
-            "expected a Real type error, got: {err}"
+            msg.contains("must be a whole number") && msg.contains("fractional part"),
+            "expected a message naming the value and why, got: {err}"
         );
     }
 
