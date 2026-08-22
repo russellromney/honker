@@ -1,5 +1,45 @@
 # CHANGELOG
 
+## Unreleased — extension reach for every binding (Phase Beavis)
+
+Closes issue #99. Every binding could `open()` a database; almost none
+could tell you where the loadable extension is, which is what you need
+to load Honker onto a connection you already own. Enqueueing outside
+your app's transaction loses atomicity, so that is the whole reason ORM
+users reach for the extension.
+
+- New `@russellthehippo/honker-ext-<platform>` npm packages carrying
+  `libhonker_ext`, pulled in by `honker-node` and `honker-bun` through
+  `optionalDependencies`. No extra install step.
+- `extensionPath()` / `extensionInfo()` in Node and Bun. Pure
+  JavaScript: resolving a path must not load the napi addon and drag a
+  second statically linked SQLite into a process that already has
+  better-sqlite3's.
+- `HonkerExtension.Locate()` (.NET) and `dev.honker.HonkerExtension
+  .path()` (JVM, inherited by Kotlin). Both packages already bundled
+  the extension and knew how to find it; the resolvers were private.
+- `honker.ExtensionPath()` (Go) and `Honker.Extension.path/0` (Elixir).
+  Neither ecosystem can ship a binary, so these read
+  `HONKER_EXTENSION_PATH` and otherwise error with every path tried and
+  the release URL.
+- `release-extension.yml` publishes `libhonker_ext` for five targets to
+  GitHub Releases on `ext-v*` tags. The repo had none, while three doc
+  pages told people to download from a release page.
+- Integer SQL arguments now accept whole `REAL` values.
+  `better-sqlite3` binds every JavaScript number as `REAL`, so the
+  `Queue` wrapper published on honker.dev failed on its first call with
+  `Invalid function parameter type Real at index 4`. Fractional values
+  are still rejected rather than rounded.
+- The contract is written down in `BINDINGS.md`:
+  `HONKER_EXTENSION_PATH`, then bundled, then a loud error; entrypoint
+  always `sqlite3_honkerext_init`; the accessor never loads native code.
+
+Proof: a clean-consumer job in `release-node.yml` installs the packed
+tarballs with `better-sqlite3` and round-trips enqueue → claim → ack
+through raw SQL. It reads nothing from `target/release` and has no skip
+path, unlike `tests/test_extension_interop.py`, which skips when the
+build tree is empty and is how this shipped broken.
+
 ## Unreleased — schedule lifecycle + job cancel (Phase Mantle)
 
 Shipped in PR #42. Closes issue #25, with the deliberate "no `max_runs`"
