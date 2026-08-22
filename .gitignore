@@ -56,3 +56,9 @@ test_out2.txt
 # Local scratchpads (project memory lives in ROADMAP.md / CHANGELOG.md)
 PLAN.md
 main.py
+
+# Extension binaries staged into the honker-ext npm packages by
+# scripts/copy-node-extension.sh. Built per release, never committed.
+packages/honker-ext-npm/*/libhonker_ext.*
+packages/honker-ext-npm/*/honker_ext.dll
+packages/honker-node/libhonker_ext.*

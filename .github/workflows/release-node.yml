@@ -218,7 +218,13 @@ jobs:
             assert.equal(claimed[0].id, id);
             assert.equal(JSON.parse(claimed[0].payload).to, 'alice@example.com');
 
-            const { ok } = db.prepare("SELECT honker_ack(?, 'worker-1') AS ok").get(id);
+            // better-sqlite3 binds every JS number as REAL, and the
+            // honker_* functions want an INTEGER id. CAST makes the
+            // wrapper work whatever the caller passes. Dropping the
+            // CAST here fails with "Invalid function parameter type Real".
+            const { ok } = db
+              .prepare("SELECT honker_ack(CAST(? AS INTEGER), 'worker-1') AS ok")
+              .get(id);
             assert.equal(ok, 1);
 
             db.close();
