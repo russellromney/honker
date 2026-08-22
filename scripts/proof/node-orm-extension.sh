@@ -43,57 +43,27 @@ test -n "$ext_tgz"
 
 cd "$app"
 npm init -y >/dev/null
-npm install --no-audit --no-fund "$root_tgz" "$ext_tgz" better-sqlite3 >/dev/null
+npm install --no-audit --no-fund "$root_tgz" "$ext_tgz" \
+  better-sqlite3 drizzle-orm kysely >/dev/null
 
-PLATFORM="$PLATFORM" node - <<'JS'
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const Database = require('better-sqlite3');
-const { extensionPath, extensionInfo } = require('@russellthehippo/honker-node/extension');
+# One scenario per integration the docs actually recommend. Prisma is
+# absent on purpose: guides/orm/javascript.mdx documents that Prisma
+# cannot load SQLite extensions at all, and its fallback is a second
+# better-sqlite3 connection, which the first scenario already covers.
+# Copy the scenarios into the consumer project. Node resolves bare
+# imports from the importing file's own directory, so running them from
+# the repo would not see the packages installed here — and a user's
+# scenario file lives in their project anyway.
+cp "$ROOT"/scripts/proof/orm/js/*.mjs "$app/"
 
-const info = extensionInfo();
-assert.equal(info.entrypoint, 'sqlite3_honkerext_init');
-// Prove it resolved out of the installed package and not some stray
-// build lying around the machine.
-assert.match(
-  info.path,
-  new RegExp(`honker-ext-${process.env.PLATFORM}`),
-  `resolved from ${info.path}`,
-);
-
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'honker-orm-'));
-try {
-  const db = new Database(path.join(dir, 'app.db'));
-  // No entrypoint argument: filename derivation is part of what is
-  // under test.
-  db.loadExtension(extensionPath());
-  db.prepare('SELECT honker_bootstrap()').run();
-
-  // Every numeric argument is BOUND, never a SQL literal. better-sqlite3
-  // binds JS numbers as REAL, so literals would quietly sidestep the
-  // coercion path this is here to cover. Swapping these back to literals
-  // makes the test pass against a broken build.
-  const payload = JSON.stringify({ to: 'alice@example.com' });
-  const { id } = db
-    .prepare('SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL) AS id')
-    .get('emails', payload, 0, 3);
-  assert.ok(id > 0, `expected a job id, got ${id}`);
-
-  const claimed = JSON.parse(
-    db.prepare('SELECT honker_claim_batch(?, ?, ?, ?) AS jobs').get('emails', 'worker-1', 8, 300).jobs,
-  );
-  assert.equal(claimed.length, 1);
-  assert.equal(claimed[0].id, id);
-  assert.equal(JSON.parse(claimed[0].payload).to, 'alice@example.com');
-
-  const { ok } = db.prepare('SELECT honker_ack(?, ?) AS ok').get(id, 'worker-1');
-  assert.equal(ok, 1, 'ack must match the claim');
-
-  db.close();
-  console.log(`PASS: better-sqlite3 round trip through ${info.path}`);
-} finally {
-  fs.rmSync(dir, { recursive: true, force: true });
-}
-JS
+failed=0
+for scenario in "$app"/*.mjs; do
+  name="$(basename "$scenario" .mjs)"
+  if HONKER_PLATFORM="$PLATFORM" node "$scenario"; then
+    :
+  else
+    echo "FAIL $name" >&2
+    failed=1
+  fi
+done
+exit "$failed"

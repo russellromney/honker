@@ -4,6 +4,18 @@
   "description": "Node binding for honker \u2014 durable queues, streams, pub/sub, and scheduler on SQLite.",
   "main": "wrapper.js",
   "types": "wrapper.d.ts",
+  "exports": {
+    ".": {
+      "types": "./wrapper.d.ts",
+      "default": "./wrapper.js"
+    },
+    "./extension": {
+      "types": "./extension.d.ts",
+      "default": "./extension.js"
+    },
+    "./package.json": "./package.json",
+    "./*": "./*"
+  },
   "homepage": "https://honker.dev",
   "publishConfig": {
     "access": "public"
