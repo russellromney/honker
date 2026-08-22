@@ -588,6 +588,46 @@ jobs:
           . .venv/bin/activate
           python -m pytest tests/test_ruby_python_interop.py -q --tb=short
 
+  jvm:
+    name: jvm · honker + documented ORM recipes
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-jvm-${{ hashFiles('honker-core/src/**/*.rs', 'honker-extension/src/**/*.rs') }}"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Build honker-extension
+        run: cargo build --locked --release -p honker-extension
+      - name: Build and install dev.honker:honker
+        working-directory: packages/honker-jvm
+        run: mvn -B -q -DskipTests install
+      - name: Run honker-jvm tests
+        working-directory: packages/honker-jvm
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: mvn -B test
+      - name: ORM · JVM (JDBC, Hibernate, jOOQ)
+        working-directory: scripts/proof/orm/jvm
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-jvm.db" \
+            mvn -B -q compile exec:java -Dexec.mainClass=dev.honker.ormproof.OrmProof
+      - name: ORM · Kotlin (Exposed)
+        working-directory: scripts/proof/orm/jvm
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-kotlin.db" \
+            mvn -B -q compile exec:java -Dexec.mainClass=dev.honker.ormproof.ExposedProof
+
   ci-ok:
     # THE required status check for everything in *this* workflow.
     #
@@ -627,6 +667,7 @@ jobs:
       - dotnet
       - node
       - binding-smoke
+      - jvm
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
