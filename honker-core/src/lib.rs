@@ -198,21 +198,25 @@ pub enum Error {
 
 /// Default PRAGMA block applied on every connection open. Rationale:
 ///
+///   * `busy_timeout=5000`       — wait up to 5s for the writer lock
+///     before returning SQLITE_BUSY. **Must come first.** Converting
+///     the journal to WAL takes a brief exclusive lock, and until the
+///     timeout is set it is 0, so two processes opening the same fresh
+///     file at once make one of them fail instantly with "database is
+///     locked". Ordering this after `journal_mode` is a real bug, not
+///     a style question.
 ///   * `journal_mode=WAL`        — concurrent readers with one writer.
 ///   * `synchronous=NORMAL`      — fsync WAL at checkpoint, not every
 ///     commit. Safe against app crashes; OS crashes may lose the last
 ///     few unchecked-pointed transactions.
-///   * `busy_timeout=5000`       — wait up to 5s for the writer lock
-///     before returning SQLITE_BUSY.
 ///   * `foreign_keys=ON`         — enforce FK constraints (off by
 ///     default in SQLite, a real footgun).
 ///   * `cache_size=-32000`       — 32MB page cache (default was 2MB).
 ///   * `temp_store=MEMORY`       — temp B-trees in RAM, not disk.
 ///   * `wal_autocheckpoint=10000`— fsync every 10k WAL pages. Reduces
 ///     fsync frequency 10× vs the default of 1k.
-pub const DEFAULT_PRAGMAS: &str = "PRAGMA journal_mode = WAL;
+pub const DEFAULT_PRAGMAS: &str = "PRAGMA busy_timeout = 5000;
          PRAGMA synchronous = NORMAL;
-         PRAGMA busy_timeout = 5000;
          PRAGMA foreign_keys = ON;
          PRAGMA cache_size = -32000;
          PRAGMA temp_store = MEMORY;
@@ -221,7 +225,57 @@ pub const DEFAULT_PRAGMAS: &str = "PRAGMA journal_mode = WAL;
 /// Apply the library's default PRAGMAs to an already-open connection.
 /// Idempotent.
 pub fn apply_default_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    // busy_timeout has to land before anything that can contend, and
+    // the WAL conversion needs its own retry on top — see
+    // `set_journal_mode_wal`.
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    set_journal_mode_wal(conn)?;
     conn.execute_batch(DEFAULT_PRAGMAS)
+}
+
+/// Put the database into WAL mode, retrying while another connection
+/// holds the lock.
+///
+/// `PRAGMA journal_mode = WAL` takes a brief exclusive lock, and SQLite
+/// does **not** run the busy handler for it — `busy_timeout` buys
+/// nothing here. Two processes opening the same file at once and one
+/// fails immediately with "database is locked". That is exactly what a
+/// worker pool does on startup, and it is why the multiprocess
+/// pressure test failed intermittently.
+///
+/// WAL is a persistent property of the file, so the common case after
+/// the first open is a read with no lock at all.
+fn set_journal_mode_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let already_wal = |conn: &Connection| -> rusqlite::Result<bool> {
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        Ok(mode.eq_ignore_ascii_case("wal"))
+    };
+
+    if already_wal(conn)? {
+        return Ok(());
+    }
+
+    // Bounded to roughly the busy_timeout above, so a genuinely stuck
+    // lock still surfaces as an error rather than hanging.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode = WAL;") {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Someone else may have completed the conversion while
+                // we were waiting; that is a success, not a failure.
+                if already_wal(conn).unwrap_or(false) {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3714,5 +3768,78 @@ while True:
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+#[cfg(test)]
+mod open_race_tests {
+    use std::sync::{Arc, Barrier};
+
+    /// Many connections opening the same fresh database at once must
+    /// all succeed.
+    ///
+    /// `PRAGMA journal_mode = WAL` needs exclusive access to convert the
+    /// journal, and SQLite does **not** run the busy handler for it, so
+    /// `busy_timeout` buys nothing. Without the retry in
+    /// `set_journal_mode_wal`, converters collide with each other and
+    /// the losers fail outright with "database is locked". A worker pool
+    /// starting against a fresh file is exactly that shape, which is
+    /// what made `test_many_processes_enqueue_claim_and_ack_exactly_once`
+    /// fail intermittently on Windows.
+    ///
+    /// The collision is converter-versus-converter, so it can only be
+    /// provoked by racing — holding a read or write lock from a single
+    /// other connection does not block the conversion. Hence the
+    /// deliberately high pressure: enough rounds and openers that the
+    /// old behavior fails essentially every time.
+    #[test]
+    fn concurrent_opens_never_return_database_is_locked() {
+        const ROUNDS: usize = 24;
+        const OPENERS: usize = 32;
+
+        for round in 0..ROUNDS {
+            let dir = std::env::temp_dir().join(format!(
+                "honker-open-race-{}-{round}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("pressure.db");
+
+            let barrier = Arc::new(Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let conn = rusqlite::Connection::open(&path)?;
+                        // Converge on the conversion together.
+                        barrier.wait();
+                        super::apply_default_pragmas(&conn)?;
+                        let mode: String =
+                            conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+                        assert!(
+                            mode.eq_ignore_ascii_case("wal"),
+                            "expected WAL after open, got {mode}"
+                        );
+                        Ok::<_, rusqlite::Error>(())
+                    })
+                })
+                .collect();
+
+            let failures: Vec<String> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap().err().map(|e| e.to_string()))
+                .collect();
+
+            std::fs::remove_dir_all(&dir).ok();
+            assert!(
+                failures.is_empty(),
+                "round {round}: concurrent opens failed: {failures:?}"
+            );
+        }
     }
 }
