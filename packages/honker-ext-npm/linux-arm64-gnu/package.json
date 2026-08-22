@@ -1,6 +1,6 @@
 {
   "name": "@russellthehippo/honker-ext-linux-arm64-gnu",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Honker SQLite loadable extension for linux-arm64-gnu.",
   "files": [
     "libhonker_ext.so"

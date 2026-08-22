@@ -1,6 +1,6 @@
 {
   "name": "@russellthehippo/honker-bun",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Bun binding for Honker \u2014 durable queues, streams, pub/sub, and scheduler on SQLite.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://honker.dev",
@@ -26,9 +26,9 @@
     "bun": ">=1.3.0"
   },
   "optionalDependencies": {
-    "@russellthehippo/honker-ext-darwin-arm64": "0.4.5",
-    "@russellthehippo/honker-ext-darwin-x64": "0.4.5",
-    "@russellthehippo/honker-ext-linux-x64-gnu": "0.4.5",
-    "@russellthehippo/honker-ext-linux-arm64-gnu": "0.4.5"
+    "@russellthehippo/honker-ext-darwin-arm64": "0.4.6",
+    "@russellthehippo/honker-ext-darwin-x64": "0.4.6",
+    "@russellthehippo/honker-ext-linux-x64-gnu": "0.4.6",
+    "@russellthehippo/honker-ext-linux-arm64-gnu": "0.4.6"
   }
 }

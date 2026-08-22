@@ -1,6 +1,6 @@
 {
   "name": "@russellthehippo/honker-ext-darwin-x64",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Honker SQLite loadable extension for darwin-x64.",
   "files": [
     "libhonker_ext.dylib"

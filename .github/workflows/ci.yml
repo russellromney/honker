@@ -333,6 +333,32 @@ jobs:
         run: |
           npm ci
           npx napi build --platform --release --features kernel-watcher,shm-fast-path
+      - name: Test (extension resolver — no addon load)
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/extension.js
+      - name: Check extension package version alignment
+        shell: bash
+        run: python3 scripts/proof/check-ext-version-alignment.py
+      - name: Prove the packaged extension loads under better-sqlite3
+        # Windows has no honker-ext package yet, so there is nothing to
+        # pack there. Named rather than silently skipped.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux) platform=linux-x64-gnu ;;
+            macOS) platform=darwin-arm64 ;;
+            *) echo "unexpected runner ${{ runner.os }}" >&2; exit 1 ;;
+          esac
+          cargo build --locked --release -p honker-extension
+          case "$platform" in
+            darwin-*) libname=libhonker_ext.dylib ;;
+            *) libname=libhonker_ext.so ;;
+          esac
+          cp "target/release/$libname" "packages/honker-node/libhonker_ext.$platform.${libname##*.}"
+          scripts/copy-node-extension.sh "$platform"
+          scripts/proof/node-orm-extension.sh "$platform"
       - name: Test (basic — node only)
         working-directory: packages/honker-node
         shell: bash
