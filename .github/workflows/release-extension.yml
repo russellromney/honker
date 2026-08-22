@@ -114,11 +114,16 @@ jobs:
             echo "cross-compiled leg: structural check only, cannot dlopen $TARGET here"
             exit 0
           fi
-          npm install --no-save --no-audit --no-fund better-sqlite3 >/dev/null
-          node - <<'JS'
+          # Install from the pinned lockfile the ORM proofs use, so
+          # this does not resolve a fresh better-sqlite3 on every run.
+          cp scripts/proof/orm/js/package.json scripts/proof/orm/js/package-lock.json verify/
+          (cd verify && npm ci --no-audit --no-fund >/dev/null)
+          NODE_PATH="verify/node_modules" node - <<'JS'
           const assert = require('node:assert/strict');
           const path = require('node:path');
-          const Database = require('better-sqlite3');
+          const Database = require(require.resolve('better-sqlite3', {
+            paths: [path.resolve('verify')],
+          }));
           const lib = path.resolve('verify', process.env.LIBNAME);
           const db = new Database(':memory:');
           // No entry point argument on purpose: filename derivation is

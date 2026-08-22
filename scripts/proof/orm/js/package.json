@@ -1,0 +1,10 @@
+{
+  "name": "honker-orm-proof-js",
+  "private": true,
+  "description": "Pinned deps for the documented JavaScript ORM recipes. The honker packages are installed from freshly packed tarballs by scripts/proof/node-orm-extension.sh.",
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "drizzle-orm": "0.45.2",
+    "kysely": "0.29.5"
+  }
+}

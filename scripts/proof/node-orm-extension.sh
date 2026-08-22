@@ -42,9 +42,12 @@ test -n "$root_tgz"
 test -n "$ext_tgz"
 
 cd "$app"
-npm init -y >/dev/null
-npm install --no-audit --no-fund "$root_tgz" "$ext_tgz" \
-  better-sqlite3 drizzle-orm kysely >/dev/null
+# Pinned ORM deps come from scripts/proof/orm/js, so a CI run is not at
+# the mercy of whatever those packages published this morning. The
+# honker tarballs are the two things that must be fresh.
+cp "$ROOT/scripts/proof/orm/js/package.json" "$ROOT/scripts/proof/orm/js/package-lock.json" "$app/"
+npm ci --no-audit --no-fund >/dev/null
+npm install --no-audit --no-fund --no-save "$root_tgz" "$ext_tgz" >/dev/null
 
 # One scenario per integration the docs actually recommend. Prisma is
 # absent on purpose: guides/orm/javascript.mdx documents that Prisma

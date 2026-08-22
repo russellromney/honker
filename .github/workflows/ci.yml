@@ -245,11 +245,15 @@ jobs:
           # guides/orm/python.mdx shows. The wheel's bundled extension
           # is already in place from copy-python-extension.sh above.
           if [ "${{ runner.os }}" = "Windows" ]; then
+            VENV_PY=.venv/Scripts/python.exe
             . .venv/Scripts/activate
           else
+            VENV_PY=.venv/bin/python
             . .venv/bin/activate
           fi
-          python -m pip install --quiet sqlalchemy sqlmodel django
+          # uv venv does not ship pip, so install the way the rest of
+          # this job does.
+          uv pip install --python "$VENV_PY" --quiet sqlalchemy sqlmodel django
           failed=0
           for scenario in scripts/proof/orm/python/*.py; do
             name="$(basename "$scenario" .py)"
@@ -570,9 +574,11 @@ jobs:
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
         run: |
-          gem install --no-document activerecord sqlite3
+          export BUNDLE_GEMFILE="$GITHUB_WORKSPACE/scripts/proof/orm/ruby/Gemfile"
+          bundle install
           HONKER_TEST_DB="$RUNNER_TEMP/orm-ruby.db" \
-            ruby -Ilib "$GITHUB_WORKSPACE/scripts/proof/orm/ruby/active_record_proof.rb"
+            bundle exec ruby -I"$GITHUB_WORKSPACE/packages/honker-ruby/lib" \
+            "$GITHUB_WORKSPACE/scripts/proof/orm/ruby/active_record_proof.rb"
 
       - name: Run Ruby ↔ Python interop
         shell: bash
