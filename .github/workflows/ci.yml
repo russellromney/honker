@@ -238,6 +238,30 @@ jobs:
             . .venv/bin/activate
           fi
           python -m pytest tests/ -q -n 0 --tb=short
+      - name: Prove the documented Python ORM recipes
+        shell: bash
+        run: |
+          # SQLAlchemy, SQLModel and Django, each wired the way
+          # guides/orm/python.mdx shows. The wheel's bundled extension
+          # is already in place from copy-python-extension.sh above.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            . .venv/Scripts/activate
+          else
+            . .venv/bin/activate
+          fi
+          python -m pip install --quiet sqlalchemy sqlmodel django
+          failed=0
+          for scenario in scripts/proof/orm/python/*.py; do
+            name="$(basename "$scenario" .py)"
+            rm -f "$RUNNER_TEMP/orm-$name.db"
+            if HONKER_TEST_DB="$RUNNER_TEMP/orm-$name.db" python "$scenario"; then
+              :
+            else
+              echo "FAIL $name" >&2
+              failed=1
+            fi
+          done
+          exit "$failed"
 
   dotnet:
     name: dotnet · honker-dotnet
