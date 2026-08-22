@@ -254,6 +254,22 @@ jobs:
           # uv venv does not ship pip, so install the way the rest of
           # this job does.
           uv pip install --python "$VENV_PY" --quiet sqlalchemy sqlmodel django
+
+          # These recipes need an interpreter whose sqlite3 was built
+          # with SQLITE_ENABLE_LOAD_EXTENSION. The python.org macOS
+          # build that actions/setup-python ships is not. That is a real
+          # property of the platform, not something to paper over — so
+          # assert it rather than skipping quietly, and start running
+          # the proofs the moment it changes.
+          if ! python -c "import sqlite3, sys; sys.exit(0 if hasattr(sqlite3.connect(':memory:'), 'enable_load_extension') else 1)"; then
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              echo "macOS setup-python has no SQLITE_ENABLE_LOAD_EXTENSION; the documented recipes cannot run on this interpreter"
+              exit 0
+            fi
+            echo "this interpreter cannot load SQLite extensions, and only macOS setup-python is expected to be like that" >&2
+            exit 1
+          fi
+
           failed=0
           for scenario in scripts/proof/orm/python/*.py; do
             name="$(basename "$scenario" .py)"

@@ -862,3 +862,26 @@ def test_extension_enqueue_interops_with_python(ext_db_path):
     # Python can claim both (they're on the same queue/table).
     jobs = q.claim_batch("py-w", 10)
     assert sorted(j.id for j in jobs) == [py_id, ext_id]
+
+
+def test_load_extension_names_the_real_problem_when_unsupported():
+    """A Python without SQLITE_ENABLE_LOAD_EXTENSION must say so.
+
+    Before this, honker.load_extension fell through to
+    `SELECT load_extension(...)`, which SQLite rejects with
+    "not authorized" — an error that reads like a permissions problem
+    and sends the reader nowhere useful. Found when the SQLAlchemy and
+    SQLModel proofs hit it on macOS CI.
+    """
+
+    class NoExtensionSupport:
+        # A CPython built without the feature exposes neither hook.
+        def execute(self, *args, **kwargs):
+            raise AssertionError("must not reach the SQL fallback")
+
+    with pytest.raises(honker.ExtensionLoadingUnsupported) as excinfo:
+        honker.load_extension(NoExtensionSupport())
+
+    message = str(excinfo.value)
+    assert "SQLITE_ENABLE_LOAD_EXTENSION" in message
+    assert "honker.open()" in message

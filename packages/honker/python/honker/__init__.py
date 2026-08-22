@@ -75,20 +75,45 @@ def extension_info() -> tuple[str, str]:
     raise FileNotFoundError(f"Honker SQLite extension not found; searched: {searched}")
 
 
+class ExtensionLoadingUnsupported(RuntimeError):
+    """This Python cannot load SQLite extensions at all.
+
+    Raised when the interpreter's ``sqlite3`` was compiled without
+    ``SQLITE_ENABLE_LOAD_EXTENSION``. The python.org macOS installer is
+    the common case; Homebrew Python and most Linux distributions have
+    it on.
+    """
+
+
 def load_extension(conn) -> None:
     """Load Honker's SQLite extension into an existing DB-API connection."""
     path, entrypoint = extension_info()
     enable = getattr(conn, "enable_load_extension", None)
+    load = getattr(conn, "load_extension", None)
+
+    # Neither hook means the interpreter was built without extension
+    # support. Say that, rather than falling through to a SQL
+    # load_extension() that comes back "not authorized" and sends the
+    # reader looking for a permissions problem they do not have.
+    if enable is None and load is None:
+        raise ExtensionLoadingUnsupported(
+            "this Python's sqlite3 was built without SQLITE_ENABLE_LOAD_EXTENSION, "
+            "so it cannot load "
+            f"{path}. The python.org macOS installer is built this way; Homebrew "
+            "Python and most Linux distributions are not. Use an interpreter that "
+            "supports it, or use honker.open() instead, which needs no extension."
+        )
+
     if enable is not None:
         enable(True)
     try:
-        load = getattr(conn, "load_extension", None)
         if load is None:
             conn.execute("SELECT load_extension(?, ?)", (path, entrypoint))
         else:
             try:
                 load(path, entrypoint=entrypoint)
             except TypeError:
+                # Older CPython: load_extension takes no entrypoint kwarg.
                 conn.execute("SELECT load_extension(?, ?)", (path, entrypoint))
     finally:
         if enable is not None:
@@ -97,6 +122,7 @@ def load_extension(conn) -> None:
 
 __all__ = [
     "CronSchedule",
+    "ExtensionLoadingUnsupported",
     "Database",
     "Event",
     "Job",
