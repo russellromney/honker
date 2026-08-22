@@ -42,6 +42,9 @@ mod kernel_watcher;
 mod shm_watcher;
 
 pub use honker_ops::attach_honker_functions;
+// Shared by the loadable extension's own watcher SQL functions so every
+// honker_* function coerces integer arguments the same way.
+pub use honker_ops::{arg_i64, arg_opt_i64};
 
 use parking_lot::{Condvar, Mutex};
 use rusqlite::functions::FunctionFlags;
