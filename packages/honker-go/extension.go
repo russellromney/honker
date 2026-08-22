@@ -70,9 +70,11 @@ func ExtensionPath() (string, error) {
 
 	return "", fmt.Errorf(
 		"honker: SQLite extension not found. The Go binding ships no binary — "+
-			"set HONKER_EXTENSION_PATH, download %s from "+
-			"https://github.com/russellromney/honker/releases, or build it with "+
-			"`cargo build --release -p honker-extension`. Searched: %s",
+			"set HONKER_EXTENSION_PATH, or download honker-ext-<target>.tar.gz "+
+			"from https://github.com/russellromney/honker/releases and extract "+
+			"%s from it, or build it with "+
+			"`cargo build --release -p honker-extension`. Keep the file name as-is: "+
+			"SQLite derives the extension entry point from it. Searched: %s",
 		name,
 		strings.Join(searched, ", "),
 	)

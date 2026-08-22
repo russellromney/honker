@@ -32,22 +32,27 @@ jobs:
             os: ubuntu-latest
             rust_target: x86_64-unknown-linux-gnu
             libname: libhonker_ext.so
+            native: true
           - target: linux-arm64
             os: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             libname: libhonker_ext.so
+            native: true
           - target: macos-x64
             os: macos-latest
             rust_target: x86_64-apple-darwin
             libname: libhonker_ext.dylib
+            native: false
           - target: macos-arm64
             os: macos-latest
             rust_target: aarch64-apple-darwin
             libname: libhonker_ext.dylib
+            native: true
           - target: windows-x64
             os: windows-latest
             rust_target: x86_64-pc-windows-msvc
             libname: honker_ext.dll
+            native: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -70,13 +75,58 @@ jobs:
             --target "$RUST_TARGET"
           src="target/$RUST_TARGET/release/$LIBNAME"
           test -f "$src"
-          mkdir -p dist
-          # Keep the honker_ext stem. SQLite derives the entry point from
-          # the file name, so a rename here would break load_extension()
-          # for anyone who does not pass sqlite3_honkerext_init by hand.
-          stem="${LIBNAME%.*}"
-          suffix="${LIBNAME##*.}"
-          cp "$src" "dist/${stem}-${TARGET}.${suffix}"
+
+          # The file inside the archive keeps the canonical name.
+          # SQLite derives the entry point from the file name, so
+          # anything else makes load_extension() fail unless the caller
+          # passes sqlite3_honkerext_init by hand. Per-target naming
+          # goes on the archive, never on the library.
+          mkdir -p "stage/$TARGET" dist
+          cp "$src" "stage/$TARGET/$LIBNAME"
+          tar -czf "dist/honker-ext-${TARGET}.tar.gz" -C "stage/$TARGET" "$LIBNAME"
+
+      - name: Prove the archived extension still loads
+        shell: bash
+        env:
+          LIBNAME: ${{ matrix.libname }}
+          TARGET: ${{ matrix.target }}
+          NATIVE: ${{ matrix.native }}
+        run: |
+          mkdir -p verify
+          tar -xzf "dist/honker-ext-${TARGET}.tar.gz" -C verify
+
+          # Structural check, every leg, no skip path. SQLite derives the
+          # entry point from the file name, so the archive must contain
+          # the canonical name and nothing else. Shipping
+          # libhonker_ext-macos-arm64.dylib derives
+          # sqlite3_honkerextmacosarm64_init and cannot load.
+          actual="$(tar -tzf "dist/honker-ext-${TARGET}.tar.gz")"
+          if [[ "$actual" != "$LIBNAME" ]]; then
+            echo "archive must contain exactly $LIBNAME, got: $actual" >&2
+            exit 1
+          fi
+
+          # Real load, on the legs where the runner can execute the
+          # artifact. macos-x64 is cross-compiled on an arm64 runner and
+          # cannot be dlopen'd here; the structural check above is what
+          # covers that leg.
+          if [[ "$NATIVE" != "true" ]]; then
+            echo "cross-compiled leg: structural check only, cannot dlopen $TARGET here"
+            exit 0
+          fi
+          npm install --no-save --no-audit --no-fund better-sqlite3 >/dev/null
+          node - <<'JS'
+          const assert = require('node:assert/strict');
+          const path = require('node:path');
+          const Database = require('better-sqlite3');
+          const lib = path.resolve('verify', process.env.LIBNAME);
+          const db = new Database(':memory:');
+          // No entry point argument on purpose: filename derivation is
+          // the thing under test.
+          db.loadExtension(lib);
+          assert.equal(db.prepare('SELECT honker_bootstrap() AS r').get().r, 1);
+          console.log(`archived extension loads by filename derivation: ${lib}`);
+          JS
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -109,8 +159,8 @@ jobs:
           cd dist
           ls -1
           # Five targets in the matrix; anything less means a silent drop.
-          test "$(ls -1 | wc -l)" -eq 5
-          sha256sum * > SHA256SUMS
+          test "$(ls -1 honker-ext-*.tar.gz | wc -l)" -eq 5
+          sha256sum honker-ext-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish

@@ -84,9 +84,11 @@ defmodule Honker.Extension do
       nil ->
         {:error,
          "Honker SQLite extension not found. The Elixir binding ships no binary — " <>
-           "set HONKER_EXTENSION_PATH, download #{filename()} from " <>
-           "https://github.com/russellromney/honker/releases, or build it with " <>
-           "`cargo build --release -p honker-extension`. Searched: " <>
+           "set HONKER_EXTENSION_PATH, or download honker-ext-<target>.tar.gz from " <>
+           "https://github.com/russellromney/honker/releases and extract " <>
+           "#{filename()} from it, or build it with " <>
+           "`cargo build --release -p honker-extension`. Keep the file name as-is: " <>
+           "SQLite derives the extension entry point from it. Searched: " <>
            Enum.join(candidates, ", ")}
 
       found ->
