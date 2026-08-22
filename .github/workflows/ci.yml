@@ -557,6 +557,14 @@ jobs:
             elixir -pa _build/dev/lib/honker/ebin \
             "$GITHUB_WORKSPACE/scripts/proof/orm/elixir/ecto_proof.exs"
 
+      - name: ORM · C++ (framework-owned sqlite3)
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          g++ -std=c++17 scripts/proof/orm/cpp/orm_proof.cpp -lsqlite3 \
+            -o "$RUNNER_TEMP/orm-cpp"
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-cpp.db" "$RUNNER_TEMP/orm-cpp"
+
       - name: ORM · Ruby (ActiveRecord)
         working-directory: packages/honker-ruby
         env:
