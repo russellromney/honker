@@ -63,6 +63,13 @@ jobs:
           rustup default stable
           rustup target add "${{ matrix.rust_target }}"
 
+      # The Windows leg verifies the archived extension with stdlib
+      # sqlite3, so pin the interpreter rather than taking whatever the
+      # image happens to ship.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
       - name: Build extension
         shell: bash
         env:
@@ -114,6 +121,28 @@ jobs:
             echo "cross-compiled leg: structural check only, cannot dlopen $TARGET here"
             exit 0
           fi
+          # Windows has no better-sqlite3 prebuild for this runner's
+          # Node, so npm falls back to node-gyp and the install fails.
+          # Use the stdlib sqlite3 there instead — the CI python job
+          # proves Windows ships it with extension loading enabled.
+          # macOS is the reverse: setup-python's build has no
+          # SQLITE_ENABLE_LOAD_EXTENSION, so it uses better-sqlite3.
+          # Neither branch skips; each fails if its client cannot load.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python - <<'PY'
+          import os, sqlite3, sys
+          lib = os.path.join("verify", os.environ["LIBNAME"])
+          conn = sqlite3.connect(":memory:")
+          if not hasattr(conn, "enable_load_extension"):
+              sys.exit("this Windows python cannot load extensions; the check cannot run")
+          conn.enable_load_extension(True)
+          conn.load_extension(lib)   # no entrypoint: derivation is under test
+          assert conn.execute("SELECT honker_bootstrap()").fetchone()[0] == 1
+          print(f"archived extension loads by filename derivation: {lib}")
+          PY
+            exit 0
+          fi
+
           # Install from the pinned lockfile the ORM proofs use, so
           # this does not resolve a fresh better-sqlite3 on every run.
           cp scripts/proof/orm/js/package.json scripts/proof/orm/js/package-lock.json verify/
