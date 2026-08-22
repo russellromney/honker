@@ -20,7 +20,7 @@
 
 use rusqlite::Connection;
 use rusqlite::functions::{Context, FunctionFlags};
-use rusqlite::types::{Type, ValueRef};
+use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 
 /// Read an integer argument, accepting the REAL that dynamically typed
@@ -56,7 +56,7 @@ fn real_to_i64(f: f64, idx: usize) -> rusqlite::Result<i64> {
     // 2^63 exactly; i64::MAX as f64 rounds *up* to it, so compare
     // against the power of two and exclude the top end.
     const LIMIT: f64 = 9_223_372_036_854_775_808.0;
-    if f.fract() == 0.0 && f >= -LIMIT && f < LIMIT {
+    if f.fract() == 0.0 && (-LIMIT..LIMIT).contains(&f) {
         return Ok(f as i64);
     }
 
