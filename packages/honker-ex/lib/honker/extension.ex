@@ -24,10 +24,10 @@ defmodule Honker.Extension do
   @doc """
   The SQLite entry point exported by the extension.
 
-  SQLite normally derives this from the file name — strip a leading
-  `lib`, take characters up to the first `.`, keep the alphabetic ones,
-  so `libhonker_ext.so` gives `honkerext`. It only matters when loading
-  the extension under some other name.
+  When no entry point is given, SQLite derives one from the file name.
+  That works for the canonical `libhonker_ext.{so,dylib}` /
+  `honker_ext.dll`. Pass this explicitly if the library is named
+  anything else — the derivation is version-dependent.
   """
   @spec entrypoint() :: String.t()
   def entrypoint, do: "sqlite3_honkerext_init"

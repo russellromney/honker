@@ -48,10 +48,10 @@ for platform in "${platforms[@]}"; do
     exit 1
   fi
 
-  # The file name matters. SQLite derives the entry point from it:
-  # strip a leading `lib`, take characters up to the first `.`, keep the
-  # alphabetic ones. libhonker_ext -> honkerext -> sqlite3_honkerext_init.
-  # Landing it under the staged name would derive the wrong symbol.
+  # The file name matters. With no entry point argument SQLite derives
+  # one from the file name, so the library has to land under its
+  # canonical name. Leaving it as libhonker_ext.<platform>.so derives a
+  # symbol that does not exist and load_extension() fails.
   cp "$src" "$dest_dir/$libname"
   echo "copied $src -> $dest_dir/$libname"
 done

@@ -99,7 +99,7 @@ change.
 > Before: 1.0 release prep
 
 > **Status:** core + Python + Node shipped in PR #30 (universal polling
-> SQLITE_BUSY fix, opt-in `kernel`/`shm` backends behind Beavis features,
+> SQLITE_BUSY fix, opt-in `kernel`/`shm` backends behind Cargo features,
 > sync baseline handshake, watcher-death propagation). Rust wrapper
 > parity is wired via `OpenOptions::watcher_backend`. Go, Bun, C++,
 > .NET, Ruby, and Elixir are core-backed too: extension consumers route
@@ -118,8 +118,8 @@ uses SQL watcher-handle functions registered by that extension.
 
 For each supported binding:
 
-- Add Beavis features `kernel-watcher` and `shm-fast-path` that forward
-  to `honker-core/<feature>` (where the binding has a Beavis.toml).
+- Add Cargo features `kernel-watcher` and `shm-fast-path` that forward
+  to `honker-core/<feature>` (where the binding has a Cargo.toml).
 - Accept a `watcher_backend` (or language-idiomatic equivalent) string
   parameter on the binding's `open()`.
 - Parse via `honker_core::WatcherBackend::parse` so the accepted
@@ -289,7 +289,7 @@ and no commit + deadline collision should double-fire.
 
 > After: Phase Atlas · Before: 1.0 release prep
 
-PR #30 shipped the experimental backends in source, gated by Beavis
+PR #30 shipped the experimental backends in source, gated by Cargo
 features. Published wheels still build polling-only. This phase
 decides when to enable the features in wheel builds. Polling stays
 the default either way; "available in wheels" is the only flip.
@@ -628,7 +628,7 @@ Remaining:
       already produce exactly the artifacts a publish step needs.
 - [ ] Standardize the desired proof depth. Python still needs an
       installed-wheel smoke test; Bun and Elixir test before packing
-      rather than from a clean consumer; crates rely on Beavis's package
+      rather than from a clean consumer; crates rely on Cargo's package
       verification rather than a separate consumer project.
 - [ ] Decide the release contract for `honker-rs` and the in-tree
       bindings without dedicated proof workflows (Go, C++, JVM,

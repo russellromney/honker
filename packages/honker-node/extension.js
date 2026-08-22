@@ -20,12 +20,11 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-// SQLite derives the entry point from the file name: strip a leading
-// `lib`, take characters up to the first `.`, keep only the alphabetic
-// ones. `libhonker_ext.so` gives `honkerext`, which is why the exported
-// symbol in honker-extension/src/lib.rs is `sqlite3_honkerext_init`.
-// Renaming the file breaks that derivation, so pass the entry point
-// explicitly if you ever load it under another name.
+// When no entry point is given, SQLite derives one from the file name.
+// That resolves to the `sqlite3_honkerext_init` exported by
+// honker-extension/src/lib.rs only for the canonical
+// `libhonker_ext.{so,dylib}` / `honker_ext.dll`. The derivation is
+// version-dependent, so pass this explicitly for any other name.
 const EXTENSION_ENTRYPOINT = 'sqlite3_honkerext_init';
 
 function extensionFilename() {

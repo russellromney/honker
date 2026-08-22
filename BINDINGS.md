@@ -56,11 +56,13 @@ Contract, identical in every language:
 `packages/honker/python/honker/__init__.py` is the reference
 implementation.
 
-The file name is load-bearing. SQLite derives the entry point from it:
-strip a leading `lib`, take characters up to the first `.`, keep only
-the alphabetic ones. `libhonker_ext.so` gives `honkerext`. Ship it as
-`libhonker_ext.{so,dylib}` / `honker_ext.dll` or pass the entry point
-explicitly.
+The file name is load-bearing. When no entry point is given, SQLite
+derives one from the file name, and the exact derivation varies between
+SQLite versions — `libhonker_ext-v2.dylib` resolves to
+`sqlite3_honkerextv2_init`, which does not exist. Ship the library as
+`libhonker_ext.{so,dylib}` / `honker_ext.dll`, or pass
+`sqlite3_honkerext_init` explicitly. Per-target naming belongs on the
+archive, never on the library.
 
 Go, Elixir, and C++ cannot bundle a binary idiomatically. They take it
 from a GitHub release, published by `.github/workflows/release-extension.yml`.

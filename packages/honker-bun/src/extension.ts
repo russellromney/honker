@@ -18,10 +18,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * SQLite derives the entry point from the file name: strip a leading
- * `lib`, take characters up to the first `.`, keep the alphabetic ones.
- * `libhonker_ext.so` gives `honkerext`, matching the symbol exported by
- * honker-extension. Only needed if you load the file under another name.
+ * When no entry point is given, SQLite derives one from the file name.
+ * That works for `libhonker_ext.{so,dylib}` and `honker_ext.dll`. Pass
+ * this explicitly if you load the library under any other name — the
+ * derivation is version-dependent and will not find the symbol.
  */
 export const EXTENSION_ENTRYPOINT = "sqlite3_honkerext_init";
 
