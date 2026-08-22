@@ -22,6 +22,31 @@ extension.
 | JVM `dev.honker:honker` | local + clean consumer | yes | yes | yes | yes | yes | shared JVM watcher |
 | Kotlin `dev.honker:honker-kotlin` | local + clean consumer | wrapper | Flow wrapper | wrapper | wrapper | wrapper | JVM wrapper |
 
+## Argument Types
+
+The `honker_*` SQL functions take their integer arguments the way
+SQLite's C API does: an `INTEGER` is used as-is, and a `REAL` holding a
+whole number is converted. `sqlite3_value_int64` has always behaved
+this way, so a C implementation of these functions would too.
+
+This is a deliberate guarantee, not an accident of the Rust wrapper.
+`rusqlite`'s `Context::get` type-checks strictly and rejects `REAL`,
+which is stricter than SQLite itself; `honker_ops::arg_i64` restores
+the documented behavior.
+
+It matters because dynamically typed clients bind what their language
+gives them. `better-sqlite3` binds **every** JavaScript number as
+`REAL` — whole ones included — because a JS `Number` is an IEEE-754
+double, and it offers `BigInt` as the explicit integer signal. So
+`honker_enqueue(..., priority, max_attempts, ...)` from Drizzle,
+Kysely, or plain better-sqlite3 arrives entirely as `REAL`.
+
+A `REAL` that is not a whole number is an error, and so are infinities,
+NaN, and values outside the range of a 64-bit integer. SQLite would
+truncate `2.7` to `2`; we do not. Rounding a job id or a retry count
+hides a caller's bug, and this is the one place being stricter than
+SQLite earns the inconsistency. The error names the value and why.
+
 ## Watcher Backends
 
 The stable backend is `PRAGMA data_version`. It is the default across

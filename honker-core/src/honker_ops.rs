@@ -19,8 +19,67 @@
 //! tested once and inherited by every consumer.
 
 use rusqlite::Connection;
-use rusqlite::functions::FunctionFlags;
+use rusqlite::functions::{Context, FunctionFlags};
+use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
+
+/// Read an integer argument, accepting the REAL that dynamically typed
+/// clients send for whole numbers.
+///
+/// `better-sqlite3` binds every JavaScript number as SQLite REAL, whole
+/// ones included. So `honker_enqueue(..., priority, max_attempts, ...)`
+/// called from Drizzle or Kysely arrives as REAL and used to fail with
+/// "Invalid function parameter type Real". SQLite is dynamically typed
+/// and these are integer arguments; refusing `3.0` because it arrived
+/// as a double was our bug, not the caller's.
+///
+/// A REAL with a fractional part is still an error. Truncating `1.5` to
+/// `1` would hide a real mistake, and a job id is not a rounding
+/// candidate.
+pub fn arg_i64(ctx: &Context<'_>, idx: usize) -> rusqlite::Result<i64> {
+    match ctx.get_raw(idx) {
+        ValueRef::Real(f) => real_to_i64(f, idx),
+        // Integer, and everything else, keep rusqlite's own behavior.
+        _ => ctx.get::<i64>(idx),
+    }
+}
+
+/// Nullable form of [`arg_i64`]. NULL stays None.
+pub fn arg_opt_i64(ctx: &Context<'_>, idx: usize) -> rusqlite::Result<Option<i64>> {
+    match ctx.get_raw(idx) {
+        ValueRef::Real(f) => real_to_i64(f, idx).map(Some),
+        _ => ctx.get::<Option<i64>>(idx),
+    }
+}
+
+fn real_to_i64(f: f64, idx: usize) -> rusqlite::Result<i64> {
+    // 2^63 exactly; i64::MAX as f64 rounds *up* to it, so compare
+    // against the power of two and exclude the top end.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if f.fract() == 0.0 && (-LIMIT..LIMIT).contains(&f) {
+        return Ok(f as i64);
+    }
+
+    // "Invalid function parameter type Real" is useless here: the type
+    // is fine, the value is not. Say which value and why, because the
+    // caller is often an ORM and the number came from somewhere else.
+    let why = if f.is_nan() {
+        "not a number".to_string()
+    } else if f.is_infinite() {
+        "infinite".to_string()
+    } else if f.fract() != 0.0 {
+        format!("{f} has a fractional part")
+    } else {
+        format!("{f:e} is outside the range of a 64-bit integer")
+    };
+    Err(rusqlite::Error::UserFunctionError(Box::new(
+        std::io::Error::other(format!(
+            "honker: argument {idx} must be a whole number, but {why}. \
+             Whole values bind fine even when the client sends them as \
+             REAL, which better-sqlite3 does for every JavaScript number."
+        )),
+    )))
+}
 
 /// Wrap a Displayable error for SQLite scalar-function returns.
 fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
@@ -40,8 +99,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function("honker_claim_batch", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
         let queue: String = ctx.get(0)?;
         let worker_id: String = ctx.get(1)?;
-        let n: i64 = ctx.get(2)?;
-        let timeout_s: i64 = ctx.get(3)?;
+        let n: i64 = arg_i64(ctx, 2)?;
+        let timeout_s: i64 = arg_i64(ctx, 3)?;
         let db = unsafe { ctx.get_connection() }?;
         claim_batch(&db, &queue, &worker_id, n, timeout_s).map_err(to_sql_err)
     })?;
@@ -82,7 +141,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         |ctx| {
             let name: String = ctx.get(0)?;
             let owner: String = ctx.get(1)?;
-            let ttl: i64 = ctx.get(2)?;
+            let ttl: i64 = arg_i64(ctx, 2)?;
             let db = unsafe { ctx.get_connection() }?;
             lock_acquire(&db, &name, &owner, ttl).map_err(to_sql_err)
         },
@@ -107,7 +166,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function("honker_lock_renew", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
         let name: String = ctx.get(0)?;
         let owner: String = ctx.get(1)?;
-        let ttl: i64 = ctx.get(2)?;
+        let ttl: i64 = arg_i64(ctx, 2)?;
         let db = unsafe { ctx.get_connection() }?;
         lock_renew(&db, &name, &owner, ttl).map_err(to_sql_err)
     })?;
@@ -118,8 +177,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
             let name: String = ctx.get(0)?;
-            let limit: i64 = ctx.get(1)?;
-            let per: i64 = ctx.get(2)?;
+            let limit: i64 = arg_i64(ctx, 1)?;
+            let per: i64 = arg_i64(ctx, 2)?;
             let db = unsafe { ctx.get_connection() }?;
             rate_limit_try(&db, &name, limit, per).map_err(to_sql_err)
         },
@@ -130,7 +189,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            let older_than_s: i64 = ctx.get(0)?;
+            let older_than_s: i64 = arg_i64(ctx, 0)?;
             let db = unsafe { ctx.get_connection() }?;
             rate_limit_sweep(&db, older_than_s).map_err(to_sql_err)
         },
@@ -152,8 +211,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let queue: String = ctx.get(1)?;
             let cron_expr: String = ctx.get(2)?;
             let payload: String = ctx.get(3)?;
-            let priority: i64 = ctx.get(4)?;
-            let expires_s: Option<i64> = ctx.get(5)?;
+            let priority: i64 = arg_i64(ctx, 4)?;
+            let expires_s: Option<i64> = arg_opt_i64(ctx, 5)?;
             let db = unsafe { ctx.get_connection() }?;
             scheduler_register(
                 &db, &name, &queue, &cron_expr, &payload, priority, expires_s, 3,
@@ -170,9 +229,9 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let queue: String = ctx.get(1)?;
             let cron_expr: String = ctx.get(2)?;
             let payload: String = ctx.get(3)?;
-            let priority: i64 = ctx.get(4)?;
-            let expires_s: Option<i64> = ctx.get(5)?;
-            let max_attempts: i64 = ctx.get(6)?;
+            let priority: i64 = arg_i64(ctx, 4)?;
+            let expires_s: Option<i64> = arg_opt_i64(ctx, 5)?;
+            let max_attempts: i64 = arg_i64(ctx, 6)?;
             let db = unsafe { ctx.get_connection() }?;
             scheduler_register(
                 &db,
@@ -212,7 +271,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            let now_unix: i64 = ctx.get(0)?;
+            let now_unix: i64 = arg_i64(ctx, 0)?;
             let db = unsafe { ctx.get_connection() }?;
             scheduler_tick(&db, now_unix).map_err(to_sql_err)
         },
@@ -282,9 +341,9 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let name: String = ctx.get(0)?;
             let cron_expr: Option<String> = ctx.get(1)?;
             let payload: Option<String> = ctx.get(2)?;
-            let priority: Option<i64> = ctx.get(3)?;
-            let expires_s_arg: Option<i64> = ctx.get(4)?;
-            let touch_expires: i64 = ctx.get(5)?;
+            let priority: Option<i64> = arg_opt_i64(ctx, 3)?;
+            let expires_s_arg: Option<i64> = arg_opt_i64(ctx, 4)?;
+            let touch_expires: i64 = arg_i64(ctx, 5)?;
             let db = unsafe { ctx.get_connection() }?;
             let expires_s = if touch_expires != 0 {
                 Some(expires_s_arg)
@@ -311,11 +370,11 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let name: String = ctx.get(0)?;
             let cron_expr: Option<String> = ctx.get(1)?;
             let payload: Option<String> = ctx.get(2)?;
-            let priority: Option<i64> = ctx.get(3)?;
-            let expires_s_arg: Option<i64> = ctx.get(4)?;
-            let touch_expires: i64 = ctx.get(5)?;
-            let max_attempts_arg: Option<i64> = ctx.get(6)?;
-            let touch_max_attempts: i64 = ctx.get(7)?;
+            let priority: Option<i64> = arg_opt_i64(ctx, 3)?;
+            let expires_s_arg: Option<i64> = arg_opt_i64(ctx, 4)?;
+            let touch_expires: i64 = arg_i64(ctx, 5)?;
+            let max_attempts_arg: Option<i64> = arg_opt_i64(ctx, 6)?;
+            let touch_max_attempts: i64 = arg_i64(ctx, 7)?;
             let db = unsafe { ctx.get_connection() }?;
             let expires_s = if touch_expires != 0 {
                 Some(expires_s_arg)
@@ -341,15 +400,15 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function("honker_result_save", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let value: String = ctx.get(1)?;
-        let ttl_s: i64 = ctx.get(2)?;
+        let ttl_s: i64 = arg_i64(ctx, 2)?;
         let db = unsafe { ctx.get_connection() }?;
         result_save(&db, job_id, &value, ttl_s).map_err(to_sql_err)
     })?;
 
     conn.create_scalar_function("honker_result_get", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let db = unsafe { ctx.get_connection() }?;
         result_get(&db, job_id).map_err(to_sql_err)
     })?;
@@ -373,11 +432,11 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function("honker_enqueue", 7, FunctionFlags::SQLITE_UTF8, |ctx| {
         let queue: String = ctx.get(0)?;
         let payload: String = ctx.get(1)?;
-        let run_at: Option<i64> = ctx.get(2)?;
-        let delay: Option<i64> = ctx.get(3)?;
-        let priority: i64 = ctx.get(4)?;
-        let max_attempts: i64 = ctx.get(5)?;
-        let expires: Option<i64> = ctx.get(6)?;
+        let run_at: Option<i64> = arg_opt_i64(ctx, 2)?;
+        let delay: Option<i64> = arg_opt_i64(ctx, 3)?;
+        let priority: i64 = arg_i64(ctx, 4)?;
+        let max_attempts: i64 = arg_i64(ctx, 5)?;
+        let expires: Option<i64> = arg_opt_i64(ctx, 6)?;
         let db = unsafe { ctx.get_connection() }?;
         enqueue(
             &db,
@@ -395,7 +454,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // honker_ack(job_id, worker_id) -> 1 if ack'd, 0 if claim expired /
     // not ours.
     conn.create_scalar_function("honker_ack", 2, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let worker_id: String = ctx.get(1)?;
         let db = unsafe { ctx.get_connection() }?;
         ack(&db, job_id, &worker_id).map_err(to_sql_err)
@@ -407,9 +466,9 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // to pending. Fires a notify on the queue's channel on successful
     // pending-flip (so waiting workers wake).
     conn.create_scalar_function("honker_retry", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let worker_id: String = ctx.get(1)?;
-        let delay_s: i64 = ctx.get(2)?;
+        let delay_s: i64 = arg_i64(ctx, 2)?;
         let error: String = ctx.get(3)?;
         let db = unsafe { ctx.get_connection() }?;
         retry(&db, job_id, &worker_id, delay_s, &error).map_err(to_sql_err)
@@ -418,7 +477,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // honker_fail(job_id, worker_id, error) -> 1 if failed-to-dead, 0 if
     // not our claim.
     conn.create_scalar_function("honker_fail", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let worker_id: String = ctx.get(1)?;
         let error: String = ctx.get(2)?;
         let db = unsafe { ctx.get_connection() }?;
@@ -428,9 +487,9 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // honker_heartbeat(job_id, worker_id, extend_s) -> 1 if extended, 0
     // if not our claim.
     conn.create_scalar_function("honker_heartbeat", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let worker_id: String = ctx.get(1)?;
-        let extend_s: i64 = ctx.get(2)?;
+        let extend_s: i64 = arg_i64(ctx, 2)?;
         let db = unsafe { ctx.get_connection() }?;
         heartbeat(&db, job_id, &worker_id, extend_s).map_err(to_sql_err)
     })?;
@@ -438,14 +497,14 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // honker_cancel(job_id) -> 1 if a pending/processing row was removed,
     // 0 otherwise. Idempotent on missing.
     conn.create_scalar_function("honker_cancel", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let db = unsafe { ctx.get_connection() }?;
         cancel(&db, job_id).map_err(to_sql_err)
     })?;
 
     // honker_get_job(job_id) -> JSON object on hit, empty string on miss.
     conn.create_scalar_function("honker_get_job", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let job_id: i64 = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 0)?;
         let db = unsafe { ctx.get_connection() }?;
         get_job(&db, job_id).map_err(to_sql_err)
     })?;
@@ -460,7 +519,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
             let expr: String = ctx.get(0)?;
-            let from_unix: i64 = ctx.get(1)?;
+            let from_unix: i64 = arg_i64(ctx, 1)?;
             super::cron::next_after_unix(&expr, from_unix).map_err(to_sql_err)
         },
     )?;
@@ -491,8 +550,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
             let topic: String = ctx.get(0)?;
-            let offset: i64 = ctx.get(1)?;
-            let limit: i64 = ctx.get(2)?;
+            let offset: i64 = arg_i64(ctx, 1)?;
+            let limit: i64 = arg_i64(ctx, 2)?;
             let db = unsafe { ctx.get_connection() }?;
             stream_read_since(&db, &topic, offset, limit).map_err(to_sql_err)
         },
@@ -509,7 +568,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         |ctx| {
             let consumer: String = ctx.get(0)?;
             let topic: String = ctx.get(1)?;
-            let offset: i64 = ctx.get(2)?;
+            let offset: i64 = arg_i64(ctx, 2)?;
             let db = unsafe { ctx.get_connection() }?;
             stream_save_offset(&db, &consumer, &topic, offset).map_err(to_sql_err)
         },
@@ -1673,4 +1732,160 @@ pub fn stream_get_offset(conn: &Connection, consumer: &str, topic: &str) -> rusq
 
 fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
+}
+
+#[cfg(test)]
+mod real_arg_tests {
+    use crate::{attach_honker_functions, bootstrap_honker_schema};
+    use rusqlite::Connection;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        attach_honker_functions(&conn).unwrap();
+        bootstrap_honker_schema(&conn).unwrap();
+        conn
+    }
+
+    // better-sqlite3 binds every JavaScript number as REAL, so this is
+    // the exact shape a Drizzle or Kysely caller sends. Before the
+    // arg_i64 coercion this failed with "Invalid function parameter
+    // type Real at index 4".
+    #[test]
+    fn enqueue_accepts_real_priority_and_max_attempts() {
+        let conn = db();
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, ?1, ?2, NULL)",
+                (0.0_f64, 3.0_f64),
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn ack_accepts_a_real_job_id() {
+        let conn = db();
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let _: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('emails', 'w1', 8, 300)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let acked: i64 = conn
+            .query_row("SELECT honker_ack(?1, 'w1')", [id as f64], |r| r.get(0))
+            .unwrap();
+        assert_eq!(acked, 1, "a REAL job id must ack the same row");
+    }
+
+    // Coercion is not rounding. A fractional argument is a caller
+    // mistake and has to stay an error.
+    #[test]
+    fn fractional_reals_are_still_rejected() {
+        let conn = db();
+        let err = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, ?1, 3, NULL)",
+                [1.5_f64],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a whole number") && msg.contains("fractional part"),
+            "expected a message naming the value and why, got: {err}"
+        );
+    }
+
+    #[test]
+    fn null_optional_args_stay_none() {
+        let conn = db();
+        // expires is the argument where None and Some(0) actually
+        // differ in the stored row: `expires.map(|e| now + e)` writes
+        // NULL for None and `now` for Some(0). run_at and delay both
+        // collapse to `now` either way, so neither can discriminate.
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expires_at: Option<i64> = conn
+            .query_row(
+                "SELECT expires_at FROM _honker_live WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            expires_at, None,
+            "a NULL expires argument must stay None, not become Some(0)"
+        );
+    }
+
+    #[test]
+    fn whole_real_delay_coerces() {
+        let conn = db();
+        let now: i64 = conn
+            .query_row("SELECT unixepoch()", [], |r| r.get(0))
+            .unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, ?1, 0, 3, NULL)",
+                [30.0_f64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let run_at: i64 = conn
+            .query_row("SELECT run_at FROM _honker_live WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            (run_at - (now + 30)).abs() <= 1,
+            "a REAL delay of 30.0 must schedule now + 30, got {run_at} (now = {now})"
+        );
+    }
+
+    // The bounds in real_to_i64 are the part most likely to be wrong,
+    // so pin every edge rather than trusting the comparison reads right.
+    #[test]
+    fn real_bounds_are_exact() {
+        let conn = db();
+        let probe = |v: f64| -> Result<i64, rusqlite::Error> {
+            conn.query_row("SELECT honker_ack(?1, 'w1')", [v], |r| r.get::<_, i64>(0))
+        };
+
+        // 2^63 is not representable as i64; i64::MAX as f64 rounds up to
+        // it, which is why the check is `f < LIMIT` and not `<=`.
+        assert!(
+            probe(9_223_372_036_854_775_808.0).is_err(),
+            "2^63 must reject"
+        );
+        // Largest f64 strictly below 2^63.
+        assert!(
+            probe(9_223_372_036_854_774_784.0).is_ok(),
+            "2^63-1024 must pass"
+        );
+        // -2^63 is exactly i64::MIN and must pass.
+        assert!(
+            probe(-9_223_372_036_854_775_808.0).is_ok(),
+            "-2^63 must pass"
+        );
+        assert!(probe(f64::INFINITY).is_err(), "infinity must reject");
+        assert!(probe(f64::NEG_INFINITY).is_err(), "-infinity must reject");
+        assert!(probe(f64::NAN).is_err(), "NaN must reject");
+        // Negative zero is whole and must coerce to 0, not error.
+        assert!(probe(-0.0).is_ok(), "-0.0 must pass");
+    }
 }

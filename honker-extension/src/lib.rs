@@ -108,7 +108,7 @@ fn attach_watcher_sql_functions(conn: &Connection) -> Result<()> {
         |ctx| {
             let db_path: String = ctx.get(0)?;
             let backend: Option<String> = ctx.get(1)?;
-            let poll_interval_ms: Option<i64> = ctx.get(2)?;
+            let poll_interval_ms: Option<i64> = honker_core::arg_opt_i64(ctx, 2)?;
             let poll_interval_ms = poll_interval_ms.map(|ms| ms.max(0) as u64);
             let handle = open_watcher_handle(&db_path, backend.as_deref(), poll_interval_ms)
                 .map_err(|e| {
@@ -124,8 +124,8 @@ fn attach_watcher_sql_functions(conn: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            let id: i64 = ctx.get(0)?;
-            let timeout_ms: i64 = ctx.get(1)?;
+            let id: i64 = honker_core::arg_i64(ctx, 0)?;
+            let timeout_ms: i64 = honker_core::arg_i64(ctx, 1)?;
             let Some(handle) = SQL_WATCHERS.lock().unwrap().remove(&(id as u64)) else {
                 return Ok(-1);
             };
@@ -149,7 +149,7 @@ fn attach_watcher_sql_functions(conn: &Connection) -> Result<()> {
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            let id: i64 = ctx.get(0)?;
+            let id: i64 = honker_core::arg_i64(ctx, 0)?;
             if let Some(handle) = SQL_WATCHERS.lock().unwrap().remove(&(id as u64)) {
                 handle.shared.unsubscribe(handle.sub_id);
                 let _ = handle.shared.close();
