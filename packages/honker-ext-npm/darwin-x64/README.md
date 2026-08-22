@@ -1,0 +1,18 @@
+# @russellthehippo/honker-ext-darwin-x64
+
+The Honker SQLite loadable extension (`libhonker_ext.dylib`) for `darwin-x64`.
+
+You do not install this directly. It arrives as an optional
+dependency of `@russellthehippo/honker-node` or
+`@russellthehippo/honker-bun`, which pick the right platform
+automatically.
+
+To load Honker onto a SQLite connection you already own:
+
+```js
+const { extensionPath } = require('@russellthehippo/honker-node/extension');
+db.loadExtension(extensionPath());
+db.prepare('SELECT honker_bootstrap()').run();
+```
+
+Full docs: https://honker.dev

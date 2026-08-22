@@ -22,6 +22,61 @@ extension.
 | JVM `dev.honker:honker` | local + clean consumer | yes | yes | yes | yes | yes | shared JVM watcher |
 | Kotlin `dev.honker:honker-kotlin` | local + clean consumer | wrapper | Flow wrapper | wrapper | wrapper | wrapper | JVM wrapper |
 
+## Extension Reach
+
+Every binding can `open()` a database. A binding must also be able to
+say where the loadable extension is, so callers can load Honker onto a
+connection they already own. That is what ORM users need: enqueueing
+outside the application's transaction loses atomicity.
+
+| Binding | Ships the extension | Path accessor |
+| --- | --- | --- |
+| Python `honker` | wheel | `extension_info()`, `load_extension(conn)` |
+| Node `@russellthehippo/honker-node` | `honker-ext-*` npm packages | `extensionPath()`, `extensionInfo()` |
+| Bun `@russellthehippo/honker-bun` | `honker-ext-*` npm packages | `extensionPath()`, `extensionInfo()` |
+| Ruby `honker` | platform gems | `Honker.extension_path`, `Honker.load_extension` |
+| .NET `Honker` | NuGet native assets | `HonkerExtension.Locate()` |
+| JVM `dev.honker:honker` | jar resources | `HonkerExtension.path()` |
+| Kotlin `dev.honker:honker-kotlin` | jar resources | inherits the JVM class |
+| Go | no — download it | `honker.ExtensionPath()` |
+| Elixir `honker` | no — download it | `Honker.Extension.path/0` |
+| C++ | links the static lib | n/a |
+| Rust `honker` | crate dependency | n/a |
+
+Contract, in every language:
+
+- An explicit path argument wins where the binding has one, then
+  `HONKER_EXTENSION_PATH`, then the bundled copy, then an error naming
+  every path searched.
+- A set-but-missing `HONKER_EXTENSION_PATH` is an error, never a
+  fall-through to the bundled copy. A wrong override is a
+  configuration mistake and silently loading something else hides it.
+- The bundled-copy step differs by ecosystem and is the one part that
+  is not identical: Node and Bun resolve the platform package then
+  walk up to the first `node_modules`; Python checks `_lib` then walks
+  up; Ruby checks the gem's `lib/honker`; .NET and the JVM check their
+  packaged native assets; Go checks the executable's directory then
+  the working directory; Elixir checks the working directory then
+  `priv/`.
+- The entry point is always `sqlite3_honkerext_init`.
+- The accessor must not require loading the binding's native code. A
+  caller asking for a path string already has their own SQLite in the
+  process and must not get a second one.
+
+`packages/honker/python/honker/__init__.py` is the reference
+implementation.
+
+The file name is load-bearing. When no entry point is given, SQLite
+derives one from the file name, and the exact derivation varies between
+SQLite versions — `libhonker_ext-v2.dylib` resolves to
+`sqlite3_honkerextv2_init`, which does not exist. Ship the library as
+`libhonker_ext.{so,dylib}` / `honker_ext.dll`, or pass
+`sqlite3_honkerext_init` explicitly. Per-target naming belongs on the
+archive, never on the library.
+
+Go, Elixir, and C++ cannot bundle a binary idiomatically. They take it
+from a GitHub release, published by `.github/workflows/release-extension.yml`.
+
 ## Argument Types
 
 The `honker_*` SQL functions take their integer arguments the way
@@ -46,6 +101,7 @@ NaN, and values outside the range of a 64-bit integer. SQLite would
 truncate `2.7` to `2`; we do not. Rounding a job id or a retry count
 hides a caller's bug, and this is the one place being stricter than
 SQLite earns the inconsistency. The error names the value and why.
+
 
 ## Watcher Backends
 

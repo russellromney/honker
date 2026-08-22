@@ -13,7 +13,32 @@ Full docs live here:
 npm install @russellthehippo/honker-node
 ```
 
-You also need the Honker SQLite extension. Build it from the main repo or use a release artifact.
+That's everything for `honker.open()`. The native binding is
+statically linked; there is no separate extension to install.
+
+## Using Honker with an ORM
+
+If you'd rather load Honker onto a connection you already own — a
+Drizzle, Kysely, or plain better-sqlite3 handle — you need the SQLite
+loadable extension instead. It installs automatically as an optional
+dependency, and this tells you where it is:
+
+```js
+const Database = require("better-sqlite3");
+const { extensionPath } = require("@russellthehippo/honker-node/extension");
+
+const db = new Database("app.db");
+db.loadExtension(extensionPath());
+db.prepare("SELECT honker_bootstrap()").run();
+```
+
+Now `honker_enqueue()` runs inside your own transactions, which is the
+point — enqueueing outside them loses atomicity.
+
+Set `HONKER_EXTENSION_PATH` to override. Prebuilt for macOS
+(arm64, x64) and Linux (x64, arm64, glibc); on other platforms build it
+with `cargo build --release -p honker-extension` and point
+`HONKER_EXTENSION_PATH` at the result.
 
 ## Quick start
 

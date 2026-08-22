@@ -65,11 +65,32 @@ jobs:
           }
           JS
 
+      - name: Build SQLite extension
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Same features the .node gets, so the extension and the addon
+          # agree on which watcher backends exist.
+          cargo build --locked --release -p honker-extension \
+            --features kernel-watcher,shm-fast-path \
+            --target "$RUST_TARGET"
+          case "$PLATFORM" in
+            darwin-*) libname=libhonker_ext.dylib ;;
+            *) libname=libhonker_ext.so ;;
+          esac
+          src="target/$RUST_TARGET/release/$libname"
+          test -f "$src"
+          cp "$src" "packages/honker-node/libhonker_ext.$PLATFORM.${libname##*.}"
+
       - name: Upload native artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: node-native-${{ matrix.platform }}
-          path: packages/honker-node/honker.${{ matrix.platform }}.node
+          path: |
+            packages/honker-node/honker.${{ matrix.platform }}.node
+            packages/honker-node/libhonker_ext.${{ matrix.platform }}.*
           if-no-files-found: error
 
   package:
@@ -98,10 +119,14 @@ jobs:
         run: |
           npm ci
           npm exec -- napi artifacts --output-dir . --npm-dir npm
+          ../../scripts/copy-node-extension.sh
           ../../scripts/proof/check-node-native-artifacts.sh honker.*.node npm/*/*.node
           node -e "require('./npm/linux-x64-gnu/honker.linux-x64-gnu.node'); console.log('linux-x64 native load ok')"
           for dir in npm/*; do
             test -f "$dir"/honker.*.node
+          done
+          for dir in ../honker-ext-npm/*; do
+            test -f "$dir"/libhonker_ext.*
           done
           package_dir="$RUNNER_TEMP/node-packages"
           mkdir -p "$package_dir"
@@ -109,6 +134,9 @@ jobs:
           npm pack --pack-destination "$package_dir"
           for dir in npm/*; do
             npm pack "./$dir" --pack-destination "$package_dir"
+          done
+          for dir in ../honker-ext-npm/*; do
+            npm pack "$dir" --pack-destination "$package_dir"
           done
           cd "$RUNNER_TEMP/node-consumer"
           npm init -y >/dev/null
@@ -137,6 +165,12 @@ jobs:
             fs.rmSync(dir, { recursive: true, force: true });
           }
           JS
+
+      - name: Prove the extension loads under better-sqlite3
+        shell: bash
+        # Same script PR CI runs, so the proof gating a release is not a
+        # second implementation that can drift from the one PRs see.
+        run: scripts/proof/node-orm-extension.sh linux-x64-gnu
 
       - name: Upload npm package artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

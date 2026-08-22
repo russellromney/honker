@@ -401,6 +401,11 @@ public sealed class Database : IDisposable
         command.ExecuteNonQuery();
     }
 
+    // Exposed through HonkerExtension.Locate so callers loading the
+    // extension onto their own connection resolve it exactly the way
+    // Open does.
+    internal static string LocateExtension(OpenOptions options) => ResolveExtensionPath(options);
+
     private static string ResolveExtensionPath(OpenOptions options)
     {
         if (!string.IsNullOrWhiteSpace(options.ExtensionPath))
@@ -411,6 +416,16 @@ public sealed class Database : IDisposable
         var envPath = Environment.GetEnvironmentVariable("HONKER_EXTENSION_PATH");
         if (!string.IsNullOrWhiteSpace(envPath))
         {
+            // A set-but-wrong override is a configuration mistake, not a
+            // reason to quietly load some other extension. Every other
+            // binding throws here.
+            if (!File.Exists(envPath))
+            {
+                throw new InvalidOperationException(
+                    $"HONKER_EXTENSION_PATH does not exist: {envPath}"
+                );
+            }
+
             return envPath;
         }
 

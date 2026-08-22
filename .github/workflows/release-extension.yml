@@ -1,0 +1,181 @@
+name: Release · SQLite extension
+
+# Builds libhonker_ext for every supported target and attaches the
+# binaries to a GitHub Release.
+#
+# Go, C++, and Elixir have no package that can bundle the extension, so
+# a download is the only way they get it. The docs have promised these
+# artifacts for a while; this is the workflow that makes that true.
+#
+# Usage:
+#   git tag ext-v0.4.0 && git push origin ext-v0.4.0
+
+on:
+  push:
+    tags:
+      - "ext-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: extension · ${{ matrix.target }}
+    timeout-minutes: 25
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            libname: libhonker_ext.so
+            native: true
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            libname: libhonker_ext.so
+            native: true
+          - target: macos-x64
+            os: macos-latest
+            rust_target: x86_64-apple-darwin
+            libname: libhonker_ext.dylib
+            native: false
+          - target: macos-arm64
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+            libname: libhonker_ext.dylib
+            native: true
+          - target: windows-x64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            libname: honker_ext.dll
+            native: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: |
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
+
+      - name: Build extension
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          LIBNAME: ${{ matrix.libname }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release -p honker-extension \
+            --features kernel-watcher,shm-fast-path \
+            --target "$RUST_TARGET"
+          src="target/$RUST_TARGET/release/$LIBNAME"
+          test -f "$src"
+
+          # The file inside the archive keeps the canonical name.
+          # SQLite derives the entry point from the file name, so
+          # anything else makes load_extension() fail unless the caller
+          # passes sqlite3_honkerext_init by hand. Per-target naming
+          # goes on the archive, never on the library.
+          mkdir -p "stage/$TARGET" dist
+          cp "$src" "stage/$TARGET/$LIBNAME"
+          tar -czf "dist/honker-ext-${TARGET}.tar.gz" -C "stage/$TARGET" "$LIBNAME"
+
+      - name: Prove the archived extension still loads
+        shell: bash
+        env:
+          LIBNAME: ${{ matrix.libname }}
+          TARGET: ${{ matrix.target }}
+          NATIVE: ${{ matrix.native }}
+        run: |
+          mkdir -p verify
+          tar -xzf "dist/honker-ext-${TARGET}.tar.gz" -C verify
+
+          # Structural check, every leg, no skip path. SQLite derives the
+          # entry point from the file name, so the archive must contain
+          # the canonical name and nothing else. Shipping
+          # libhonker_ext-macos-arm64.dylib derives
+          # sqlite3_honkerextmacosarm64_init and cannot load.
+          actual="$(tar -tzf "dist/honker-ext-${TARGET}.tar.gz")"
+          if [[ "$actual" != "$LIBNAME" ]]; then
+            echo "archive must contain exactly $LIBNAME, got: $actual" >&2
+            exit 1
+          fi
+
+          # Real load, on the legs where the runner can execute the
+          # artifact. macos-x64 is cross-compiled on an arm64 runner and
+          # cannot be dlopen'd here; the structural check above is what
+          # covers that leg.
+          if [[ "$NATIVE" != "true" ]]; then
+            echo "cross-compiled leg: structural check only, cannot dlopen $TARGET here"
+            exit 0
+          fi
+          # Install from the pinned lockfile the ORM proofs use, so
+          # this does not resolve a fresh better-sqlite3 on every run.
+          cp scripts/proof/orm/js/package.json scripts/proof/orm/js/package-lock.json verify/
+          (cd verify && npm ci --no-audit --no-fund >/dev/null)
+          NODE_PATH="verify/node_modules" node - <<'JS'
+          const assert = require('node:assert/strict');
+          const path = require('node:path');
+          const Database = require(require.resolve('better-sqlite3', {
+            paths: [path.resolve('verify')],
+          }));
+          const lib = path.resolve('verify', process.env.LIBNAME);
+          const db = new Database(':memory:');
+          // No entry point argument on purpose: filename derivation is
+          // the thing under test.
+          db.loadExtension(lib);
+          assert.equal(db.prepare('SELECT honker_bootstrap() AS r').get().r, 1);
+          console.log(`archived extension loads by filename derivation: ${lib}`);
+          JS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: extension-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: extension-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksum
+        run: |
+          cd dist
+          ls -1
+          # Five targets in the matrix; anything less means a silent drop.
+          test "$(ls -1 honker-ext-*.tar.gz | wc -l)" -eq 5
+          sha256sum honker-ext-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/ext-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Honker SQLite extension $TAG" \
+            --generate-notes \
+            dist/*

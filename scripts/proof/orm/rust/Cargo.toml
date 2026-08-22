@@ -1,0 +1,14 @@
+[package]
+name = "honker-orm-proof-sqlx"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone on purpose: this proves the documented sqlx recipe from a
+# consumer's position, not from inside the workspace.
+[workspace]
+
+[dependencies]
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

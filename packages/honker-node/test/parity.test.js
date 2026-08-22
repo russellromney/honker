@@ -624,7 +624,25 @@ test('claimWaker: wakes when runAt deadline arrives', { timeout: 12_000 }, async
       new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
     ]);
     const dt = Date.now() - t0;
-    assert.ok(job, 'claimWaker timed out waiting for runAt job');
+    if (!job) {
+      // Windows-only so far; does not reproduce on macOS or Linux.
+      // Report the state that decides the wait so the next failure says
+      // why. nextClaimAt of 0 means the waker fell back to idlePollS,
+      // which is a different bug from the deadline being computed wrong.
+      const diag = {
+        runAt,
+        msUntilDue,
+        waitedMs: dt,
+        now: Math.floor(Date.now() / 1000),
+        nextClaimAt: db._callScalar('SELECT honker_queue_next_claim_at(?)', ['deadline']),
+        unixepoch: db._callScalar('SELECT unixepoch()'),
+        journalMode: db._callScalar('PRAGMA journal_mode'),
+        pending: db._callScalar(
+          "SELECT count(*) FROM _honker_live WHERE queue = 'deadline' AND state = 'pending'",
+        ),
+      };
+      assert.fail(`claimWaker timed out waiting for runAt job: ${JSON.stringify(diag)}`);
+    }
     assert.deepEqual(job.payload, { hello: 'future' });
     assert.ok(
       dt >= Math.max(0, msUntilDue - 250),

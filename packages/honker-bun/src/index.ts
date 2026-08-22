@@ -14,6 +14,14 @@
 import { Database as BunDB } from "bun:sqlite";
 import { dlopen, FFIType } from "bun:ffi";
 
+// Loading Honker onto a bun:sqlite handle you already own — see
+// ./extension.ts. Re-exported so ORM users import from one place.
+export {
+  EXTENSION_ENTRYPOINT,
+  extensionInfo,
+  extensionPath,
+} from "./extension";
+
 // ---------------------------------------------------------------------
 // SQLite lib shim (Bun's bundled SQLite lacks loadable-extension support)
 // ---------------------------------------------------------------------
