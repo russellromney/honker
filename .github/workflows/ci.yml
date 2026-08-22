@@ -620,7 +620,10 @@ jobs:
           java-version: "17"
           cache: maven
       - name: Build honker-extension
-        run: cargo build --locked --release -p honker-extension
+        # The binding's kernel-listener tests need the experimental
+        # backends compiled in, the same way the python, dotnet and
+        # binding-smoke jobs build it.
+        run: cargo build --locked --release -p honker-extension --features kernel-watcher,shm-fast-path
       - name: Build and install dev.honker:honker
         working-directory: packages/honker-jvm
         run: mvn -B -q -DskipTests install
