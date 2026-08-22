@@ -79,8 +79,15 @@ function candidates() {
 
   // In-repo build, so the bindings' own tests and anyone hacking on the
   // repo resolve without publishing anything.
+  //
+  // Bounded on purpose. Walking to the filesystem root means an
+  // installed package under a world-writable ancestor (/tmp/build/...)
+  // would load /tmp/target/release/libhonker_ext.so if someone planted
+  // one. Stop at the first node_modules — past that we are outside the
+  // project and no longer looking at a build tree we own.
   for (let dir = __dirname; ; ) {
     found.push(path.join(dir, 'target', 'release', filename));
+    if (path.basename(dir) === 'node_modules') break;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -108,9 +115,12 @@ function extensionPath() {
   }
 
   const pkg = platformPackage();
+  // You cannot reach this message without honker-node installed, so
+  // "install honker-node" is never the answer. Name the things that
+  // actually drop an optional dependency.
   const hint = pkg
-    ? `Install @russellthehippo/honker-node so the optional dependency ${pkg} comes with it, or set HONKER_EXTENSION_PATH.`
-    : `No Honker extension is published for ${process.platform}-${process.arch}. Build it with \`cargo build --release -p honker-extension\` and set HONKER_EXTENSION_PATH.`;
+    ? `Expected the optional dependency ${pkg}. It is missing, which usually means the install used --omit=optional or --no-optional, the lockfile was built on a different platform, or the registry mirror does not carry it. Reinstall, or set HONKER_EXTENSION_PATH to a libhonker_ext you have.`
+    : `No Honker extension is published for ${process.platform}-${process.arch}${isMusl() ? ' (musl)' : ''}. Build it with \`cargo build --release -p honker-extension\` and set HONKER_EXTENSION_PATH.`;
   throw new Error(`Honker SQLite extension not found. ${hint}\nSearched:\n  ${searched.join('\n  ')}`);
 }
 

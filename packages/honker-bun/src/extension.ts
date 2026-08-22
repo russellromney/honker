@@ -14,7 +14,7 @@
 
 import { existsSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -42,11 +42,33 @@ function platformPackage(): string | null {
     return null;
   }
   if (platform === "linux") {
+    // Only glibc builds are published. Without this guard, Alpine
+    // resolves the -gnu package and extensionPath() hands back a .so
+    // that cannot load — bun install does not honour the `libc` field
+    // the way npm does, so the package may well be present.
+    if (isMusl()) return null;
     if (arch === "x64") return "@russellthehippo/honker-ext-linux-x64-gnu";
     if (arch === "arm64") return "@russellthehippo/honker-ext-linux-arm64-gnu";
     return null;
   }
   return null;
+}
+
+function isMusl(): boolean {
+  if (process.platform !== "linux") return false;
+  const report =
+    typeof process.report?.getReport === "function"
+      ? (process.report.getReport() as Record<string, unknown>)
+      : null;
+  const header = report?.header as { glibcVersionRuntime?: string } | undefined;
+  if (header?.glibcVersionRuntime) return false;
+  const shared = report?.sharedObjects;
+  if (Array.isArray(shared)) {
+    return shared.some(
+      (f) => typeof f === "string" && (f.includes("libc.musl-") || f.includes("ld-musl-")),
+    );
+  }
+  return false;
 }
 
 function candidates(): string[] {
@@ -62,9 +84,13 @@ function candidates(): string[] {
     }
   }
 
+  // Bounded at the first node_modules — see the note in
+  // packages/honker-node/extension.js. Walking to the filesystem root
+  // can pick up a planted library under a world-writable ancestor.
   let dir = dirname(fileURLToPath(import.meta.url));
   for (;;) {
     found.push(join(dir, "target", "release", filename));
+    if (basename(dir) === "node_modules") break;
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -96,7 +122,7 @@ export function extensionPath(): string {
 
   const pkg = platformPackage();
   const hint = pkg
-    ? `Install @russellthehippo/honker-bun so the optional dependency ${pkg} comes with it, or set HONKER_EXTENSION_PATH.`
+    ? `Expected the optional dependency ${pkg}. It is missing, which usually means the install skipped optional dependencies, the lockfile was built on a different platform, or the registry mirror does not carry it. Reinstall, or set HONKER_EXTENSION_PATH to a libhonker_ext you have.`
     : `No Honker extension is published for ${process.platform}-${process.arch}. Build it with \`cargo build --release -p honker-extension\` and set HONKER_EXTENSION_PATH.`;
   throw new Error(
     `Honker SQLite extension not found. ${hint}\nSearched:\n  ${searched.join("\n  ")}`,

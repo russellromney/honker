@@ -15,9 +15,20 @@ const { test } = require('node:test');
 const ext = require('../extension.js');
 
 test('entrypoint matches the symbol honker-extension exports', () => {
-  // honker-extension/src/lib.rs declares sqlite3_honkerext_init. If that
-  // symbol is ever renamed, this constant has to move with it.
-  assert.equal(ext.EXTENSION_ENTRYPOINT, 'sqlite3_honkerext_init');
+  // Read the Rust rather than restating the string. Asserting the
+  // constant equals its own literal proves nothing: renaming the export
+  // would leave that version of this test green.
+  const libRs = fs.readFileSync(
+    path.resolve(__dirname, '..', '..', '..', 'honker-extension', 'src', 'lib.rs'),
+    'utf8',
+  );
+  const exported = libRs.match(/pub unsafe extern "C" fn (sqlite3_\w+_init)/);
+  assert.ok(exported, 'no sqlite3_*_init entry point found in honker-extension/src/lib.rs');
+  assert.equal(
+    ext.EXTENSION_ENTRYPOINT,
+    exported[1],
+    'extension.js and honker-extension disagree on the entry point symbol',
+  );
 });
 
 test('HONKER_EXTENSION_PATH wins when the file exists', () => {

@@ -30,7 +30,10 @@ final class NativeLoader {
             if (Files.isRegularFile(p)) {
                 return p;
             }
-            searched.add(p);
+            // Matches the explicit-path branch above and every other
+            // binding: a set-but-wrong override fails loudly rather
+            // than falling through to the packaged copy.
+            throw new HonkerLoadException("HONKER_EXTENSION_PATH does not exist: " + p);
         }
 
         Path packaged = extractPackaged();

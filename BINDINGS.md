@@ -43,11 +43,21 @@ outside the application's transaction loses atomicity.
 | C++ | links the static lib | n/a |
 | Rust `honker` | crate dependency | n/a |
 
-Contract, identical in every language:
+Contract, in every language:
 
-- Resolution order is `HONKER_EXTENSION_PATH`, then the bundled copy,
-  then an error naming every path searched. Never guess, never fall
-  back silently.
+- An explicit path argument wins where the binding has one, then
+  `HONKER_EXTENSION_PATH`, then the bundled copy, then an error naming
+  every path searched.
+- A set-but-missing `HONKER_EXTENSION_PATH` is an error, never a
+  fall-through to the bundled copy. A wrong override is a
+  configuration mistake and silently loading something else hides it.
+- The bundled-copy step differs by ecosystem and is the one part that
+  is not identical: Node and Bun resolve the platform package then
+  walk up to the first `node_modules`; Python checks `_lib` then walks
+  up; Ruby checks the gem's `lib/honker`; .NET and the JVM check their
+  packaged native assets; Go checks the executable's directory then
+  the working directory; Elixir checks the working directory then
+  `priv/`.
 - The entry point is always `sqlite3_honkerext_init`.
 - The accessor must not require loading the binding's native code. A
   caller asking for a path string already has their own SQLite in the

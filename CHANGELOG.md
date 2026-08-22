@@ -25,20 +25,29 @@ users reach for the extension.
 - `release-extension.yml` publishes `libhonker_ext` for five targets to
   GitHub Releases on `ext-v*` tags. The repo had none, while three doc
   pages told people to download from a release page.
-- Integer SQL arguments now accept whole `REAL` values.
-  `better-sqlite3` binds every JavaScript number as `REAL`, so the
-  `Queue` wrapper published on honker.dev failed on its first call with
-  `Invalid function parameter type Real at index 4`. Fractional values
-  are still rejected rather than rounded.
+- Depends on the `REAL` argument coercion in PR #101. `better-sqlite3`
+  binds every JavaScript number as `REAL`, so without it the `Queue`
+  wrapper published on honker.dev fails on its first call with
+  `Invalid function parameter type Real at index 4`. The acceptance
+  proof here binds its parameters and fails without that change, which
+  is the intended ordering.
 - The contract is written down in `BINDINGS.md`:
   `HONKER_EXTENSION_PATH`, then bundled, then a loud error; entrypoint
   always `sqlite3_honkerext_init`; the accessor never loads native code.
 
-Proof: a clean-consumer job in `release-node.yml` installs the packed
-tarballs with `better-sqlite3` and round-trips enqueue → claim → ack
-through raw SQL. It reads nothing from `target/release` and has no skip
-path, unlike `tests/test_extension_interop.py`, which skips when the
-build tree is empty and is how this shipped broken.
+Proof: `scripts/proof/node-orm-extension.sh` installs the packed
+tarballs into a clean project with `better-sqlite3` and round-trips
+enqueue → claim → ack through raw SQL, with every numeric argument
+bound rather than written as a literal. Both `ci.yml` and
+`release-node.yml` call it, so PRs run the same check that gates a
+release. It reads nothing from `target/release` and has no skip path,
+unlike `tests/test_extension_interop.py`, which skips when the build
+tree is empty and is how this shipped broken.
+
+Publish order, which the `optionalDependencies` pins require: the four
+`honker-ext-*` packages first, then `honker-node@0.4.6` and
+`honker-bun@0.4.2`. `scripts/proof/check-ext-version-alignment.py`
+guards the pins.
 
 ## Unreleased — schedule lifecycle + job cancel (Phase Mantle)
 
