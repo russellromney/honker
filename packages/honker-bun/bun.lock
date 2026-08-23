@@ -4,12 +4,26 @@
   "workspaces": {
     "": {
       "name": "@russellthehippo/honker-bun",
+      "optionalDependencies": {
+        "@russellthehippo/honker-ext-darwin-arm64": "0.4.6",
+        "@russellthehippo/honker-ext-darwin-x64": "0.4.6",
+        "@russellthehippo/honker-ext-linux-arm64-gnu": "0.4.6",
+        "@russellthehippo/honker-ext-linux-x64-gnu": "0.4.6",
+      },
       "peerDependencies": {
         "typescript": "^5",
       },
     },
   },
   "packages": {
+    "@russellthehippo/honker-ext-darwin-arm64": ["@russellthehippo/honker-ext-darwin-arm64@0.4.6", "", { "os": "darwin", "cpu": "arm64" }, "sha512-WAGssCw2kA5Qlbv2c0PzNwpx9BLmB2Rmf4aovQjGXxP8kI496o2y5VnTnTKBgOi0TWvVLYVYa1PKfrng/UC8sg=="],
+
+    "@russellthehippo/honker-ext-darwin-x64": ["@russellthehippo/honker-ext-darwin-x64@0.4.6", "", { "os": "darwin", "cpu": "x64" }, "sha512-gGlEGPgiFbysF/NFb88PYY8PMZjXI6T7oqH2O2FSRu5ktwkSQUyELID9G/zC9Wi5blw/Hx1iTsI3hQl1rcRfkQ=="],
+
+    "@russellthehippo/honker-ext-linux-arm64-gnu": ["@russellthehippo/honker-ext-linux-arm64-gnu@0.4.6", "", { "os": "linux", "cpu": "arm64" }, "sha512-1SpEfmAlvG9dgIXFHkYWHdp8cyaqZdnEoupmVvuOe7ecXwQUzNCeBsATFGD737fE+BfrrV0yUPI3cfx07uB5AQ=="],
+
+    "@russellthehippo/honker-ext-linux-x64-gnu": ["@russellthehippo/honker-ext-linux-x64-gnu@0.4.6", "", { "os": "linux", "cpu": "x64" }, "sha512-cqD9kAn01tTNdIM+DxJ1ZlNuCan7PM2hO1ZXxSmPkR5SZ93APz+4SKLvmnBkWtVKz4Z95W0yzUY6Lmag6uCG+g=="],
+
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
   }
 }
