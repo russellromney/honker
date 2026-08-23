@@ -16,7 +16,7 @@
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <honker.version>0.4.0</honker.version>
+    <honker.version>0.5.0</honker.version>
     <sqlite-jdbc.version>3.53.2.1</sqlite-jdbc.version>
     <hibernate.version>6.6.4.Final</hibernate.version>
     <jooq.version>3.19.18</jooq.version>
