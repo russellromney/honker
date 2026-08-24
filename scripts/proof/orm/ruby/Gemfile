@@ -4,3 +4,7 @@ source "https://rubygems.org"
 
 gem "activerecord", "~> 8.0"
 gem "sqlite3", "~> 2.6"
+# Ruby 4 dropped fiddle from default gems. The honker gem uses it to
+# resolve the bundled extension. CI's 3.4 still has it; this keeps the
+# proof runnable on 4.
+gem "fiddle"

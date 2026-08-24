@@ -1,0 +1,391 @@
+{
+  "functions": [
+    "honker_enqueue",
+    "honker_claim_batch",
+    "honker_ack",
+    "honker_ack_batch",
+    "honker_retry",
+    "honker_fail",
+    "honker_heartbeat",
+    "honker_sweep_expired",
+    "honker_queue_next_claim_at",
+    "honker_cancel",
+    "honker_get_job",
+    "honker_stream_publish",
+    "honker_stream_read_since",
+    "honker_stream_save_offset",
+    "honker_stream_get_offset",
+    "notify",
+    "honker_scheduler_register",
+    "honker_scheduler_unregister",
+    "honker_scheduler_tick",
+    "honker_scheduler_soonest",
+    "honker_scheduler_pause",
+    "honker_scheduler_resume",
+    "honker_scheduler_list",
+    "honker_scheduler_update",
+    "honker_cron_next_after",
+    "honker_lock_acquire",
+    "honker_lock_release",
+    "honker_lock_renew",
+    "honker_rate_limit_try",
+    "honker_rate_limit_sweep",
+    "honker_result_save",
+    "honker_result_get",
+    "honker_result_sweep"
+  ],
+  "steps": [
+    {
+      "id": "enqueue",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL)",
+      "args": ["$ns:q", "{\"to\":\"alice@example.com\"}", 0, 3],
+      "store": "job_id",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "get_job",
+      "sql": "SELECT honker_get_job(?)",
+      "args": ["$job_id"],
+      "expect": {"kind": "contains", "s": "alice@example.com"}
+    },
+    {
+      "id": "claim",
+      "sql": "SELECT honker_claim_batch(?, ?, ?, ?)",
+      "args": ["$ns:q", "w1", 8, 300],
+      "expect": {"kind": "json_id_eq_ref", "ref": "job_id"}
+    },
+    {
+      "id": "heartbeat",
+      "sql": "SELECT honker_heartbeat(?, ?, ?)",
+      "args": ["$job_id", "w1", 60],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "ack",
+      "sql": "SELECT honker_ack(?, ?)",
+      "args": ["$job_id", "w1"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "get_job_after_ack",
+      "sql": "SELECT honker_get_job(?)",
+      "args": ["$job_id"],
+      "expect": {"kind": "empty_string"}
+    },
+    {
+      "id": "enqueue_opts",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, ?, ?, ?, ?)",
+      "args": ["$ns:q", "{\"to\":\"bob@example.com\"}", 0, 10, 3, 3600],
+      "store": "job_opt",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "claim_opts",
+      "sql": "SELECT honker_claim_batch(?, ?, ?, ?)",
+      "args": ["$ns:q", "w1", 8, 300],
+      "expect": {"kind": "json_id_eq_ref", "ref": "job_opt"}
+    },
+    {
+      "id": "ack_opts",
+      "sql": "SELECT honker_ack(?, ?)",
+      "args": ["$job_opt", "w1"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "enqueue_retry",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL)",
+      "args": ["$ns:qr", "{\"n\":1}", 0, 2],
+      "store": "job_r",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "claim_retry",
+      "sql": "SELECT honker_claim_batch(?, ?, ?, ?)",
+      "args": ["$ns:qr", "w1", 8, 300],
+      "expect": {"kind": "json_id_eq_ref", "ref": "job_r"}
+    },
+    {
+      "id": "retry",
+      "sql": "SELECT honker_retry(?, ?, ?, ?)",
+      "args": ["$job_r", "w1", 0, "transient"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "reclaim",
+      "sql": "SELECT honker_claim_batch(?, ?, ?, ?)",
+      "args": ["$ns:qr", "w1", 8, 300],
+      "expect": {"kind": "json_id_eq_ref", "ref": "job_r"}
+    },
+    {
+      "id": "fail",
+      "sql": "SELECT honker_fail(?, ?, ?)",
+      "args": ["$job_r", "w1", "permanent"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "enqueue_cancel",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL)",
+      "args": ["$ns:qc", "{\"n\":1}", 0, 3],
+      "store": "job_c",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "cancel",
+      "sql": "SELECT honker_cancel(?)",
+      "args": ["$job_c"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "cancel_idempotent",
+      "sql": "SELECT honker_cancel(?)",
+      "args": ["$job_c"],
+      "expect": {"kind": "int_eq", "n": 0}
+    },
+    {
+      "id": "get_cancelled",
+      "sql": "SELECT honker_get_job(?)",
+      "args": ["$job_c"],
+      "expect": {"kind": "empty_string"}
+    },
+    {
+      "id": "claim_cancelled",
+      "sql": "SELECT honker_claim_batch(?, ?, ?, ?)",
+      "args": ["$ns:qc", "w1", 8, 300],
+      "expect": {"kind": "json_len", "n": 0}
+    },
+    {
+      "id": "enqueue_b1",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL)",
+      "args": ["$ns:qb", "{\"i\":1}", 0, 3],
+      "store": "b1",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "enqueue_b2",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL)",
+      "args": ["$ns:qb", "{\"i\":2}", 0, 3],
+      "store": "b2",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "claim_batch",
+      "sql": "SELECT honker_claim_batch(?, ?, ?, ?)",
+      "args": ["$ns:qb", "w1", 8, 300],
+      "expect": {"kind": "json_len", "n": 2}
+    },
+    {
+      "id": "ack_batch",
+      "sql": "SELECT honker_ack_batch(?, ?)",
+      "args": ["$json:b1,b2", "w1"],
+      "expect": {"kind": "int_eq", "n": 2}
+    },
+    {
+      "id": "enqueue_expired",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, ?)",
+      "args": ["$ns:qe", "{\"i\":1}", 0, 3, -1],
+      "store": "job_e",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "sweep_expired",
+      "sql": "SELECT honker_sweep_expired(?)",
+      "args": ["$ns:qe"],
+      "expect": {"kind": "int_ge", "n": 1}
+    },
+    {
+      "id": "next_claim_at",
+      "sql": "SELECT honker_queue_next_claim_at(?)",
+      "args": ["$ns:qe"],
+      "expect": {"kind": "int_ge", "n": 0}
+    },
+    {
+      "id": "notify",
+      "sql": "SELECT notify(?, ?)",
+      "args": ["$ns:ch", "{\"id\":42}"],
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "stream_publish",
+      "sql": "SELECT honker_stream_publish(?, ?, ?)",
+      "args": ["$ns:topic", null, "{\"e\":1}"],
+      "store": "off1",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "stream_publish_key",
+      "sql": "SELECT honker_stream_publish(?, ?, ?)",
+      "args": ["$ns:topic", "k1", "{\"e\":2}"],
+      "store": "off2",
+      "expect": {"kind": "int_gt_ref", "ref": "off1"}
+    },
+    {
+      "id": "stream_read",
+      "sql": "SELECT honker_stream_read_since(?, ?, ?)",
+      "args": ["$ns:topic", 0, 10],
+      "expect": {"kind": "json_len", "n": 2}
+    },
+    {
+      "id": "stream_save_offset",
+      "sql": "SELECT honker_stream_save_offset(?, ?, ?)",
+      "args": ["$ns:cons", "$ns:topic", "$off1"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "stream_get_offset",
+      "sql": "SELECT honker_stream_get_offset(?, ?)",
+      "args": ["$ns:cons", "$ns:topic"],
+      "expect": {"kind": "eq_ref", "ref": "off1"}
+    },
+    {
+      "id": "cron_next",
+      "sql": "SELECT honker_cron_next_after(?, ?)",
+      "args": ["@every 1s", 1000],
+      "expect": {"kind": "int_gt", "n": 1000}
+    },
+    {
+      "id": "sched_register",
+      "sql": "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?, ?)",
+      "args": ["$ns:sched", "$ns:sq", "@every 60s", "{\"ok\":true}", 0, null, 3],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "sched_soonest",
+      "sql": "SELECT honker_scheduler_soonest()",
+      "args": [],
+      "store": "boundary",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "sched_tick",
+      "sql": "SELECT honker_scheduler_tick(?)",
+      "args": ["$boundary"],
+      "expect": {"kind": "contains", "s": "$ns:sched"}
+    },
+    {
+      "id": "sched_list",
+      "sql": "SELECT honker_scheduler_list()",
+      "args": [],
+      "expect": {"kind": "contains", "s": "$ns:sched"}
+    },
+    {
+      "id": "sched_pause",
+      "sql": "SELECT honker_scheduler_pause(?)",
+      "args": ["$ns:sched"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "sched_resume",
+      "sql": "SELECT honker_scheduler_resume(?)",
+      "args": ["$ns:sched"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "sched_update",
+      "sql": "SELECT honker_scheduler_update(?, ?, ?, ?, ?, ?)",
+      "args": ["$ns:sched", "@every 30s", null, null, null, 0],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "sched_unregister",
+      "sql": "SELECT honker_scheduler_unregister(?)",
+      "args": ["$ns:sched"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "lock_acquire",
+      "sql": "SELECT honker_lock_acquire(?, ?, ?)",
+      "args": ["$ns:lock", "alice", 60],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "lock_held",
+      "sql": "SELECT honker_lock_acquire(?, ?, ?)",
+      "args": ["$ns:lock", "bob", 60],
+      "expect": {"kind": "int_eq", "n": 0}
+    },
+    {
+      "id": "lock_renew",
+      "sql": "SELECT honker_lock_renew(?, ?, ?)",
+      "args": ["$ns:lock", "alice", 60],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "lock_renew_other",
+      "sql": "SELECT honker_lock_renew(?, ?, ?)",
+      "args": ["$ns:lock", "bob", 60],
+      "expect": {"kind": "int_eq", "n": 0}
+    },
+    {
+      "id": "lock_release_other",
+      "sql": "SELECT honker_lock_release(?, ?)",
+      "args": ["$ns:lock", "bob"],
+      "expect": {"kind": "int_eq", "n": 0}
+    },
+    {
+      "id": "lock_release",
+      "sql": "SELECT honker_lock_release(?, ?)",
+      "args": ["$ns:lock", "alice"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "lock_reacquire",
+      "sql": "SELECT honker_lock_acquire(?, ?, ?)",
+      "args": ["$ns:lock", "bob", 60],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "lock_release_bob",
+      "sql": "SELECT honker_lock_release(?, ?)",
+      "args": ["$ns:lock", "bob"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "rate_ok_1",
+      "sql": "SELECT honker_rate_limit_try(?, ?, ?)",
+      "args": ["$ns:rl", 2, 60],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "rate_ok_2",
+      "sql": "SELECT honker_rate_limit_try(?, ?, ?)",
+      "args": ["$ns:rl", 2, 60],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "rate_blocked",
+      "sql": "SELECT honker_rate_limit_try(?, ?, ?)",
+      "args": ["$ns:rl", 2, 60],
+      "expect": {"kind": "int_eq", "n": 0}
+    },
+    {
+      "id": "rate_sweep",
+      "sql": "SELECT honker_rate_limit_sweep(?)",
+      "args": [1],
+      "expect": {"kind": "int_ge", "n": 0}
+    },
+    {
+      "id": "result_save",
+      "sql": "SELECT honker_result_save(?, ?, ?)",
+      "args": ["$job_id", "{\"ok\":true}", 0],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "result_get",
+      "sql": "SELECT honker_result_get(?)",
+      "args": ["$job_id"],
+      "expect": {"kind": "contains", "s": "ok"}
+    },
+    {
+      "id": "result_missing",
+      "sql": "SELECT honker_result_get(?)",
+      "args": [999999999],
+      "expect": {"kind": "is_null"}
+    },
+    {
+      "id": "result_sweep",
+      "sql": "SELECT honker_result_sweep()",
+      "args": [],
+      "expect": {"kind": "int_ge", "n": 0}
+    }
+  ]
+}

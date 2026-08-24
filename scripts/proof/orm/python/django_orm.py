@@ -1,8 +1,4 @@
-"""Django, as guides/orm/python.mdx shows it.
-
-Drives the real connection_created signal rather than loading the
-extension by hand, so the documented receiver is what gets exercised.
-"""
+"""Django, as guides/orm/python.mdx shows it."""
 
 import json
 import os
@@ -21,37 +17,72 @@ settings.configure(
 )
 django.setup()
 
-import honker  # noqa: E402  (must follow django.setup())
-from django.db import connection  # noqa: E402
+import honker  # noqa: E402
+from django.db import connection, transaction  # noqa: E402
 from django.db.backends.signals import connection_created  # noqa: E402
 from django.dispatch import receiver  # noqa: E402
+
+from surface import run  # noqa: E402
 
 
 @receiver(connection_created)
 def _load_honker(sender, connection, **kwargs):
     if connection.vendor != "sqlite":
         return
-    raw = connection.connection  # underlying sqlite3.Connection
+    raw = connection.connection
     honker.load_extension(raw)
     raw.execute("SELECT honker_bootstrap()")
 
 
-with connection.cursor() as cur:
-    payload = json.dumps({"to": "alice@example.com"})
-    # Django's placeholder style, with every value bound.
-    cur.execute(
-        "SELECT honker_enqueue(%s, %s, NULL, NULL, %s, %s, NULL)",
-        ["emails", payload, 0, 3],
-    )
-    job_id = cur.fetchone()[0]
-    assert job_id > 0, f"expected a job id, got {job_id}"
+def scalar(sql, args):
+    with connection.cursor() as cur:
+        cur.execute(sql.replace("?", "%s"), args)
+        row = cur.fetchone()
+        return None if row is None else row[0]
 
-    cur.execute("SELECT honker_claim_batch(%s, %s, %s, %s)", ["emails", "w1", 8, 300])
-    claimed = json.loads(cur.fetchone()[0])
-    assert len(claimed) == 1, f"expected one claimed job, got {claimed}"
-    assert claimed[0]["id"] == job_id
 
-    cur.execute("SELECT honker_ack(%s, %s)", [job_id, "w1"])
-    assert cur.fetchone()[0] == 1, "ack must match the claim"
+run(scalar, "dj")
 
+
+def prove_atomicity():
+    with connection.cursor() as cur:
+        cur.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)")
+
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            cur.execute("INSERT INTO orders (id, user_id) VALUES (%s, %s)", [42, 1])
+            cur.execute(
+                "SELECT honker_enqueue(%s, %s, NULL, NULL, %s, %s, NULL)",
+                ["dj_atomic", json.dumps({"order_id": 42}), 0, 3],
+            )
+            job_id = cur.fetchone()[0]
+
+    with connection.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM orders WHERE id = %s", [42])
+        assert cur.fetchone()[0] == 1
+        cur.execute("SELECT honker_get_job(%s)", [job_id])
+        assert "order_id" in (cur.fetchone()[0] or "")
+
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cur:
+                cur.execute("INSERT INTO orders (id, user_id) VALUES (%s, %s)", [43, 1])
+                cur.execute(
+                    "SELECT honker_enqueue(%s, %s, NULL, NULL, %s, %s, NULL)",
+                    ["dj_atomic", json.dumps({"order_id": 43}), 0, 3],
+                )
+                rolled = cur.fetchone()[0]
+            raise RuntimeError("rollback")
+    except RuntimeError as exc:
+        if str(exc) != "rollback":
+            raise
+
+    with connection.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM orders WHERE id = %s", [43])
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT honker_get_job(%s)", [rolled])
+        assert not cur.fetchone()[0]
+
+
+prove_atomicity()
 print("PASS django")

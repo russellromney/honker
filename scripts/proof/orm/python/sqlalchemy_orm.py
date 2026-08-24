@@ -1,16 +1,12 @@
-"""SQLAlchemy / SQLModel, as guides/orm/python.mdx shows it.
-
-Both share this wiring: the connect event loads the extension onto the
-raw DB-API connection. SQLModel's Session subclasses SQLAlchemy's, so
-the extension path is identical and only the wrapper on top differs.
-"""
+"""SQLAlchemy, as guides/orm/python.mdx shows it."""
 
 import json
 import os
-import sys
 
 import honker
 from sqlalchemy import create_engine, event, text
+
+from surface import qmark_to_named, run
 
 DB = os.environ["HONKER_TEST_DB"]
 engine = create_engine(f"sqlite:///{DB}")
@@ -22,33 +18,48 @@ def _load_honker(conn, _):
     conn.execute("SELECT honker_bootstrap()")
 
 
-with engine.connect() as conn:
-    # Bound parameters, not literals: SQLAlchemy's own binding layer is
-    # the thing under test, the same way better-sqlite3's REAL binding
-    # was for Node.
-    payload = json.dumps({"to": "alice@example.com"})
-    job_id = conn.execute(
-        text(
-            "SELECT honker_enqueue(:q, :p, NULL, NULL, :prio, :max, NULL) AS id"
-        ),
-        {"q": "emails", "p": payload, "prio": 0, "max": 3},
-    ).scalar_one()
-    assert job_id > 0, f"expected a job id, got {job_id}"
+def scalar(sql, args):
+    named, names = qmark_to_named(sql)
+    params = dict(zip(names, args))
+    with engine.connect() as conn:
+        result = conn.execute(text(named), params).scalar()
+        conn.commit()
+        return result
 
-    claimed = json.loads(
-        conn.execute(
-            text("SELECT honker_claim_batch(:q, :w, :n, :t) AS jobs"),
-            {"q": "emails", "w": "w1", "n": 8, "t": 300},
+
+run(scalar, "sa")
+
+
+def prove_atomicity():
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)"))
+
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO orders (id, user_id) VALUES (:id, :uid)"), {"id": 42, "uid": 1})
+        job_id = conn.execute(
+            text("SELECT honker_enqueue(:q, :p, NULL, NULL, :prio, :max, NULL)"),
+            {"q": "sa_atomic", "p": json.dumps({"order_id": 42}), "prio": 0, "max": 3},
         ).scalar_one()
-    )
-    assert len(claimed) == 1, f"expected one claimed job, got {claimed}"
-    assert claimed[0]["id"] == job_id
-    assert json.loads(claimed[0]["payload"])["to"] == "alice@example.com"
 
-    acked = conn.execute(
-        text("SELECT honker_ack(:id, :w) AS ok"), {"id": job_id, "w": "w1"}
-    ).scalar_one()
-    assert acked == 1, "ack must match the claim"
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM orders WHERE id = 42")).scalar_one() == 1
+        job = conn.execute(text("SELECT honker_get_job(:id)"), {"id": job_id}).scalar()
+        assert job and "order_id" in job
 
-print("PASS sqlalchemy", file=sys.stderr)
+    with engine.connect() as conn:
+        trans = conn.begin()
+        conn.execute(text("INSERT INTO orders (id, user_id) VALUES (:id, :uid)"), {"id": 43, "uid": 1})
+        rolled = conn.execute(
+            text("SELECT honker_enqueue(:q, :p, NULL, NULL, :prio, :max, NULL)"),
+            {"q": "sa_atomic", "p": json.dumps({"order_id": 43}), "prio": 0, "max": 3},
+        ).scalar_one()
+        trans.rollback()
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM orders WHERE id = 43")).scalar_one() == 0
+        job = conn.execute(text("SELECT honker_get_job(:id)"), {"id": rolled}).scalar()
+        assert not job
+
+
+prove_atomicity()
 print("PASS sqlalchemy")
