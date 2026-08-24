@@ -128,6 +128,37 @@ public sealed class OutboxLockTests
     }
 
     [Fact]
+    public void CommandOutsideAnOpenTransactionOnTheSameThreadRaises()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var q = db.Queue("emails");
+
+        // The transaction gate is held for the transaction's lifetime and only
+        // this thread can release it, so a command that forgets to pass the
+        // transaction would wait on itself forever. It has to raise instead.
+        // Whole scenario runs on one background thread so the test thread can
+        // fail on a timeout rather than hanging the suite.
+        var attempt = Task.Run(() =>
+        {
+            using var tx = db.BeginTransaction();
+            try
+            {
+                q.Enqueue(new { a = 1 });   // no transaction argument
+                return null;
+            }
+            catch (InvalidOperationException ex)
+            {
+                return ex.Message;
+            }
+        });
+
+        Assert.True(attempt.Wait(TimeSpan.FromSeconds(5)),
+            "deadlocked: the command waited on a gate only its own thread could release");
+        Assert.Contains("transaction is open on this thread", attempt.Result);
+    }
+
+    [Fact]
     public async Task DatabaseSerializesCommandsForTransactionLifetime()
     {
         using var harness = TestHarness.Create();

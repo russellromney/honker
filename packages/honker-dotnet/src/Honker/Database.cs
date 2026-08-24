@@ -11,6 +11,10 @@ public sealed class Database : IDisposable
     // command cannot run on the connection between Begin and Commit/Rollback.
     private readonly object _gate = new();
     private readonly SemaphoreSlim _transactionGate = new(1, 1);
+    // Managed thread id of the thread holding an open transaction, 0 when
+    // none. Read before waiting on _transactionGate so a command issued from
+    // that same thread fails instead of blocking on a gate only it can free.
+    private int _transactionOwner;
     private readonly SqliteConnection _connection;
     private readonly Dictionary<(string Name, QueueOptions Options), Queue> _queues = new();
     private readonly Dictionary<string, Stream> _streams = new(StringComparer.Ordinal);
@@ -142,6 +146,7 @@ public sealed class Database : IDisposable
     public HonkerTransaction BeginTransaction()
     {
         _transactionGate.Wait();
+        Volatile.Write(ref _transactionOwner, Environment.CurrentManagedThreadId);
         try
         {
             lock (_gate)
@@ -151,6 +156,7 @@ public sealed class Database : IDisposable
         }
         catch
         {
+            Volatile.Write(ref _transactionOwner, 0);
             _transactionGate.Release();
             throw;
         }
@@ -331,6 +337,7 @@ public sealed class Database : IDisposable
 
     internal void EndTransaction()
     {
+        Volatile.Write(ref _transactionOwner, 0);
         _transactionGate.Release();
     }
 
@@ -342,6 +349,17 @@ public sealed class Database : IDisposable
             {
                 return action();
             }
+        }
+
+        if (Volatile.Read(ref _transactionOwner) == Environment.CurrentManagedThreadId)
+        {
+            // Only this thread can release the gate, and it is here rather than
+            // at Commit/Rollback, so waiting would never return. Before the
+            // gate existed ADO.NET raised on this; keep it loud.
+            throw new InvalidOperationException(
+                "A Honker transaction is open on this thread. Pass it to the call " +
+                "(for example enqueue(..., transaction: tx)) instead of running " +
+                "outside it; waiting for the transaction to end would deadlock.");
         }
 
         _transactionGate.Wait();
