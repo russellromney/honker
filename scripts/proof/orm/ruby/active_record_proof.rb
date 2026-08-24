@@ -1,4 +1,5 @@
 # ActiveRecord, as guides/orm/ruby.mdx shows it.
+# docs:start example
 
 require "json"
 require "active_record"
@@ -117,3 +118,4 @@ job = conn.exec_query("SELECT honker_get_job(?)", "get", [rolled]).rows.first.fi
 raise "rollback left a job" unless job.to_s == ""
 
 puts "PASS ruby-activerecord"
+# docs:end example

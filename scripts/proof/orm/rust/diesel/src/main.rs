@@ -1,4 +1,5 @@
 //! Diesel, as guides/orm/rust.mdx shows it.
+// docs:start example
 
 include!("../../catalog.rs");
 
@@ -158,3 +159,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PASS rust-diesel");
     Ok(())
 }
+// docs:end example

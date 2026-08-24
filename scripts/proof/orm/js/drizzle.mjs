@@ -1,4 +1,5 @@
 // Drizzle ORM, exactly as guides/orm/javascript.mdx shows it.
+// docs:start example
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
@@ -60,3 +61,4 @@ assert.equal(db.get(sql`SELECT honker_get_job(${rolled}) AS job`).job, '');
 
 sqlite.close();
 console.log('PASS drizzle');
+// docs:end example

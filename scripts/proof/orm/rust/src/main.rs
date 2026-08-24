@@ -1,4 +1,5 @@
 //! sqlx, as guides/orm/rust.mdx shows it.
+// docs:start example
 
 include!("../catalog.rs");
 
@@ -119,3 +120,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PASS rust-sqlx");
     Ok(())
 }
+// docs:end example

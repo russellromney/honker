@@ -1,5 +1,7 @@
 package dev.honker.ormproof;
 
+// docs:start example
+
 import dev.honker.HonkerExtension;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -284,3 +286,4 @@ public final class OrmProof {
         System.out.println("PASS jvm-jooq");
     }
 }
+// docs:end example

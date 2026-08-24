@@ -439,6 +439,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # ORM guide snippets are generated from the proof programs below.
+          # Initialize the docs submodule so sync_docs.py can prove the code
+          # shown to users is byte-for-byte the code this job executes.
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -539,8 +544,10 @@ jobs:
       # notify, scheduler, lock, rate limit, result) plus an ORM-owned
       # transaction that commits and rolls back a business write with
       # honker_enqueue.
-      - name: ORM surface catalog is complete
-        run: python3 scripts/proof/orm/check_surface.py
+      - name: ORM docs execute the exact checked-in examples
+        run: |
+          python3 scripts/proof/orm/sync_docs.py --check
+          python3 scripts/proof/orm/check_surface.py
       - name: ORM · Go (database/sql, GORM)
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so

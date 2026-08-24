@@ -1,5 +1,7 @@
 """SQLModel, as guides/orm/python.mdx shows it."""
 
+# docs:start example
+
 import json
 import os
 
@@ -71,3 +73,4 @@ def prove_atomicity():
 
 prove_atomicity()
 print("PASS sqlmodel")
+# docs:end example

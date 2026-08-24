@@ -1,4 +1,5 @@
 # Ecto, as guides/orm/elixir.mdx shows it.
+# docs:start example
 
 Mix.install([
   {:ecto_sql, "~> 3.12"},
@@ -170,3 +171,4 @@ rolled =
 %{rows: [[""]]} = Ecto.Adapters.SQL.query!(Proof.Repo, "SELECT honker_get_job(?)", [rolled])
 
 IO.puts("PASS ecto")
+# docs:end example

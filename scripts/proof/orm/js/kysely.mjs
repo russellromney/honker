@@ -1,4 +1,5 @@
 // Kysely, exactly as guides/orm/javascript.mdx shows it.
+// docs:start example
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
@@ -66,3 +67,4 @@ assert.equal(rolledJob.rows[0].job, '');
 
 await db.destroy();
 console.log('PASS kysely');
+// docs:end example

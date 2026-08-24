@@ -1,4 +1,5 @@
 // database/sql and GORM, as guides/orm/go.mdx shows them.
+// docs:start example
 package main
 
 import (
@@ -9,8 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	honker "github.com/russellromney/honker-go"
 	sqlite3 "github.com/mattn/go-sqlite3"
+	honker "github.com/russellromney/honker-go"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -431,3 +432,5 @@ func main() {
 	}
 	fmt.Println("PASS go-gorm")
 }
+
+// docs:end example

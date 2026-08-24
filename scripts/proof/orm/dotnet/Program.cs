@@ -1,4 +1,5 @@
 // Framework-owned Microsoft.Data.Sqlite, as guides/orm/dotnet.mdx describes.
+// docs:start example
 using System.Text.Json;
 using Honker;
 using Microsoft.Data.Sqlite;
@@ -236,3 +237,4 @@ static void ProveAtomicity(SqliteConnection conn)
         if (AsText(job.ExecuteScalar()) != "") throw new Exception("rollback left a job");
     }
 }
+// docs:end example

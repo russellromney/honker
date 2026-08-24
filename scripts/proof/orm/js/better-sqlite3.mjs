@@ -1,4 +1,5 @@
 // better-sqlite3, exactly as guides/orm/javascript.mdx shows it.
+// docs:start example
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
@@ -53,3 +54,4 @@ assert.equal(db.prepare('SELECT honker_get_job(?) AS job').get(rolled).job, '');
 
 db.close();
 console.log('PASS better-sqlite3');
+// docs:end example

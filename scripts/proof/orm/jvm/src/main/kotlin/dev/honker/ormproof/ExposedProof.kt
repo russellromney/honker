@@ -1,5 +1,7 @@
 package dev.honker.ormproof
 
+// docs:start example
+
 import dev.honker.HonkerExtension
 import java.sql.DriverManager
 import org.jetbrains.exposed.sql.Database
@@ -95,3 +97,4 @@ object ExposedProof {
         println("PASS jvm-kotlin-exposed")
     }
 }
+// docs:end example

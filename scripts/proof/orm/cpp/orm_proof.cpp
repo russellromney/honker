@@ -1,4 +1,5 @@
 // Framework-owned sqlite3, as guides/orm/cpp.mdx shows it.
+// docs:start example
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -298,3 +299,4 @@ int main() {
     std::printf("PASS cpp-framework-owned-sqlite3\n");
     return 0;
 }
+// docs:end example
