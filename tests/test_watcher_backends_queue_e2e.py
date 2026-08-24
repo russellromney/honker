@@ -78,7 +78,6 @@ _WORKER_SCRIPT = textwrap.dedent(
 
         db = honker.open(db_path, watcher_backend=backend)
         q = db.queue("shared")
-        print("READY", flush=True)
 
         processed = []
         # Wake-driven iterator — uses update_events() under the hood,
@@ -88,6 +87,7 @@ _WORKER_SCRIPT = textwrap.dedent(
         # source. A broken backend surfaces as "processed 0 jobs," not
         # as "fell back to idle_poll_s and passed anyway."
         iterator = q.claim(worker_id, idle_poll_s=None).__aiter__()
+        print("READY", flush=True)
         while True:
             try:
                 job = await asyncio.wait_for(iterator.__anext__(), timeout=idle_exit_s)
@@ -168,22 +168,80 @@ _WRITER_SCRIPT = textwrap.dedent(
     import honker
     db = honker.open({db_path!r})
     q = db.queue("shared")
+    if {wait_for_go!r}:
+        print("READY", flush=True)
+        if sys.stdin.readline().strip() != "GO":
+            raise RuntimeError("writer start gate closed without GO")
     for i in range({offset}, {offset} + {n}):
         q.enqueue({{"i": i}})
     """
 )
 
 
-def _run_writer(db_path: str, n: int, offset: int = 0, timeout_s: float = 15.0):
-    script = _WRITER_SCRIPT.format(
-        packages=PACKAGES_ROOT, db_path=db_path, n=n, offset=offset
+def _writer_script(db_path: str, n: int, offset: int, wait_for_go: bool) -> str:
+    return _WRITER_SCRIPT.format(
+        packages=PACKAGES_ROOT,
+        db_path=db_path,
+        n=n,
+        offset=offset,
+        wait_for_go=wait_for_go,
     )
+
+
+def _run_writer(db_path: str, n: int, offset: int = 0, timeout_s: float = 15.0):
+    script = _writer_script(db_path, n, offset, wait_for_go=False)
     res = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True, text=True, timeout=timeout_s,
     )
     assert res.returncode == 0, (
         f"writer (offset={offset} n={n}) failed: stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+
+
+def _spawn_gated_writer(db_path: str, n: int, offset: int):
+    """Start a writer and wait until imports and database open finish.
+
+    The caller releases every writer with `_release_writer` only after
+    the worker has subscribed. This keeps process startup latency out of
+    the worker's deliberately short no-wake timeout.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _writer_script(db_path, n, offset, wait_for_go=True)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    ready = proc.stdout.readline()
+    if ready.strip() != "READY":
+        err = proc.stderr.read() if proc.stderr else ""
+        proc.kill()
+        raise RuntimeError(
+            f"writer offset={offset} did not READY: ready={ready!r} stderr={err!r}"
+        )
+    return proc
+
+
+def _release_writer(proc) -> None:
+    assert proc.stdin is not None
+    proc.stdin.write("GO\n")
+    proc.stdin.flush()
+
+
+def _wait_writer(proc, offset: int, n: int, timeout_s: float = 15.0) -> None:
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise AssertionError(
+            f"writer (offset={offset} n={n}) did not exit within {timeout_s}s; "
+            f"stdout={stdout!r} stderr={stderr!r}"
+        )
+    assert proc.returncode == 0, (
+        f"writer (offset={offset} n={n}) failed: stdout={stdout!r} stderr={stderr!r}"
     )
 
 
@@ -284,22 +342,29 @@ def test_queue_many_writers_1worker_drains(tmp_path, backend):
     per_writer = 15
     total = num_writers * per_writer
 
-    worker = _spawn_worker(db_path, "w1", backend, idle_exit_s=3.0)
+    writers = []
+    worker = None
     try:
-        # Writers run in parallel via threads (each runs a subprocess).
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_writers) as ex:
-            futures = [
-                ex.submit(_run_writer, db_path, per_writer, i * per_writer)
-                for i in range(num_writers)
-            ]
-            for f in futures:
-                f.result()
+        for i in range(num_writers):
+            writers.append(
+                _spawn_gated_writer(db_path, per_writer, i * per_writer)
+            )
+        # All writers have completed interpreter startup and database open.
+        # Subscribe the worker before releasing them so its 3 s no-wake
+        # timeout measures Honker delivery, not Windows process scheduling.
+        worker = _spawn_worker(db_path, "w1", backend, idle_exit_s=3.0)
+        for writer in writers:
+            _release_writer(writer)
+        for i, writer in enumerate(writers):
+            _wait_writer(writer, i * per_writer, per_writer)
 
         processed = _wait_worker(worker, "w1", timeout_s=25.0)
     finally:
-        if worker.poll() is None:
+        for writer in writers:
+            if writer.poll() is None:
+                writer.kill()
+                writer.wait()
+        if worker is not None and worker.poll() is None:
             worker.kill()
             worker.wait()
 
