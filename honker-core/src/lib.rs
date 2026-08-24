@@ -3441,9 +3441,14 @@ while True:
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
 
+        // 300 ms = 6x RX_POLL_MS. The regression this guards is recv_timeout
+        // blocking on the safety-net interval, which lands at 500 ms or more,
+        // so this still catches it with room to spare. The old 150 ms bound
+        // was below CI scheduler jitter, not below the bug: it failed a
+        // Windows runner at 155 ms while the real failure is 3x further out.
         assert!(
-            elapsed < Duration::from_millis(150),
-            "kernel watcher shutdown took {elapsed:?}, expected < 150 ms \
+            elapsed < Duration::from_millis(300),
+            "kernel watcher shutdown took {elapsed:?}, expected < 300 ms \
              (RX_POLL_MS = 50 ms; if this exceeds 500 ms the recv_timeout \
              is blocking on the safety-net interval again)"
         );
