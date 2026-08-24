@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = std::env::var("HONKER_TEST_DB")?;
     let ext = std::env::var("HONKER_EXTENSION_PATH")?;
 
-    let (mut conn, _honker_library) = open_honker(&db, &ext)?;
+    let (mut conn, honker_library) = open_honker(&db, &ext)?;
     sql_query("SELECT honker_bootstrap()").execute(&mut conn)?;
 
     run_catalog("di", |sql, args| diesel_scalar(&mut conn, sql, args))?;
@@ -149,6 +149,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind::<BigInt, _>(rolled)
         .get_result(&mut conn)?;
     assert_eq!(job.job, "", "rollback left a job");
+
+    // The extension's callbacks remain registered on Diesel's SQLite handle.
+    // Close that handle before unloading the dynamic library that owns them.
+    drop(conn);
+    drop(honker_library);
 
     println!("PASS rust-diesel");
     Ok(())
