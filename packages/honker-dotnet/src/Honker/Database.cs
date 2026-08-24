@@ -6,7 +6,15 @@ namespace Honker;
 
 public sealed class Database : IDisposable
 {
+    // _gate protects individual uses of the shared connection. A transaction
+    // needs the stronger gate for its whole lifetime so an unrelated worker
+    // command cannot run on the connection between Begin and Commit/Rollback.
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _transactionGate = new(1, 1);
+    // Managed thread id of the thread holding an open transaction, 0 when
+    // none. Read before waiting on _transactionGate so a command issued from
+    // that same thread fails instead of blocking on a gate only it can free.
+    private int _transactionOwner;
     private readonly SqliteConnection _connection;
     private readonly Dictionary<(string Name, QueueOptions Options), Queue> _queues = new();
     private readonly Dictionary<string, Stream> _streams = new(StringComparer.Ordinal);
@@ -137,9 +145,20 @@ public sealed class Database : IDisposable
 
     public HonkerTransaction BeginTransaction()
     {
-        lock (_gate)
+        _transactionGate.Wait();
+        Volatile.Write(ref _transactionOwner, Environment.CurrentManagedThreadId);
+        try
         {
-            return new HonkerTransaction(this, _connection.BeginTransaction(deferred: false));
+            lock (_gate)
+            {
+                return new HonkerTransaction(this, _connection.BeginTransaction(deferred: false));
+            }
+        }
+        catch
+        {
+            Volatile.Write(ref _transactionOwner, 0);
+            _transactionGate.Release();
+            throw;
         }
     }
 
@@ -189,11 +208,11 @@ public sealed class Database : IDisposable
         }
 
         var sql = $"DELETE FROM _honker_notifications WHERE {string.Join(" OR ", clauses)}";
-        lock (_gate)
+        return WithConnection(null, () =>
         {
             using var command = SqliteHelpers.CreateCommand(_connection, null, sql, args);
             return command.ExecuteNonQuery();
-        }
+        });
     }
 
     public bool TryRateLimit(string name, int limit, int perSeconds)
@@ -269,16 +288,16 @@ public sealed class Database : IDisposable
 
     internal object? ExecuteScalar(string sql, HonkerTransaction? transaction, params object?[] args)
     {
-        lock (_gate)
+        return WithConnection(transaction, () =>
         {
             using var command = SqliteHelpers.CreateCommand(_connection, transaction?.Inner, sql, args);
             return command.ExecuteScalar();
-        }
+        });
     }
 
     internal IReadOnlyList<IReadOnlyDictionary<string, object?>> QueryInternal(string sql, HonkerTransaction? transaction, params object?[] args)
     {
-        lock (_gate)
+        return WithConnection(transaction, () =>
         {
             using var command = SqliteHelpers.CreateCommand(_connection, transaction?.Inner, sql, args);
             using var reader = command.ExecuteReader();
@@ -296,16 +315,16 @@ public sealed class Database : IDisposable
             }
 
             return rows;
-        }
+        });
     }
 
     internal void ExecuteNonQuery(string sql, HonkerTransaction? transaction, params object?[] args)
     {
-        lock (_gate)
+        WithConnection(transaction, () =>
         {
             using var command = SqliteHelpers.CreateCommand(_connection, transaction?.Inner, sql, args);
             command.ExecuteNonQuery();
-        }
+        });
     }
 
     internal void WithLock(Action action)
@@ -314,6 +333,56 @@ public sealed class Database : IDisposable
         {
             action();
         }
+    }
+
+    internal void EndTransaction()
+    {
+        Volatile.Write(ref _transactionOwner, 0);
+        _transactionGate.Release();
+    }
+
+    private T WithConnection<T>(HonkerTransaction? transaction, Func<T> action)
+    {
+        if (transaction is not null)
+        {
+            lock (_gate)
+            {
+                return action();
+            }
+        }
+
+        if (Volatile.Read(ref _transactionOwner) == Environment.CurrentManagedThreadId)
+        {
+            // Only this thread can release the gate, and it is here rather than
+            // at Commit/Rollback, so waiting would never return. Before the
+            // gate existed ADO.NET raised on this; keep it loud.
+            throw new InvalidOperationException(
+                "A Honker transaction is open on this thread. Pass it to the call " +
+                "(for example enqueue(..., transaction: tx)) instead of running " +
+                "outside it; waiting for the transaction to end would deadlock.");
+        }
+
+        _transactionGate.Wait();
+        try
+        {
+            lock (_gate)
+            {
+                return action();
+            }
+        }
+        finally
+        {
+            _transactionGate.Release();
+        }
+    }
+
+    private void WithConnection(HonkerTransaction? transaction, Action action)
+    {
+        WithConnection(transaction, () =>
+        {
+            action();
+            return true;
+        });
     }
 
     public void Dispose()

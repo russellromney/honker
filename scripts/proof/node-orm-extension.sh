@@ -3,9 +3,10 @@
 # *packaged* Honker extension.
 #
 # Packs honker-node and its honker-ext-<platform> package, installs both
-# into a clean project alongside better-sqlite3, and round-trips
-# enqueue -> claim -> ack through raw SQL. Nothing here reads
-# target/release, and there is no skip path: a missing extension fails.
+# into a clean project alongside better-sqlite3/Drizzle/Kysely, and runs
+# the shared ORM SQL surface plus an ORM-owned commit/rollback. Nothing
+# here reads target/release, and there is no skip path: a missing
+# extension fails.
 #
 # Shared by ci.yml (every PR) and release-node.yml (tags) so the proof
 # that gates a release is the same one PRs run.
@@ -57,15 +58,16 @@ npm install --no-audit --no-fund --no-save "$root_tgz" "$ext_tgz" >/dev/null
 # imports from the importing file's own directory, so running them from
 # the repo would not see the packages installed here — and a user's
 # scenario file lives in their project anyway.
-cp "$ROOT"/scripts/proof/orm/js/*.mjs "$app/"
+cp "$ROOT"/scripts/proof/orm/js/*.mjs "$ROOT"/scripts/proof/orm/surface.json "$app/"
 
 failed=0
-for scenario in "$app"/*.mjs; do
-  name="$(basename "$scenario" .mjs)"
-  if HONKER_PLATFORM="$PLATFORM" node "$scenario"; then
+for scenario in better-sqlite3 drizzle kysely; do
+  rm -f "$app/$scenario.db"
+  if HONKER_PLATFORM="$PLATFORM" HONKER_TEST_DB="$app/$scenario.db" \
+    HONKER_ORM_SURFACE="$app/surface.json" node "$app/$scenario.mjs"; then
     :
   else
-    echo "FAIL $name" >&2
+    echo "FAIL $scenario" >&2
     failed=1
   fi
 done

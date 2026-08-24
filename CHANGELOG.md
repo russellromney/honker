@@ -36,13 +36,18 @@ users reach for the extension.
   always `sqlite3_honkerext_init`; the accessor never loads native code.
 
 Proof: `scripts/proof/node-orm-extension.sh` installs the packed
-tarballs into a clean project with `better-sqlite3` and round-trips
-enqueue → claim → ack through raw SQL, with every numeric argument
-bound rather than written as a literal. Both `ci.yml` and
-`release-node.yml` call it, so PRs run the same check that gates a
-release. It reads nothing from `target/release` and has no skip path,
-unlike `tests/test_extension_interop.py`, which skips when the build
-tree is empty and is how this shipped broken.
+tarballs into a clean project with `better-sqlite3` and runs the
+shared ORM SQL surface (queue, stream, notify, scheduler, lock, rate
+limit, result) plus an ORM-owned commit/rollback of a business write
+with `honker_enqueue`. Every numeric argument is bound rather than
+written as a literal. Both `ci.yml` and `release-node.yml` call it,
+so PRs run the same check that gates a release. It reads nothing from
+`target/release` and has no skip path, unlike
+`tests/test_extension_interop.py`, which skips when the build tree is
+empty and is how this shipped broken. The same surface catalog drives
+every other documented ORM recipe in CI, including the Rust sqlx, SeaORM,
+and Diesel recipes. Toasty is documented as unable to load SQLite
+extensions today, so it has no recipe and no CI proof.
 
 Publish order, which the `optionalDependencies` pins require: the four
 `honker-ext-*` packages first, then `honker-node@0.4.6` and

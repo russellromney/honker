@@ -76,8 +76,7 @@ public sealed class OutboxLockTests
         }
         finally
         {
-            cts.Cancel();
-            await Task.WhenAll(worker.ContinueWith(_ => Task.CompletedTask));
+            await StopWorkerAsync(worker, cts);
         }
 
         Assert.Equal(["1", "2"], delivered);
@@ -121,12 +120,63 @@ public sealed class OutboxLockTests
         }
         finally
         {
-            cts.Cancel();
-            await Task.WhenAll(worker.ContinueWith(_ => Task.CompletedTask));
+            await StopWorkerAsync(worker, cts);
         }
 
         Assert.True(Volatile.Read(ref calls) >= 3);
         Assert.Equal(0, Scalar(db, "SELECT COUNT(*) AS c FROM _honker_jobs WHERE queue=@p0", "_outbox:retry"));
+    }
+
+    [Fact]
+    public void CommandOutsideAnOpenTransactionOnTheSameThreadRaises()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var q = db.Queue("emails");
+
+        // The transaction gate is held for the transaction's lifetime and only
+        // this thread can release it, so a command that forgets to pass the
+        // transaction would wait on itself forever. It has to raise instead.
+        // Whole scenario runs on one background thread so the test thread can
+        // fail on a timeout rather than hanging the suite.
+        var attempt = Task.Run(() =>
+        {
+            using var tx = db.BeginTransaction();
+            try
+            {
+                q.Enqueue(new { a = 1 });   // no transaction argument
+                return null;
+            }
+            catch (InvalidOperationException ex)
+            {
+                return ex.Message;
+            }
+        });
+
+        Assert.True(attempt.Wait(TimeSpan.FromSeconds(5)),
+            "deadlocked: the command waited on a gate only its own thread could release");
+        Assert.Contains("transaction is open on this thread", attempt.Result);
+    }
+
+    [Fact]
+    public async Task DatabaseSerializesCommandsForTransactionLifetime()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        using var tx = db.BeginTransaction();
+        using var started = new ManualResetEventSlim();
+
+        var concurrent = Task.Run(() =>
+        {
+            started.Set();
+            return Scalar(db, "SELECT 1");
+        });
+        started.Wait();
+        await Task.Delay(50);
+        Assert.False(concurrent.IsCompleted, "a command escaped the active transaction lifetime");
+
+        tx.Commit();
+        Assert.Equal(1, await concurrent.WaitAsync(TimeSpan.FromSeconds(2)));
     }
 
     [Fact]
@@ -182,8 +232,7 @@ public sealed class OutboxLockTests
         }
         finally
         {
-            cts.Cancel();
-            await Task.WhenAll(worker.ContinueWith(_ => Task.CompletedTask));
+            await StopWorkerAsync(worker, cts);
         }
 
         Assert.Equal([1], delivered);
@@ -240,8 +289,7 @@ public sealed class OutboxLockTests
         }
         finally
         {
-            cts.Cancel();
-            await Task.WhenAll(worker.ContinueWith(_ => Task.CompletedTask));
+            await StopWorkerAsync(worker, cts);
         }
 
         var row = db.Query("SELECT state, attempts, last_error FROM _honker_jobs WHERE queue=@p0", "_outbox:dead")[0];
@@ -272,8 +320,7 @@ public sealed class OutboxLockTests
         }
         finally
         {
-            cts.Cancel();
-            await Task.WhenAll(worker.ContinueWith(_ => Task.CompletedTask));
+            await StopWorkerAsync(worker, cts);
         }
 
         Assert.Equal([1], delivered);
@@ -305,6 +352,19 @@ public sealed class OutboxLockTests
     {
         var rows = db.Query(sql, args);
         return Convert.ToInt64(rows[0].Values.First() ?? 0L);
+    }
+
+    private static async Task StopWorkerAsync(Task worker, CancellationTokenSource cts)
+    {
+        cts.Cancel();
+        try
+        {
+            await worker;
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            // Expected while stopping an idle worker.
+        }
     }
 
     private static async Task WaitUntilAsync(

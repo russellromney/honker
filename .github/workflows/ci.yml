@@ -254,6 +254,7 @@ jobs:
           # uv venv does not ship pip, so install the way the rest of
           # this job does.
           uv pip install --python "$VENV_PY" --quiet sqlalchemy sqlmodel django
+          python scripts/proof/orm/check_surface.py
 
           # These recipes need an interpreter whose sqlite3 was built
           # with SQLITE_ENABLE_LOAD_EXTENSION. The python.org macOS
@@ -271,7 +272,7 @@ jobs:
           fi
 
           failed=0
-          for scenario in scripts/proof/orm/python/*.py; do
+          for scenario in scripts/proof/orm/python/*_orm.py; do
             name="$(basename "$scenario" .py)"
             rm -f "$RUNNER_TEMP/orm-$name.db"
             if HONKER_TEST_DB="$RUNNER_TEMP/orm-$name.db" python "$scenario"; then
@@ -434,10 +435,15 @@ jobs:
 
   binding-smoke:
     name: binding smoke · ubuntu aggregate
-    timeout-minutes: 12
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # ORM guide snippets are generated from the proof programs below.
+          # Initialize the docs submodule so sync_docs.py can prove the code
+          # shown to users is byte-for-byte the code this job executes.
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -532,17 +538,24 @@ jobs:
           mix deps.get
           mix test
       # ---- Documented ORM recipes -------------------------------------
-      # One scenario per integration named in guides/orm/*.mdx, written
-      # the way the page shows it. These fail when a documented recipe
-      # stops working, which is the point: the docs promise these, so CI
-      # has to hold them to it.
+      # One scenario per integration named in guides/orm/*.mdx. Each one
+      # loads the extension the way the page shows, then runs the shared
+      # SQL surface in scripts/proof/orm/surface.json (queue, stream,
+      # notify, scheduler, lock, rate limit, result) plus an ORM-owned
+      # transaction that commits and rolls back a business write with
+      # honker_enqueue.
+      - name: ORM docs execute the exact checked-in examples
+        run: |
+          python3 scripts/proof/orm/sync_docs.py --check
+          python3 scripts/proof/orm/check_surface.py
       - name: ORM · Go (database/sql, GORM)
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_ORM_SURFACE: ${{ github.workspace }}/scripts/proof/orm/surface.json
         run: |
           work="$RUNNER_TEMP/orm-go"
           mkdir -p "$work"
-          cp scripts/proof/orm/go/main.go "$work/"
+          cp scripts/proof/orm/go/main.go scripts/proof/orm/surface.json "$work/"
           cd "$work"
           cat > go.mod <<'GOMOD'
           module honkerormproof
@@ -551,7 +564,7 @@ jobs:
           GOMOD
           go mod edit -replace github.com/russellromney/honker-go="$GITHUB_WORKSPACE/packages/honker-go"
           go mod tidy
-          HONKER_TEST_DB="$work/orm.db" go run .
+          HONKER_TEST_DB="$work/orm.db" HONKER_ORM_SURFACE="$work/surface.json" go run .
 
       - name: ORM · Rust (sqlx)
         env:
@@ -559,18 +572,33 @@ jobs:
         run: |
           HONKER_TEST_DB="$RUNNER_TEMP/orm-sqlx.db" \
             cargo run --release --manifest-path scripts/proof/orm/rust/Cargo.toml
+      - name: ORM · Rust (SeaORM)
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-seaorm.db" \
+            cargo run --release --manifest-path scripts/proof/orm/rust/seaorm/Cargo.toml
+      - name: ORM · Rust (Diesel)
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          HONKER_TEST_DB="$RUNNER_TEMP/orm-diesel.db" \
+            cargo run --release --manifest-path scripts/proof/orm/rust/diesel/Cargo.toml
 
       - name: ORM · .NET (Microsoft.Data.Sqlite)
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_ORM_SURFACE: ${{ github.workspace }}/scripts/proof/orm/surface.json
         run: |
           HONKER_TEST_DB="$RUNNER_TEMP/orm-dotnet.db" \
+            HONKER_ORM_SURFACE="$GITHUB_WORKSPACE/scripts/proof/orm/surface.json" \
             dotnet run --project scripts/proof/orm/dotnet/OrmProof.csproj
 
       - name: ORM · Elixir (Ecto)
         working-directory: packages/honker-ex
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_ORM_SURFACE: ${{ github.workspace }}/scripts/proof/orm/surface.json
         run: |
           mix compile
           HONKER_TEST_DB="$RUNNER_TEMP/orm-ecto.db" \
@@ -580,6 +608,7 @@ jobs:
       - name: ORM · C++ (framework-owned sqlite3)
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_ORM_SURFACE: ${{ github.workspace }}/scripts/proof/orm/surface.json
         run: |
           g++ -std=c++17 scripts/proof/orm/cpp/orm_proof.cpp -lsqlite3 \
             -o "$RUNNER_TEMP/orm-cpp"
@@ -589,6 +618,7 @@ jobs:
         working-directory: packages/honker-ruby
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_ORM_SURFACE: ${{ github.workspace }}/scripts/proof/orm/surface.json
         run: |
           export BUNDLE_GEMFILE="$GITHUB_WORKSPACE/scripts/proof/orm/ruby/Gemfile"
           bundle install
@@ -647,6 +677,7 @@ jobs:
         working-directory: scripts/proof/orm/jvm
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_ORM_SURFACE: ${{ github.workspace }}/scripts/proof/orm/surface.json
         run: |
           HONKER_TEST_DB="$RUNNER_TEMP/orm-jvm.db" \
             mvn -B -q compile exec:java -Dexec.mainClass=dev.honker.ormproof.OrmProof
@@ -654,6 +685,7 @@ jobs:
         working-directory: scripts/proof/orm/jvm
         env:
           HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_ORM_SURFACE: ${{ github.workspace }}/scripts/proof/orm/surface.json
         run: |
           HONKER_TEST_DB="$RUNNER_TEMP/orm-kotlin.db" \
             mvn -B -q compile exec:java -Dexec.mainClass=dev.honker.ormproof.ExposedProof

@@ -7,6 +7,7 @@ public sealed class HonkerTransaction : IDisposable
 {
     private readonly Database _database;
     private bool _completed;
+    private bool _gateReleased;
 
     internal HonkerTransaction(Database database, SqliteTransaction inner)
     {
@@ -44,6 +45,7 @@ public sealed class HonkerTransaction : IDisposable
             Inner.Commit();
             _completed = true;
         });
+        ReleaseGate();
     }
 
     public void Rollback()
@@ -53,18 +55,38 @@ public sealed class HonkerTransaction : IDisposable
             Inner.Rollback();
             _completed = true;
         });
+        ReleaseGate();
     }
 
     public void Dispose()
     {
-        _database.WithLock(() =>
+        try
         {
-            if (!_completed)
+            _database.WithLock(() =>
             {
-                Inner.Rollback();
-            }
+                if (!_completed)
+                {
+                    Inner.Rollback();
+                    _completed = true;
+                }
 
-            Inner.Dispose();
-        });
+                Inner.Dispose();
+            });
+        }
+        finally
+        {
+            ReleaseGate();
+        }
+    }
+
+    private void ReleaseGate()
+    {
+        if (_gateReleased)
+        {
+            return;
+        }
+
+        _gateReleased = true;
+        _database.EndTransaction();
     }
 }

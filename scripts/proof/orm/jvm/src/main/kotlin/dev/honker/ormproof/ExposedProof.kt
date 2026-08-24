@@ -1,13 +1,11 @@
 package dev.honker.ormproof
 
-// Kotlin Exposed, as guides/orm/jvm.mdx shows it: raw SQL inside
-// transaction { }. The page's snippet inlines its values; this binds
-// them, because that is what an app with real data would do and it is
-// the path where driver type handling actually shows up.
+// docs:start example
 
 import dev.honker.HonkerExtension
 import java.sql.DriverManager
 import org.jetbrains.exposed.sql.Database
+import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.sqlite.SQLiteConfig
 
@@ -17,11 +15,6 @@ object ExposedProof {
         val dbPath = System.getenv("HONKER_TEST_DB")
             ?: error("HONKER_TEST_DB is required")
 
-        // Extension loading has to be enabled before the connection
-        // opens, which means Exposed's url+driver overload is not
-        // enough — it never sees the SQLiteConfig properties and
-        // load_extension comes back "not authorized". Hand Exposed a
-        // connection factory instead.
         val props = SQLiteConfig().apply { enableLoadExtension(true) }.toProperties()
         Database.connect({
             DriverManager.getConnection("jdbc:sqlite:$dbPath", props).also { conn ->
@@ -36,38 +29,72 @@ object ExposedProof {
         })
 
         transaction {
-            val conn = (this.connection.connection as java.sql.Connection)
+            val conn = TransactionManager.current().connection.connection as java.sql.Connection
+            Surface.run(conn, "exp")
+        }
 
-            val id = conn.prepareStatement(
-                "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL) AS id"
-            ).use { stmt ->
-                stmt.setString(1, "emails_exposed")
-                stmt.setString(2, """{"to":"alice@example.com"}""")
-                stmt.setInt(3, 0)
-                stmt.setInt(4, 3)
-                stmt.executeQuery().use { rs -> rs.next(); rs.getLong("id") }
-            }
-            check(id > 0) { "expected a job id, got $id" }
+        transaction {
+            exec("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, user_id INTEGER)")
+            exec("INSERT INTO orders (id, user_id) VALUES (72, 1)")
+            exec(
+                """
+                SELECT honker_enqueue(
+                  'exp_atomic',
+                  '{"order_id":72}',
+                  NULL, NULL, 0, 3, NULL
+                )
+                """.trimIndent()
+            )
+        }
 
-            val claimed = conn.prepareStatement(
-                "SELECT honker_claim_batch(?, ?, ?, ?)"
-            ).use { stmt ->
-                stmt.setString(1, "emails_exposed")
-                stmt.setString(2, "w1")
-                stmt.setInt(3, 8)
-                stmt.setInt(4, 300)
-                stmt.executeQuery().use { rs -> rs.next(); rs.getString(1) }
+        transaction {
+            val conn = TransactionManager.current().connection.connection as java.sql.Connection
+            conn.prepareStatement("SELECT COUNT(*) FROM orders WHERE id = 72").use { stmt ->
+                stmt.executeQuery().use { rs ->
+                    rs.next()
+                    check(rs.getInt(1) == 1) { "missing committed order" }
+                }
             }
-            check(claimed.contains("\"id\":$id")) { "claimed the wrong job: $claimed" }
+        }
 
-            val acked = conn.prepareStatement("SELECT honker_ack(?, ?)").use { stmt ->
-                stmt.setLong(1, id)
-                stmt.setString(2, "w1")
-                stmt.executeQuery().use { rs -> rs.next(); rs.getInt(1) }
+        try {
+            transaction {
+                exec("INSERT INTO orders (id, user_id) VALUES (73, 1)")
+                exec(
+                    """
+                    SELECT honker_enqueue(
+                      'exp_atomic',
+                      '{"order_id":73}',
+                      NULL, NULL, 0, 3, NULL
+                    )
+                    """.trimIndent()
+                )
+                error("rollback")
             }
-            check(acked == 1) { "ack must match the claim" }
+        } catch (e: Throwable) {
+            var t: Throwable? = e
+            var isRollback = false
+            while (t != null) {
+                if (t.message == "rollback") {
+                    isRollback = true
+                    break
+                }
+                t = t.cause
+            }
+            if (!isRollback) throw e
+        }
+
+        transaction {
+            val conn = TransactionManager.current().connection.connection as java.sql.Connection
+            conn.prepareStatement("SELECT COUNT(*) FROM orders WHERE id = 73").use { stmt ->
+                stmt.executeQuery().use { rs ->
+                    rs.next()
+                    check(rs.getInt(1) == 0) { "rollback left an order" }
+                }
+            }
         }
 
         println("PASS jvm-kotlin-exposed")
     }
 }
+// docs:end example
