@@ -959,9 +959,18 @@ class HonkerJvmTest {
                 child.destroyForcibly();
             }
         }
+        // Keep iteration order for the failure message. Sorted samples say a
+        // tail exists but not where it came from: slow runs bunched at the
+        // start point at JIT or page-cache warmup, scattered ones at whatever
+        // else shares the runner. This has flaked on CI with a tail nobody
+        // could reproduce, and sorting threw away the half of the evidence
+        // that distinguishes those.
+        List<Long> inOrder = List.copyOf(samples);
         samples.sort(Long::compareTo);
-        assertTrue(percentile(samples, 0.50) < 50, "listener wake p50 was too slow: " + samples);
-        assertTrue(percentile(samples, 0.90) < 250, "listener wake p90 was too slow: " + samples);
+        assertTrue(percentile(samples, 0.50) < 50,
+            "listener wake p50 was too slow: sorted=" + samples + " byIteration=" + inOrder);
+        assertTrue(percentile(samples, 0.90) < 250,
+            "listener wake p90 was too slow: sorted=" + samples + " byIteration=" + inOrder);
     }
 
     @Test
