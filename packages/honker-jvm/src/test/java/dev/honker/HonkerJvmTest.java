@@ -931,7 +931,7 @@ class HonkerJvmTest {
     }
 
     @Test
-    void crossProcessListenerWakeLatencyStaysBelowUserVisibleBounds() throws Exception {
+    void crossProcessListenerWakesFromWatcherNotFallbackPoll() throws Exception {
         Path dbPath = tmp.resolve("listener-latency.db");
         Path extension = NativeLoader.resolve(OpenOptions.defaults());
         try (Database db = Honker.open(dbPath, OpenOptions.builder().extensionPath(extension).build())) {
@@ -968,6 +968,19 @@ class HonkerJvmTest {
         // that distinguishes those.
         List<Long> inOrder = List.copyOf(samples);
         samples.sort(Long::compareTo);
+        // These bounds separate mechanisms, they do not police the published
+        // latency figure — bench/wake_latency_bench.py does that, gated at
+        // p50 < 5 ms in CI against 500 samples.
+        //
+        // A watcher that never fires cannot reach here at all: the child sets
+        // fallbackPollInterval to 30 s and gives up after 10 s, so it exits 2
+        // and child.waitFor() above fails. What these catch is the band in
+        // between — a watcher that still fires but has degraded to hundreds of
+        // milliseconds, which no exit code would notice.
+        //
+        // Deliberately loose. This runs on shared PR runners where absolute
+        // wall-clock assertions flake; tightening them toward the real ~3 ms
+        // buys no signal the bench does not already give and costs red builds.
         assertTrue(percentile(samples, 0.50) < 50,
             "listener wake p50 was too slow: sorted=" + samples + " byIteration=" + inOrder);
         assertTrue(percentile(samples, 0.90) < 250,
