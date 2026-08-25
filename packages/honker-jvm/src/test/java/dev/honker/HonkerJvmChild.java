@@ -23,7 +23,7 @@ public final class HonkerJvmChild {
         if ("worker-marker".equals(mode)) {
             workerMarker(dbPath, extensionPath, readyPath, donePath);
         } else if ("listener-marker".equals(mode)) {
-            listenerMarker(dbPath, extensionPath, readyPath, donePath, WatcherBackend.PRAGMA_DATA_VERSION);
+            listenerStdoutMarker(dbPath, extensionPath, WatcherBackend.PRAGMA_DATA_VERSION);
         } else if ("listener-mmap-marker".equals(mode)) {
             listenerMarker(dbPath, extensionPath, readyPath, donePath, WatcherBackend.MMAP_SHM);
         } else if ("listener-kernel-marker".equals(mode)) {
@@ -71,6 +71,25 @@ public final class HonkerJvmChild {
                 System.exit(2);
             }
             Files.writeString(donePath, notification.payloadJson(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static void listenerStdoutMarker(Path dbPath, Path extensionPath, WatcherBackend backend) throws Exception {
+        try (Database db = Honker.open(dbPath, OpenOptions.builder()
+            .extensionPath(extensionPath)
+            .fallbackPollInterval(Duration.ofSeconds(30))
+            .watcherOptions(WatcherOptions.builder().backend(backend).build())
+            .build());
+             Listener listener = db.listen("multiprocess-listen")) {
+            System.out.println("READY");
+            System.out.flush();
+            Notification notification = listener.next(Duration.ofSeconds(10)).orElse(null);
+            if (notification == null) {
+                System.err.println("child listener timed out");
+                System.exit(2);
+            }
+            System.out.println("WAKE:" + notification.payloadJson());
+            System.out.flush();
         }
     }
 

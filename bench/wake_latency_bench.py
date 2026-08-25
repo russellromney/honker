@@ -17,9 +17,9 @@ the watcher has a stable baseline. Then repeats:
      subprocess which contains the wake timestamp in ms-since-epoch.
   3. Parent records `dt = wake_ts - t0`.
 
-Repeat N times, report p50 / p90 / p99. On M-series darwin expect
-~1–2 ms p50 (bounded by the 1 ms update-watcher cadence); Linux tends to
-run faster.
+Repeat N times, report p50 / p90 / p99. An Apple M1 Pro measured
+~2.9 ms p50 over 500 samples (bounded in part by the 1 ms update-watcher
+cadence); Linux tends to run faster.
 
 Run:
     python bench/wake_latency_bench.py --samples 500

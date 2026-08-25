@@ -125,7 +125,7 @@ def test_cross_process_wake_latency_p99_under_bound(tmp_path):
 
     p50 = percentile(times_ms, 0.5)
     p90 = percentile(times_ms, 0.9)
-    median_bound = 50.0   # real p50 ~= 1-2 ms on M-series
+    median_bound = 50.0   # real p50 ~= 2.9 ms on an Apple M1 Pro
     p90_bound = 750.0     # CI runners can schedule out subprocesses for 100+ ms
 
     assert p50 < median_bound, (

@@ -182,6 +182,51 @@ jobs:
           assert ratio >= 50, f'mmap-shm should be at least 50x faster than cached PRAGMA, got {ratio:.1f}x'
           "
 
+  wake-latency:
+    name: bench · cross-process wake latency (regression check)
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-wake-bench-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
+      - name: Build Python binding
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python maturin
+          cargo build --locked --release -p honker-extension
+          scripts/copy-python-extension.sh
+          cd packages/honker
+          VIRTUAL_ENV="$GITHUB_WORKSPACE/.venv" "$GITHUB_WORKSPACE/.venv/bin/python" -m maturin develop --release
+      - name: Run cross-process wake bench
+        run: .venv/bin/python bench/wake_latency_bench.py --samples 500 | tee "$RUNNER_TEMP/wake-latency.json"
+      - name: Assert p50 cross-process wake stays below 5 ms
+        run: |
+          python - "$RUNNER_TEMP/wake-latency.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          result = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          bound_ms = 5.0
+          p50_ms = result["p50_ms"]
+          print(f"cross-process wake p50: {p50_ms:.3f} ms (bound: < {bound_ms:.1f} ms)")
+          if p50_ms >= bound_ms:
+              raise SystemExit(
+                  f"cross-process wake p50 regressed: {p50_ms:.3f} ms >= {bound_ms:.1f} ms"
+              )
+          PY
+
   python:
     name: python · honker
     timeout-minutes: 10
