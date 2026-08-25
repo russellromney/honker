@@ -166,6 +166,9 @@ Backend contract:
 ## Not Proven Yet
 
 - Every possible cross-language pair; CI covers representative pairs
+- Cross-binding named-consumer checkpoints involving Node. Its current stream
+  wrapper reverses topic and consumer at the offset SQL boundary, so its own
+  resume path works but another binding will not see the same checkpoint.
 - Long soak on every OS; scary nightly soaks Linux
 - Ruby and Elixir async listen parity with Python/Node/.NET/Rust/Go/Bun/C++
 - Published Maven Central proof for JVM/Kotlin
