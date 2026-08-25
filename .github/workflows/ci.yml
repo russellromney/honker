@@ -209,7 +209,9 @@ jobs:
           cd packages/honker
           VIRTUAL_ENV="$GITHUB_WORKSPACE/.venv" "$GITHUB_WORKSPACE/.venv/bin/python" -m maturin develop --release
       - name: Run cross-process wake bench
-        run: .venv/bin/python bench/wake_latency_bench.py --samples 500 | tee "$RUNNER_TEMP/wake-latency.json"
+        run: |
+          set -o pipefail
+          .venv/bin/python bench/wake_latency_bench.py --samples 500 | tee "$RUNNER_TEMP/wake-latency.json"
       - name: Assert p50 cross-process wake stays below 5 ms
         run: |
           python - "$RUNNER_TEMP/wake-latency.json" <<'PY'
@@ -767,6 +769,7 @@ jobs:
       - lint
       - rust
       - perf-regression
+      - wake-latency
       - python
       - dotnet
       - node
@@ -787,10 +790,10 @@ jobs:
           import os
           import sys
 
-          # perf-regression is gated on `github.event_name != 'pull_request'`,
-          # so it legitimately reports "skipped" on every PR. Nothing else
-          # is allowed to skip.
-          MAY_SKIP = {"perf-regression"}
+          # perf-regression and wake-latency are gated on
+          # `github.event_name != 'pull_request'`, so they legitimately report
+          # "skipped" on every PR. Nothing else is allowed to skip.
+          MAY_SKIP = {"perf-regression", "wake-latency"}
 
           needs = json.loads(os.environ["NEEDS_JSON"])
           blocking = []
