@@ -1,9 +1,4 @@
-"""Cross-binding interop between Ruby and Python.
-
-Ruby is currently an extension-backed binding rather than a core
-watcher binding. This test still matters: both packages must agree on
-the on-disk schema, queue semantics, and notification payload format.
-"""
+"""Cross-binding interop between Ruby and Python."""
 
 import json
 import os
@@ -169,3 +164,51 @@ def test_ruby_and_python_share_queue_stream_and_notification_tables(tmp_path):
     assert observed["acked"] == 25
     assert observed["notification"] == {"source": "python", "count": 25}
     assert observed["event_count"] == 2
+
+
+def test_ruby_listener_receives_a_live_notification_from_python(tmp_path):
+    _require_ruby_interop()
+    db_path = tmp_path / "python-writer-ruby-listener.db"
+    py_db = honker.open(str(db_path))
+    env = os.environ.copy()
+    env["DB_PATH"] = str(db_path)
+    env["HONKER_EXTENSION_PATH"] = str(EXT_PATH)
+    script = r'''
+    require "json"
+    require "honker"
+
+    $stdout.sync = true
+    db = Honker::Database.new(
+      ENV.fetch("DB_PATH"),
+      extension_path: ENV.fetch("HONKER_EXTENSION_PATH"),
+    )
+    listener = db.listen("python-live", fallback_poll_s: nil)
+    puts "READY"
+    notification = listener.next(timeout_s: 5)
+    raise "listener timed out" unless notification
+    puts JSON.generate(notification.payload)
+    listener.close
+    db.close
+    '''
+    proc = subprocess.Popen(
+        [*RUBY_CMD, "-Ilib", "-e", script],
+        cwd=RUBY_DIR,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        assert proc.stdout.readline().strip() == "READY"
+        with py_db.transaction() as tx:
+            tx.notify("python-live", {"source": "python", "live": True})
+        stdout, stderr = proc.communicate(timeout=10)
+
+        assert proc.returncode == 0, stderr
+        assert json.loads(stdout) == {"source": "python", "live": True}
+    finally:
+        py_db.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)

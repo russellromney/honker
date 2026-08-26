@@ -17,7 +17,7 @@ extension.
 | Rust `honker` | CI | yes | yes | yes | yes | yes | shared Rust watcher |
 | Go | CI | yes | yes | yes | yes | yes | extension C ABI |
 | Bun `@russellthehippo/honker-bun` | CI | yes | yes | yes | yes | yes | extension C ABI |
-| Elixir `honker` | CI | yes | yes | yes | yes | yes | extension SQL handles |
+| Elixir `honker` | yes | yes | yes | yes | yes | yes | extension SQL handles |
 | C++ | CI | yes | yes | yes | yes | yes | extension C ABI |
 | JVM `dev.honker:honker` | CI + local clean consumer | yes | yes | yes | yes | yes | shared JVM watcher |
 | Kotlin `dev.honker:honker-kotlin` | local + ORM CI | wrapper | Flow wrapper | wrapper | wrapper | wrapper | JVM wrapper |

@@ -177,4 +177,33 @@ defmodule HonkerPythonInteropTest do
       assert length(events) == 2
     end
   end
+
+  test "elixir listener receives a live notification from python", ctx do
+    if Map.get(ctx, :skip) do
+      :ok
+    else
+      {:ok, subscription} = Honker.listen(ctx.db, "python-live", fallback_poll_ms: nil)
+      ref = subscription.ref
+
+      script = """
+      import os
+      import honker
+
+      db = honker.open(os.environ["DB_PATH"])
+      with db.transaction() as tx:
+          tx.notify("python-live", {"source": "python", "live": True})
+      """
+
+      {out, status} =
+        System.cmd(ctx.python, ["-c", script],
+          env: [{"PYTHONPATH", python_path()}, {"DB_PATH", ctx.db_path}],
+          stderr_to_stdout: true
+        )
+
+      assert status == 0, out
+      assert_receive {:honker_notification, ^ref, notification}, 2_000
+      assert notification.payload == %{"source" => "python", "live" => true}
+      assert :ok = Honker.unlisten(subscription)
+    end
+  end
 end

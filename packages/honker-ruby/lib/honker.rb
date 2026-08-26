@@ -196,10 +196,18 @@ module Honker
       end
     end
 
-    def wait_after(generation, timeout_s = nil)
+    # Wake blocked waiters without claiming that SQLite changed. Listener
+    # cancellation uses this path so closing one listener cannot create a
+    # spurious Database#wait_for_update result for unrelated callers.
+    def wake
+      @mutex.synchronize { @changed.broadcast unless @closed }
+    end
+
+    def wait_after(generation, timeout_s = nil, &cancelled)
       deadline = timeout_s.nil? ? nil : monotonic_now + [timeout_s.to_f, 0.0].max
       @mutex.synchronize do
         loop do
+          return false if cancelled&.call
           raise @error if @error
           return false if @closed
           return true if @generation > generation
@@ -304,7 +312,9 @@ module Honker
       @fallback_poll_s = fallback_poll_s&.to_f
       @buffer = []
       @state_mutex = Mutex.new
+      @state_changed = ConditionVariable.new
       @active_calls = 0
+      @active_threads = Hash.new(0)
       @closed = false
       @read_db = SQLite3::Database.new(@db.path)
       @read_db.busy_timeout = 5000
@@ -337,9 +347,15 @@ module Honker
         return nil if remaining && remaining <= 0
 
         wait_s = [remaining, @fallback_poll_s].compact.min
-        @db.wait_for_update_after(generation, wait_s)
-        return nil if @db.updates_closed?
+        @db.wait_for_update_after(generation, wait_s) { closed? }
+        if @db.updates_closed?
+          close
+          return nil
+        end
       end
+    rescue StandardError
+      close
+      raise
     ensure
       end_call if read_db
     end
@@ -353,14 +369,25 @@ module Honker
     end
 
     def close
-      should_signal = @state_mutex.synchronize do
+      should_wake = @state_mutex.synchronize do
         next false if @closed
 
         @closed = true
         close_read_db_if_idle
         true
       end
-      @db.signal_update if should_signal
+
+      if should_wake
+        @db.wake_update_waiters
+        @db.unregister_listener(self)
+      end
+
+      @state_mutex.synchronize do
+        unless @active_threads.key?(Thread.current)
+          @state_changed.wait(@state_mutex) until @active_calls.zero?
+          close_read_db_if_idle
+        end
+      end
       nil
     end
 
@@ -388,6 +415,7 @@ module Honker
         return nil if @closed
 
         @active_calls += 1
+        @active_threads[Thread.current] += 1
         @read_db
       end
     end
@@ -395,7 +423,10 @@ module Honker
     def end_call
       @state_mutex.synchronize do
         @active_calls -= 1
+        @active_threads[Thread.current] -= 1
+        @active_threads.delete(Thread.current) if @active_threads[Thread.current].zero?
         close_read_db_if_idle
+        @state_changed.broadcast if @active_calls.zero?
       end
     end
 
@@ -456,9 +487,21 @@ module Honker
       @db.execute("SELECT honker_bootstrap()")
       watcher = CoreWatcher.new(path, resolved_extension, watcher_backend, watcher_poll_interval_ms)
       @updates = UpdateHub.new(watcher)
+      @listeners_mutex = Mutex.new
+      @listeners = {}
+      @closed = false
     end
 
     def close
+      listeners = @listeners_mutex.synchronize do
+        return if @closed
+
+        @closed = true
+        registered = @listeners.keys
+        @listeners.clear
+        registered
+      end
+      listeners.each(&:close)
       @updates&.close
       @db&.close
     end
@@ -475,20 +518,30 @@ module Honker
       @updates.wait(timeout_s)
     end
 
-    def wait_for_update_after(generation, timeout_s)
-      @updates.wait_after(generation, timeout_s)
+    def wait_for_update_after(generation, timeout_s, &cancelled)
+      @updates.wait_after(generation, timeout_s, &cancelled)
     end
 
-    def signal_update
-      @updates.signal
+    def wake_update_waiters
+      @updates.wake
     end
 
     def updates_closed?
       @updates.closed?
     end
 
+    def closed?
+      @listeners_mutex.synchronize { @closed }
+    end
+
     def listen(channel, fallback_poll_s: 15.0)
+      raise Error, "database is closed" if closed?
+
       listener = Listener.new(self, channel, fallback_poll_s: fallback_poll_s)
+      unless register_listener(listener)
+        listener.close
+        raise Error, "database is closed"
+      end
       return listener unless block_given?
 
       begin
@@ -496,6 +549,22 @@ module Honker
       ensure
         listener.close
       end
+    end
+
+    # Internal listener lifecycle hooks. They are public only because the
+    # Listener is a separate object rather than a nested implementation detail.
+    def register_listener(listener)
+      @listeners_mutex.synchronize do
+        return false if @closed
+
+        @listeners[listener] = true
+        true
+      end
+    end
+
+    def unregister_listener(listener)
+      @listeners_mutex.synchronize { @listeners.delete(listener) }
+      nil
     end
 
     # Returns a Queue handle for a named queue.

@@ -152,7 +152,7 @@ defmodule Honker do
   Historical rows are skipped. New notifications arrive as
   `{:honker_notification, subscription.ref, %Honker.Notification{}}`.
   Call `unlisten/1` to stop explicitly; the listener also stops when the
-  subscribing process exits.
+  subscribing process exits or the database is closed.
   """
   def listen(%Database{} = db, channel, opts \\ []) do
     Honker.Listener.start(db, channel, self(), opts)

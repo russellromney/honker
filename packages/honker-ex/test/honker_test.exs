@@ -382,6 +382,16 @@ defmodule HonkerTest do
     end)
   end
 
+  defp receive_notifications(ref, count, timeout_ms \\ 2_000) do
+    Enum.map(1..count, fn _ ->
+      receive do
+        {:honker_notification, ^ref, notification} -> notification
+      after
+        timeout_ms -> flunk("timed out waiting for notification")
+      end
+    end)
+  end
+
   setup do
     case find_extension() do
       nil ->
@@ -534,6 +544,107 @@ defmodule HonkerTest do
     refute_receive {:honker_notification, ^ref, _}, 50
 
     assert :ok = Honker.unlisten(subscription)
+  end
+
+  test "listener fallback recovers when the watcher misses a wake", ctx do
+    {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: 20)
+    ref = subscription.ref
+    worker = :sys.get_state(ctx.db.update_hub).worker
+    Process.sleep(25)
+    true = :erlang.suspend_process(worker)
+
+    try do
+      {:ok, _} = Honker.notify(ctx.db, "orders", %{"id" => "fallback"})
+      assert_receive {:honker_notification, ^ref, notification}, 1_000
+      assert notification.payload == %{"id" => "fallback"}
+    after
+      if Process.alive?(worker), do: :erlang.resume_process(worker)
+      Honker.unlisten(subscription)
+    end
+  end
+
+  test "listeners drain more than one batch to multiple slow consumers", ctx do
+    {:ok, first} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+    {:ok, second} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+
+    {:ok, tx} = Honker.Transaction.begin(ctx.db)
+
+    for i <- 0..1_104 do
+      assert {:ok, _} = Honker.notify_tx(tx, "orders", %{"seq" => i})
+    end
+
+    :ok = Honker.Transaction.commit(tx)
+    Process.sleep(50)
+
+    first_rows = receive_notifications(first.ref, 1_105)
+    second_rows = receive_notifications(second.ref, 1_105)
+    assert Enum.map(first_rows, & &1.payload["seq"]) == Enum.to_list(0..1_104)
+    assert Enum.map(first_rows, & &1.id) == Enum.map(second_rows, & &1.id)
+    refute_receive {:honker_notification, _, _}, 25
+
+    assert :ok = Honker.unlisten(first)
+    assert :ok = Honker.unlisten(second)
+  end
+
+  test "listener churn does not leak subscribers or break future delivery", ctx do
+    for _ <- 1..50 do
+      {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+      assert :ok = Honker.unlisten(subscription)
+    end
+
+    assert map_size(:sys.get_state(ctx.db.update_hub).subscribers) == 0
+    {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+    {:ok, _} = Honker.notify(ctx.db, "orders", %{"ok" => true})
+    assert_receive {:honker_notification, ref, notification}, 2_000
+    assert ref == subscription.ref
+    assert notification.payload == %{"ok" => true}
+    assert :ok = Honker.unlisten(subscription)
+  end
+
+  test "listener survives writer reconnects", ctx do
+    {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+    ref = subscription.ref
+
+    for i <- 0..1 do
+      {:ok, writer} = Honker.open(ctx.db_path, extension_path: ctx.ext)
+      {:ok, _} = Honker.notify(writer, "orders", %{"reconnect" => i})
+      :ok = Honker.close(writer)
+      assert_receive {:honker_notification, ^ref, notification}, 2_000
+      assert notification.payload == %{"reconnect" => i}
+    end
+
+    assert :ok = Honker.unlisten(subscription)
+  end
+
+  test "database replacement surfaces watcher failure to listener", ctx do
+    if :os.type() == {:win32, :nt} do
+      :ok
+    else
+      {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+      ref = subscription.ref
+      listener_monitor = Process.monitor(subscription.pid)
+      Process.sleep(150)
+      replacement = Path.join(Path.dirname(ctx.db_path), "replacement.db")
+      File.write!(replacement, "")
+      File.rename!(replacement, ctx.db_path)
+
+      assert_receive {:honker_listener_error, ^ref, reason}, 2_000
+      assert reason =~ "watcher closed or died"
+      assert_receive {:DOWN, ^listener_monitor, :process, _pid, _reason}, 1_000
+    end
+  end
+
+  test "watcher worker failure is reported and stops listeners", ctx do
+    {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+    ref = subscription.ref
+    listener_monitor = Process.monitor(subscription.pid)
+    worker = :sys.get_state(ctx.db.update_hub).worker
+
+    Process.exit(worker, :kill)
+
+    assert_receive {:honker_listener_error, ^ref, reason}, 1_000
+    assert reason =~ "update watcher exited"
+    assert_receive {:DOWN, ^listener_monitor, :process, _pid, _reason}, 1_000
   end
 
   test "listener stops when its subscribing process exits", ctx do

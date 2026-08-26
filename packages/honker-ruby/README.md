@@ -241,7 +241,7 @@ end
 
 Without a block, `listen` returns an enumerable listener. Use
 `listener.next(timeout_s: 5)` for a bounded wait and call `listener.close`
-when finished.
+when finished. Closing the database also closes every listener created from it.
 
 Delayed jobs use `run_at:`:
 

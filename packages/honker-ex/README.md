@@ -58,7 +58,8 @@ end
 :ok = Honker.unlisten(subscription)
 ```
 
-The listener also stops automatically if the subscribing process exits.
+The listener also stops automatically if the subscribing process exits or the
+database is closed.
 
 Delayed jobs use `run_at:`:
 
