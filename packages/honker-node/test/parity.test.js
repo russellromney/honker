@@ -865,6 +865,13 @@ test('claimWaker: wakes when runAt deadline arrives', { timeout: 12_000 }, async
     const msUntilDue = runAt * 1000 - Date.now();
     q.enqueue({ hello: 'future' }, { runAt });
     const waker = q.claimWaker({ idlePollS: 30 });
+    // Captured before the wait, while it still decides anything. Sampled
+    // after the timeout it is always 0, because next_claim_at only reports
+    // deadlines with run_at > unixepoch() and by then run_at has passed.
+    const nextClaimAtBeforeWait = db._callScalar(
+      'SELECT honker_queue_next_claim_at(?)',
+      ['deadline'],
+    );
     const t0 = Date.now();
     const job = await Promise.race([
       waker.next('w1'),
@@ -872,16 +879,22 @@ test('claimWaker: wakes when runAt deadline arrives', { timeout: 12_000 }, async
     ]);
     const dt = Date.now() - t0;
     if (!job) {
-      // Windows-only so far; does not reproduce on macOS or Linux.
-      // Report the state that decides the wait so the next failure says
-      // why. nextClaimAt of 0 means the waker fell back to idlePollS,
-      // which is a different bug from the deadline being computed wrong.
+      // Seen on Windows and on ubuntu-latest. Report the state that
+      // decides the wait.
+      //
+      // nextClaimAtBeforeWait is the deciding value: it should equal runAt.
+      // 0 there means the waker had no deadline to park on and fell back to
+      // idlePollS, which is a different bug from the deadline being computed
+      // wrong. nextClaimAtAfter is expected to be 0 once run_at has passed
+      // and proves nothing on its own — an earlier read of it was taken as
+      // evidence of the fallback and is not.
       const diag = {
         runAt,
         msUntilDue,
         waitedMs: dt,
+        nextClaimAtBeforeWait,
         now: Math.floor(Date.now() / 1000),
-        nextClaimAt: db._callScalar('SELECT honker_queue_next_claim_at(?)', ['deadline']),
+        nextClaimAtAfter: db._callScalar('SELECT honker_queue_next_claim_at(?)', ['deadline']),
         unixepoch: db._callScalar('SELECT unixepoch()'),
         journalMode: db._callScalar('PRAGMA journal_mode'),
         pending: db._callScalar(
