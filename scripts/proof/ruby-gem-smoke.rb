@@ -17,7 +17,15 @@ Dir.mktmpdir("honker-ruby-proof-") do |dir|
   raise "claim failed" unless job && job.id == id
   raise "payload mismatch" unless job.payload["to"] == "alice@example.com"
   raise "ack failed" unless job.ack
+
+  listener = db.listen("release-proof", fallback_poll_s: nil)
+  db.notify("release-proof", { installed_gem: true })
+  notification = listener.next(timeout_s: 2)
+  raise "listener timed out" unless notification
+  raise "notification mismatch" unless notification.payload == { "installed_gem" => true }
+
   db.close
+  raise "database close did not close listener" unless listener.closed?
 end
 
 puts "ruby gem smoke ok"

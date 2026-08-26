@@ -12,12 +12,12 @@ extension.
 | SQLite extension | load smoke | SQL | SQL | notify SQL only | SQL | SQL | host language watches/reads |
 | Python `honker` | yes | yes | yes | yes | yes | yes | shared Rust watcher |
 | Node `@russellthehippo/honker-node` | yes | yes | yes | yes | yes | yes | shared Rust watcher |
-| Ruby `honker` | yes | yes | yes | notify yes, listen no | yes | yes | extension C ABI |
+| Ruby `honker` | yes | yes | yes | yes | yes | yes | extension C ABI |
 | .NET `Honker` | yes | yes | yes | yes | yes | yes | extension C ABI |
 | Rust `honker` | CI | yes | yes | yes | yes | yes | shared Rust watcher |
 | Go | CI | yes | yes | yes | yes | yes | extension C ABI |
 | Bun `@russellthehippo/honker-bun` | CI | yes | yes | yes | yes | yes | extension C ABI |
-| Elixir `honker` | CI | yes | yes | notify yes, listen no | yes | yes | extension SQL handles |
+| Elixir `honker` | yes | yes | yes | yes | yes | yes | extension SQL handles |
 | C++ | CI | yes | yes | yes | yes | yes | extension C ABI |
 | JVM `dev.honker:honker` | CI + local clean consumer | yes | yes | yes | yes | yes | shared JVM watcher |
 | Kotlin `dev.honker:honker-kotlin` | local + ORM CI | wrapper | Flow wrapper | wrapper | wrapper | wrapper | JVM wrapper |
@@ -170,7 +170,6 @@ Backend contract:
   wrapper reverses topic and consumer at the offset SQL boundary, so its own
   resume path works but another binding will not see the same checkpoint.
 - Long soak on every OS; scary nightly soaks Linux
-- Ruby and Elixir async listen parity with Python/Node/.NET/Rust/Go/Bun/C++
 - Published Maven Central proof for JVM/Kotlin
 
 ## Compatibility Notes

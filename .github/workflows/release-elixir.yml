@@ -50,6 +50,15 @@ jobs:
           mix deps.get
           mix test
           mix hex.build
+          mix hex.build --unpack --output "$RUNNER_TEMP/honker-hex-unpacked"
+
+      - name: Smoke-test the unpacked Hex package
+        working-directory: ${{ runner.temp }}/honker-hex-unpacked
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: |
+          MIX_ENV=prod mix deps.get
+          MIX_ENV=prod mix run "$GITHUB_WORKSPACE/scripts/proof/elixir-hex-smoke.exs"
 
       - name: Upload Hex package artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

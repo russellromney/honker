@@ -72,6 +72,12 @@ def queue_writer_helper(path, ext, first, count)
   db.close
 end
 
+def notification_writer_helper(path, ext, channel, payload)
+  db = Honker::Database.new(path, extension_path: ext)
+  db.notify(channel, JSON.parse(payload))
+  db.close
+end
+
 if ARGV.first == "--honker-queue-worker"
   _, path, ext, backend, worker_id, ready_path, result_path = ARGV
   queue_worker_helper(path, ext, backend, worker_id, ready_path, result_path)
@@ -79,6 +85,10 @@ if ARGV.first == "--honker-queue-worker"
 elsif ARGV.first == "--honker-queue-writer"
   _, path, ext, first, count = ARGV
   queue_writer_helper(path, ext, Integer(first), Integer(count))
+  exit! 0
+elsif ARGV.first == "--honker-notification-writer"
+  _, path, ext, channel, payload = ARGV
+  notification_writer_helper(path, ext, channel, payload)
   exit! 0
 end
 
@@ -322,6 +332,30 @@ class HonkerWatcherBackendQueueTest < Minitest::Test
       assert_int_set(read_result(result), 60)
     end
   end
+
+  def test_listener_backends_observe_a_notification_from_another_process
+    each_backend do |path, ext, backend|
+      db = Honker::Database.new(path, extension_path: ext, watcher_backend: backend)
+      listener = db.listen("cross-process", fallback_poll_s: nil)
+      writer = Process.spawn(
+        RbConfig.ruby,
+        __FILE__,
+        "--honker-notification-writer",
+        path,
+        ext,
+        "cross-process",
+        JSON.dump({ "source" => "child" }),
+      )
+
+      wait_process(writer)
+      notification = listener.next(timeout_s: 2)
+      refute_nil notification
+      assert_equal({ "source" => "child" }, notification.payload)
+    ensure
+      listener&.close
+      db&.close
+    end
+  end
 end
 
 class HonkerTest < Minitest::Test
@@ -387,5 +421,281 @@ class HonkerTest < Minitest::Test
     assert_equal "orders", row[0]
     assert_equal({ "id" => 42 }, JSON.parse(row[1]))
     db.close
+  end
+
+  def test_listen_is_live_only_and_channel_filtered
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    db.notify("orders", { id: "historical" })
+    listener = db.listen("orders", fallback_poll_s: nil)
+
+    assert_nil listener.next(timeout_s: 0.05)
+    db.notify("other", { id: "wrong-channel" })
+    db.notify("orders", { id: 1 })
+    db.notify("orders", { id: 2 })
+
+    first = listener.next(timeout_s: 2)
+    second = listener.next(timeout_s: 2)
+    assert_equal({ "id" => 1 }, first.payload)
+    assert_equal({ "id" => 2 }, second.payload)
+    assert_equal "orders", first.channel
+    assert_operator second.id, :>, first.id
+    assert_operator first.created_at, :>, 0
+  ensure
+    listener&.close
+    db&.close
+  end
+
+  def test_multiple_listeners_do_not_steal_wakes
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    first = db.listen("orders", fallback_poll_s: nil)
+    second = db.listen("orders", fallback_poll_s: nil)
+
+    db.notify("orders", { id: 42 })
+    one = first.next(timeout_s: 2)
+    two = second.next(timeout_s: 2)
+
+    assert_equal({ "id" => 42 }, one.payload)
+    assert_equal one.id, two.id
+  ensure
+    first&.close
+    second&.close
+    db&.close
+  end
+
+  def test_listener_observes_commit_but_not_rollback
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: nil)
+
+    db.transaction do |tx|
+      db.notify_tx(tx, "orders", { id: "rolled-back" })
+      tx.rollback!
+    end
+    assert_nil listener.next(timeout_s: 0.05)
+
+    db.transaction do |tx|
+      db.notify_tx(tx, "orders", { id: "committed" })
+    end
+    notification = listener.next(timeout_s: 2)
+    assert_equal({ "id" => "committed" }, notification.payload)
+  ensure
+    listener&.close
+    db&.close
+  end
+
+  def test_listener_fallback_poll_does_not_expose_uncommitted_rows
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: 0.01)
+    result = ::Queue.new
+    reader = Thread.new { result << listener.next(timeout_s: 0.2) }
+
+    db.transaction do |tx|
+      db.notify_tx(tx, "orders", { id: "uncommitted" })
+      sleep 0.05
+      tx.rollback!
+    end
+
+    reader.join
+    assert_nil result.pop
+  ensure
+    listener&.close
+    db&.close
+  end
+
+  def test_listener_fallback_recovers_when_a_wake_is_missed
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    writer = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: 0.02)
+    wait_started = ::Queue.new
+
+    db.define_singleton_method(:wait_for_update_after) do |_generation, timeout_s, &_cancelled|
+      wait_started << true if wait_started.empty?
+      sleep(timeout_s)
+      false
+    end
+
+    result = ::Queue.new
+    reader = Thread.new { result << listener.next(timeout_s: 1) }
+    wait_started.pop
+    writer.notify("orders", { id: "fallback" })
+
+    assert reader.join(1), "fallback polling did not recover the missed wake"
+    assert_equal({ "id" => "fallback" }, result.pop.payload)
+  ensure
+    listener&.close
+    writer&.close
+    db&.close
+  end
+
+  def test_listener_drains_more_than_one_batch_to_multiple_slow_consumers
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    first = db.listen("orders", fallback_poll_s: nil)
+    second = db.listen("orders", fallback_poll_s: nil)
+
+    db.transaction do |tx|
+      1_105.times { |i| db.notify_tx(tx, "orders", { seq: i }) }
+    end
+    sleep 0.05
+
+    first_rows = Array.new(1_105) { first.next(timeout_s: 2) }
+    second_rows = Array.new(1_105) { second.next(timeout_s: 2) }
+    assert_equal (0...1_105).to_a, first_rows.map { |row| row.payload["seq"] }
+    assert_equal first_rows.map(&:id), second_rows.map(&:id)
+    assert_nil first.next(timeout_s: 0)
+    assert_nil second.next(timeout_s: 0)
+  ensure
+    first&.close
+    second&.close
+    db&.close
+  end
+
+  def test_listener_churn_does_not_leak_or_break_future_delivery
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    50.times { db.listen("orders", fallback_poll_s: nil).close }
+
+    assert_empty db.instance_variable_get(:@listeners)
+    listener = db.listen("orders", fallback_poll_s: nil)
+    db.notify("orders", { ok: true })
+    assert_equal({ "ok" => true }, listener.next(timeout_s: 2).payload)
+  ensure
+    listener&.close
+    db&.close
+  end
+
+  def test_listener_survives_writer_reconnects
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: nil)
+    writer = nil
+
+    2.times do |i|
+      writer = Honker::Database.new(@db_path, extension_path: @ext)
+      writer.notify("orders", { reconnect: i })
+      writer.close
+      assert_equal({ "reconnect" => i }, listener.next(timeout_s: 2).payload)
+    end
+  ensure
+    writer&.close
+    listener&.close
+    db&.close
+  end
+
+  def test_database_replacement_surfaces_watcher_failure_to_listener
+    skip "file identity replacement is not supported on Windows" if Gem.win_platform?
+
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: nil)
+    sleep 0.15
+    replacement = File.join(@tmpdir, "replacement.db")
+    File.write(replacement, "")
+    File.rename(replacement, @db_path)
+
+    error = assert_raises(Honker::Error) { listener.next(timeout_s: 2) }
+    assert_match(/watcher closed or died/, error.message)
+    assert listener.closed?
+  ensure
+    listener&.close
+    db&.close
+  end
+
+  def test_update_hub_propagates_watcher_failure
+    watcher = Object.new
+    watcher.define_singleton_method(:wait) do |_timeout_s|
+      raise Honker::Error, "injected watcher failure"
+    end
+    watcher.define_singleton_method(:close) { nil }
+    hub = Honker::UpdateHub.new(watcher)
+
+    error = assert_raises(Honker::Error) { hub.wait_after(0, 1) }
+    assert_equal "injected watcher failure", error.message
+  ensure
+    hub&.close
+  end
+
+  def test_listener_close_is_idempotent
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders")
+    sleep 0.02
+    generation = db.update_snapshot
+    listener.close
+    listener.close
+
+    assert listener.closed?
+    assert_nil listener.next(timeout_s: 0)
+    assert_equal generation, db.update_snapshot
+    refute db.wait_for_update(0), "closing a listener manufactured a database update"
+  ensure
+    db&.close
+  end
+
+  def test_listener_close_only_cancels_that_listener
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: nil)
+    listener_result = ::Queue.new
+    update_result = ::Queue.new
+    reader = Thread.new { listener_result << listener.next }
+    waiter = Thread.new { update_result << db.wait_for_update(0.15) }
+    sleep 0.02
+
+    listener.close
+
+    assert reader.join(0.5), "listener close did not cancel its blocked next call"
+    assert_nil listener_result.pop
+    assert waiter.join(0.5), "database update waiter did not reach its timeout"
+    refute update_result.pop, "listener close was reported as a database update"
+  ensure
+    listener&.close
+    db&.close
+  end
+
+  def test_listen_block_yields_and_closes_automatically
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    writer = Honker::Database.new(@db_path, extension_path: @ext)
+    write_thread = Thread.new do
+      sleep 0.02
+      writer.notify("orders", { id: 42 })
+    end
+
+    notification = db.listen("orders", fallback_poll_s: nil) do |received|
+      break received
+    end
+
+    write_thread.join
+    assert_equal({ "id" => 42 }, notification.payload)
+  ensure
+    writer&.close
+    db&.close
+  end
+
+  def test_database_close_unblocks_a_listener
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: nil)
+    result = ::Queue.new
+    reader = Thread.new { result << listener.next }
+
+    sleep 0.02
+    db.close
+    db = nil
+
+    assert reader.join(1), "listener remained blocked after database close"
+    assert_nil result.pop
+    assert listener.closed?
+    assert_nil listener.instance_variable_get(:@read_db)
+  ensure
+    listener&.close
+    db&.close
+  end
+
+  def test_database_closes_an_idle_listener_and_rejects_new_listeners
+    db = Honker::Database.new(@db_path, extension_path: @ext)
+    listener = db.listen("orders", fallback_poll_s: nil)
+
+    db.close
+
+    assert listener.closed?
+    assert_nil listener.instance_variable_get(:@read_db)
+    error = assert_raises(Honker::Error) { db.listen("orders") }
+    assert_equal "database is closed", error.message
+  ensure
+    listener&.close
+    db&.close
   end
 end

@@ -295,13 +295,11 @@ feature-parity phase should either port those task APIs to every core
 binding or define explicit API tiers so "core binding" has a precise
 meaning before 1.0.
 
-Two listener-surface gaps carry over from the shipped wake-parity work:
-
-- Ruby and Elixir expose extension-backed `notify` and table APIs but
-  still have no async listen / update-watcher API. Add one only if the
-  runtime integration can support a clean cancellation story.
-- Add parity tests exercising a cross-process notification wake in every
-  binding that has a listener API.
+Ruby and Elixir now expose high-level, live-only channel listeners backed by
+one fan-out update hub per database. Ruby listeners support explicit close and
+block cleanup; Elixir subscriptions support explicit `unlisten` and stop when
+their owner process exits. Both bindings include cross-process notification
+wake proofs across their supported watcher backends.
 
 ## Phase Atlas — Map Experimental Backend Edge-Case Behavior
 
