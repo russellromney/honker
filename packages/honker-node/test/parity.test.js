@@ -349,7 +349,7 @@ test('stream: canonical checkpoint wins over a legacy-looking row', () => {
   }
 });
 
-test('stream: unverifiable legacy checkpoint fails without creating a canonical row', () => {
+test('stream: unverifiable legacy read fails but an explicit zero reset succeeds', () => {
   const { path: p, cleanup } = tmpdb();
   try {
     const db = honker.open(p);
@@ -377,6 +377,38 @@ test('stream: unverifiable legacy checkpoint fails without creating a canonical 
       ),
       [],
     );
+
+    assert.equal(s.saveOffset('worker-c', 0), true);
+    assert.equal(s.getOffset('worker-c'), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: explicit valid save recovers an unverifiable legacy checkpoint', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const s = db.stream('orders');
+    const current = s.publish({ i: 1 });
+    const tx = db.transaction();
+    tx.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, ?)',
+      ['orders', 'worker-c', 999],
+    );
+    tx.commit();
+
+    assert.equal(s.saveOffset('worker-c', current), true);
+    assert.equal(s.getOffset('worker-c'), current);
+    assert.deepEqual(
+      db.query(
+        'SELECT name, topic, offset FROM _honker_stream_consumers ORDER BY name, topic',
+      ),
+      [
+        { name: 'orders', topic: 'worker-c', offset: 999 },
+        { name: 'worker-c', topic: 'orders', offset: current },
+      ],
+    );
   } finally {
     cleanup();
   }
@@ -398,6 +430,10 @@ test('stream: reversed-name collision fails loudly instead of skipping events', 
       (err) =>
         err instanceof honker.CheckpointMigrationError && err.offset === offset,
     );
+    const orders = db.stream('orders');
+    const ordersOffset = orders.publish({ belongsTo: 'orders' });
+    assert.equal(orders.saveOffset('worker-c', ordersOffset), true);
+    assert.equal(orders.getOffset('worker-c'), ordersOffset);
   } finally {
     cleanup();
   }
@@ -489,6 +525,33 @@ test('stream: saveOffsetTx migrates legacy state in the caller transaction', () 
     assert.equal(s.saveOffsetTx(committed, 'c1', second), true);
     committed.commit();
     assert.equal(s.getOffset('c1'), second);
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: saveOffsetTx can recover unverifiable legacy state atomically', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const s = db.stream('events');
+    const current = s.publish({ i: 1 });
+    const seed = db.transaction();
+    seed.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, ?)',
+      ['events', 'c1', 999],
+    );
+    seed.commit();
+
+    const rolledBack = db.transaction();
+    assert.equal(s.saveOffsetTx(rolledBack, 'c1', current), true);
+    rolledBack.rollback();
+    assert.throws(() => s.getOffset('c1'), honker.CheckpointMigrationError);
+
+    const committed = db.transaction();
+    assert.equal(s.saveOffsetTx(committed, 'c1', current), true);
+    committed.commit();
+    assert.equal(s.getOffset('c1'), current);
   } finally {
     cleanup();
   }

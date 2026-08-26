@@ -96,11 +96,20 @@ saved. Migration is transactional, preserves the old row, and verifies that
 the saved offset belongs to a retained event in the requested stream. A
 canonical row always wins when both key orders exist.
 
-This alpha compatibility path deliberately rejects checkpoint state it cannot
+Node 0.5.0's alpha compatibility path deliberately rejects checkpoint state it cannot
 verify—for example, an arbitrary offset or one whose event was manually
 deleted—with `CheckpointMigrationError` and code
-`HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE`. Reset that checkpoint explicitly
-before continuing. Running 0.4.6 and a corrected version against the same
-consumer concurrently is unsupported during the upgrade.
+`HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE`. Guarded reads (`getOffset()`,
+`readFromConsumer()`, and `subscribe()`) throw because guessing could skip
+events. Recover by explicitly establishing canonical progress:
+
+```js
+stream.saveOffset("worker-c", 0);           // replay retained events
+stream.saveOffset("worker-c", knownOffset); // resume after a known event
+```
+
+`saveOffsetTx()` supports the same recovery inside a caller-owned transaction.
+Running 0.4.6 and a corrected version against the same consumer concurrently
+is unsupported during the upgrade.
 
 For streams, notify/listen, SQL functions, and full scheduler docs, see the main repo and docs site.

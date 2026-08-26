@@ -372,6 +372,9 @@ jobs:
           else
             maturin develop --release --features kernel-watcher,shm-fast-path
           fi
+      - name: Check Node package version alignment
+        shell: bash
+        run: python3 scripts/proof/check-node-version-alignment.py
       - name: Build .node binary
         working-directory: packages/honker-node
         shell: bash

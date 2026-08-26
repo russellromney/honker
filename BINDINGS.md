@@ -167,9 +167,10 @@ Backend contract:
   Publishing and explicit-offset reads are unaffected; named-consumer
   `readFromConsumer()` and `subscribe()` cannot share 0.4.6 resume positions
   with another binding.
-- Current Node source writes the canonical key. On first checkpoint access it
+- Node 0.5.0 writes the canonical key. On first checkpoint access it
   transactionally copies a legacy row only when that row's offset belongs to a
   retained event in the requested stream. Canonical rows win, and unverifiable
-  alpha-era state fails loudly instead of guessing. Node/Python publish,
-  checkpoint, resume, subscription, legacy-upgrade, and transactional-save
-  journeys run in the Node CI matrix.
+  alpha-era reads fail loudly instead of guessing. An explicit `saveOffset` or
+  `saveOffsetTx` establishes canonical progress and is the supported reset
+  path. Node/Python publish, checkpoint, resume, subscription, legacy-upgrade,
+  recovery, and transactional-save journeys run in the Node CI matrix.

@@ -228,6 +228,53 @@ def test_node_automatically_migrates_verified_0_4_6_checkpoint(tmp_path):
         py_db.close()
 
 
+def test_node_explicit_save_recovers_unverifiable_0_4_6_checkpoint(tmp_path):
+    _require_node_interop()
+    db_path = tmp_path / "unverifiable-node-checkpoint.db"
+    py_db = honker.open(str(db_path))
+    try:
+        with py_db.transaction() as tx:
+            tx.execute(
+                "INSERT INTO _honker_stream_consumers (name, topic, offset) "
+                "VALUES (?, ?, ?)",
+                ["orders", "worker-c", 999],
+            )
+
+        observed = _run_node(
+            r"""
+            const honker = require(".");
+            const db = honker.open(process.argv[1]);
+            try {
+              const stream = db.stream("orders");
+              let readError;
+              try {
+                stream.getOffset("worker-c");
+              } catch (err) {
+                readError = err.code;
+              }
+              const changed = stream.saveOffset("worker-c", 0);
+              console.log(JSON.stringify({
+                readError,
+                changed,
+                recoveredOffset: stream.getOffset("worker-c"),
+              }));
+            } finally {
+              db.close();
+            }
+            """,
+            db_path,
+        )
+
+        assert observed == {
+            "readError": "HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE",
+            "changed": True,
+            "recoveredOffset": 0,
+        }
+        assert py_db.stream("orders").get_offset("worker-c") == 0
+    finally:
+        py_db.close()
+
+
 def test_node_transactional_checkpoint_is_visible_to_python(tmp_path):
     _require_node_interop()
     db_path = tmp_path / "node-transactional-checkpoint.db"

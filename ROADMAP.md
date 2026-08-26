@@ -72,7 +72,9 @@ reprocess the full retained stream.
   event in the requested stream, then copy it to the canonical row in the same
   transaction.
 - Offset zero is safe to copy. If a nonzero offset is missing or belongs to a
-  different stream, raise `CheckpointMigrationError` rather than guess.
+  different stream, guarded reads raise `CheckpointMigrationError` rather than
+  guess. Explicit `saveOffset` / `saveOffsetTx` calls bypass that legacy row and
+  establish the caller-supplied canonical progress, including a zero reset.
 - Keep the legacy row for rollback. Canonical state wins once present.
 - Treat arbitrary/deleted offsets, reversed-name collisions, and mixed 0.4.6 +
   corrected-version writers as unsupported alpha upgrade cases. There is no
@@ -80,9 +82,9 @@ reprocess the full retained stream.
 
 ### Verification
 
-- Keep Node tests for canonical-only, legacy-only, canonical precedence, and
-  unverifiable rows, covering `saveOffset`, `saveOffsetTx`, `getOffset`, and
-  subscription resume.
+- Keep Node tests for canonical-only, legacy-only, canonical precedence,
+  unverifiable reads, explicit recovery, and identical/reversed names, covering
+  `saveOffset`, `saveOffsetTx`, `getOffset`, and subscription resume.
 - Prove an on-disk checkpoint written by 0.4.6 automatically migrates without
   a resume-from-zero replay, while new Node checkpoints are visible to Python.
 - Run actual Python→Node and Node→Python publish/checkpoint/resume journeys,

@@ -10,12 +10,16 @@
   stream. The migration is transactional, canonical state wins, and the old
   row remains available for rollback.
 - Unverifiable alpha-era checkpoint state fails with
-  `CheckpointMigrationError` instead of silently replaying or skipping events.
-  Concurrent use of Node 0.4.6 and a corrected release for the same consumer is
-  unsupported during upgrade.
+  `CheckpointMigrationError` on reads instead of silently replaying or skipping
+  events. An explicit `saveOffset` or `saveOffsetTx` establishes canonical
+  progress, so resetting to zero never requires raw SQL. Concurrent use of Node
+  0.4.6 and a corrected release for the same consumer is unsupported during
+  upgrade.
 - Cross-runtime tests publish real events and prove Python→Node and Node→Python
   named-consumer resume, Node subscription persistence, legacy 0.4.6 migration,
   and transactional commit/rollback.
+- The Node package and its platform-native packages advance to 0.5.0 for this
+  on-disk resume behavior change.
 
 ## Unreleased — extension reach for every binding (Phase Beavis)
 

@@ -92,7 +92,7 @@ class CheckpointMigrationError extends Error {
       `Cannot automatically migrate the Node 0.4.6 checkpoint for stream ` +
         `${JSON.stringify(stream)} and consumer ${JSON.stringify(consumer)}: ` +
         `legacy offset ${offset} is not a retained event in that stream. ` +
-        `Reset or migrate this checkpoint explicitly before upgrading.`,
+        `Call saveOffset(consumer, 0) to reset it, or explicitly save a known offset.`,
     );
     this.name = 'CheckpointMigrationError';
     this.code = 'HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE';
@@ -634,7 +634,7 @@ class Stream {
   // a normal checkpoint is the offset of an event in this stream. That
   // lets the common upgrade path migrate automatically without guessing
   // about a legitimate checkpoint for the reversed name pair.
-  _resolveCheckpointTx(tx, consumer) {
+  _resolveCheckpointTx(tx, consumer, { allowUnverifiable = false } = {}) {
     const canonicalOffset = scalar(
       tx.query(
         'SELECT offset FROM _honker_stream_consumers WHERE name = ? AND topic = ?',
@@ -656,6 +656,12 @@ class Stream {
         tx.query('SELECT topic FROM _honker_stream WHERE offset = ?', [legacyOffset]),
       );
       if (eventTopic !== this.name) {
+        // Reads must not guess: adopting this row could skip events for
+        // the requested stream. An explicit save is different. It gives
+        // us the caller's intended canonical progress, so leave the
+        // ambiguous legacy row untouched and let the canonical upsert
+        // below establish the new source of truth.
+        if (allowUnverifiable) return 0;
         throw new CheckpointMigrationError(this.name, consumer, legacyOffset);
       }
     }
@@ -671,7 +677,7 @@ class Stream {
   saveOffset(consumer, offset) {
     const tx = this._db.transaction();
     try {
-      this._resolveCheckpointTx(unwrapTx(tx), consumer);
+      this._resolveCheckpointTx(unwrapTx(tx), consumer, { allowUnverifiable: true });
       const changed =
         scalar(
           unwrapTx(tx).query('SELECT honker_stream_save_offset(?, ?, ?)', [
@@ -692,7 +698,7 @@ class Stream {
 
   saveOffsetTx(tx, consumer, offset) {
     const rawTx = unwrapTx(tx);
-    this._resolveCheckpointTx(rawTx, consumer);
+    this._resolveCheckpointTx(rawTx, consumer, { allowUnverifiable: true });
     return (
       scalar(
         rawTx.query('SELECT honker_stream_save_offset(?, ?, ?)', [
