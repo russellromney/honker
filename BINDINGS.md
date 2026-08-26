@@ -160,13 +160,16 @@ Backend contract:
 - Ruby and Elixir async listen parity with Python/Node/.NET/Rust/Go/Bun/C++
 - Published Maven Central proof for JVM/Kotlin
 
-## Known Defects
+## Compatibility Notes
 
-- **Node stream checkpoints are not interoperable in
-  `@russellthehippo/honker-node@0.4.6`.** The wrapper passes `(topic,
-  consumer)` to SQL functions whose contract is `(consumer, topic)`. Node's
-  own save/resume path is self-consistent, but Python and other bindings read a
-  different `_honker_stream_consumers` row. Publishing and reading stream
-  events are unaffected. The strict expected-failure interop test in
-  `tests/test_node_python_interop.py` tracks this until the migration-safe fix
-  described in `ROADMAP.md` ships.
+- **Node 0.4.6 stream checkpoints use transposed keys.** Its wrapper passes
+  `(topic, consumer)` to SQL functions whose contract is `(consumer, topic)`.
+  Publishing and explicit-offset reads are unaffected; named-consumer
+  `readFromConsumer()` and `subscribe()` cannot share 0.4.6 resume positions
+  with another binding.
+- Current Node source writes the canonical key. On first checkpoint access it
+  transactionally copies a legacy row only when that row's offset belongs to a
+  retained event in the requested stream. Canonical rows win, and unverifiable
+  alpha-era state fails loudly instead of guessing. Node/Python publish,
+  checkpoint, resume, subscription, legacy-upgrade, and transactional-save
+  journeys run in the Node CI matrix.

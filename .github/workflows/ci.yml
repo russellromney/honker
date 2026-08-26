@@ -364,7 +364,7 @@ jobs:
             VENV_PY=.venv/bin/python
             ACTIVATE=.venv/bin/activate
           fi
-          uv pip install --python "$VENV_PY" maturin
+          uv pip install --python "$VENV_PY" maturin pytest pytest-xdist
           cd packages/honker
           . "../../$ACTIVATE"
           if [ "${{ runner.os }}" = "Windows" ]; then
@@ -378,6 +378,15 @@ jobs:
         run: |
           npm ci
           npx napi build --platform --release --features kernel-watcher,shm-fast-path
+      - name: Test Node ↔ Python stream checkpoint journeys
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            VENV_PY=.venv/Scripts/python.exe
+          else
+            VENV_PY=.venv/bin/python
+          fi
+          "$VENV_PY" -m pytest tests/test_node_python_interop.py -q --tb=short
       - name: Test (extension resolver — no addon load)
         working-directory: packages/honker-node
         shell: bash
@@ -458,9 +467,6 @@ jobs:
         with:
           use-cache: false
       - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "22"
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
@@ -633,15 +639,6 @@ jobs:
         run: |
           . .venv/bin/activate
           python -m pytest tests/test_ruby_python_interop.py -q --tb=short
-      - name: Track Node ↔ Python stream-checkpoint defect
-        shell: bash
-        run: |
-          cd packages/honker-node
-          npm ci
-          npx napi build --platform --release --features kernel-watcher,shm-fast-path
-          cd ../..
-          . .venv/bin/activate
-          python -m pytest tests/test_node_python_interop.py -q --tb=short -rxX
 
   jvm:
     name: jvm · honker + documented ORM recipes

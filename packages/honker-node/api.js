@@ -86,6 +86,22 @@ function unwrapTx(tx) {
   return tx instanceof Transaction ? tx._tx : tx;
 }
 
+class CheckpointMigrationError extends Error {
+  constructor(stream, consumer, offset) {
+    super(
+      `Cannot automatically migrate the Node 0.4.6 checkpoint for stream ` +
+        `${JSON.stringify(stream)} and consumer ${JSON.stringify(consumer)}: ` +
+        `legacy offset ${offset} is not a retained event in that stream. ` +
+        `Reset or migrate this checkpoint explicitly before upgrading.`,
+    );
+    this.name = 'CheckpointMigrationError';
+    this.code = 'HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE';
+    this.stream = stream;
+    this.consumer = consumer;
+    this.offset = offset;
+  }
+}
+
 class Transaction {
   constructor(tx) {
     this._tx = tx;
@@ -612,22 +628,76 @@ class Stream {
     return this.readSince(this.getOffset(consumer), limit);
   }
 
-  saveOffset(consumer, offset) {
-    return (
-      this._db._callScalar('SELECT honker_stream_save_offset(?, ?, ?)', [
-        this.name,
-        consumer,
-        offset,
-      ]) === 1
+  // Node 0.4.6 persisted (stream, consumer) into the SQL ABI's
+  // (consumer, topic) key. Prefer the canonical row. When only the old
+  // row exists, its saved offset identifies which stream produced it:
+  // a normal checkpoint is the offset of an event in this stream. That
+  // lets the common upgrade path migrate automatically without guessing
+  // about a legitimate checkpoint for the reversed name pair.
+  _resolveCheckpointTx(tx, consumer) {
+    const canonicalOffset = scalar(
+      tx.query(
+        'SELECT offset FROM _honker_stream_consumers WHERE name = ? AND topic = ?',
+        [consumer, this.name],
+      ),
     );
+    if (canonicalOffset != null) return canonicalOffset;
+
+    const legacyOffset = scalar(
+      tx.query(
+        'SELECT offset FROM _honker_stream_consumers WHERE name = ? AND topic = ?',
+        [this.name, consumer],
+      ),
+    );
+    if (legacyOffset == null) return 0;
+
+    if (legacyOffset !== 0) {
+      const eventTopic = scalar(
+        tx.query('SELECT topic FROM _honker_stream WHERE offset = ?', [legacyOffset]),
+      );
+      if (eventTopic !== this.name) {
+        throw new CheckpointMigrationError(this.name, consumer, legacyOffset);
+      }
+    }
+
+    tx.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, ?) ' +
+        'ON CONFLICT(name, topic) DO NOTHING',
+      [consumer, this.name, legacyOffset],
+    );
+    return legacyOffset;
+  }
+
+  saveOffset(consumer, offset) {
+    const tx = this._db.transaction();
+    try {
+      this._resolveCheckpointTx(unwrapTx(tx), consumer);
+      const changed =
+        scalar(
+          unwrapTx(tx).query('SELECT honker_stream_save_offset(?, ?, ?)', [
+            consumer,
+            this.name,
+            offset,
+          ]),
+        ) === 1;
+      tx.commit();
+      return changed;
+    } catch (err) {
+      try {
+        tx.rollback();
+      } catch {}
+      throw err;
+    }
   }
 
   saveOffsetTx(tx, consumer, offset) {
+    const rawTx = unwrapTx(tx);
+    this._resolveCheckpointTx(rawTx, consumer);
     return (
       scalar(
-        unwrapTx(tx).query('SELECT honker_stream_save_offset(?, ?, ?)', [
-          this.name,
+        rawTx.query('SELECT honker_stream_save_offset(?, ?, ?)', [
           consumer,
+          this.name,
           offset,
         ]),
       ) === 1
@@ -635,10 +705,17 @@ class Stream {
   }
 
   getOffset(consumer) {
-    return this._db._callScalar('SELECT honker_stream_get_offset(?, ?)', [
-      this.name,
-      consumer,
-    ]);
+    const tx = this._db.transaction();
+    try {
+      const offset = this._resolveCheckpointTx(unwrapTx(tx), consumer);
+      tx.commit();
+      return offset;
+    } catch (err) {
+      try {
+        tx.rollback();
+      } catch {}
+      throw err;
+    }
   }
 
   subscribe(consumer, opts = {}) {
@@ -955,6 +1032,7 @@ module.exports = function buildApi(nativeBinding) {
     Stream,
     StreamEvent,
     StreamSubscription,
+    CheckpointMigrationError,
     Listener,
     Scheduler,
     Lock,

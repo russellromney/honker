@@ -294,6 +294,156 @@ test('stream: consumer offsets + readFromConsumer', () => {
   }
 });
 
+test('stream: automatically migrates a verified Node 0.4.6 checkpoint', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const s = db.stream('orders');
+    const first = s.publish({ i: 1 });
+    const second = s.publish({ i: 2 });
+    const tx = db.transaction();
+    tx.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, ?)',
+      ['orders', 'worker-c', first],
+    );
+    tx.commit();
+
+    assert.equal(s.getOffset('worker-c'), first);
+    assert.deepEqual(s.readFromConsumer('worker-c', 10).map((event) => event.payload), [
+      { i: 2 },
+    ]);
+    assert.deepEqual(
+      db.query(
+        'SELECT name, topic, offset FROM _honker_stream_consumers ORDER BY name, topic',
+      ),
+      [
+        { name: 'orders', topic: 'worker-c', offset: first },
+        { name: 'worker-c', topic: 'orders', offset: first },
+      ],
+    );
+
+    assert.equal(s.saveOffset('worker-c', second), true);
+    assert.equal(s.getOffset('worker-c'), second);
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: canonical checkpoint wins over a legacy-looking row', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const s = db.stream('orders');
+    const first = s.publish({ i: 1 });
+    const second = s.publish({ i: 2 });
+    const tx = db.transaction();
+    tx.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, ?), (?, ?, ?)',
+      ['worker-c', 'orders', first, 'orders', 'worker-c', second],
+    );
+    tx.commit();
+
+    assert.equal(s.getOffset('worker-c'), first);
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: unverifiable legacy checkpoint fails without creating a canonical row', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const s = db.stream('orders');
+    const tx = db.transaction();
+    tx.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, ?)',
+      ['orders', 'worker-c', 999],
+    );
+    tx.commit();
+
+    assert.throws(
+      () => s.getOffset('worker-c'),
+      (err) =>
+        err instanceof honker.CheckpointMigrationError &&
+        err.code === 'HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE' &&
+        err.stream === 'orders' &&
+        err.consumer === 'worker-c' &&
+        err.offset === 999,
+    );
+    assert.deepEqual(
+      db.query(
+        'SELECT offset FROM _honker_stream_consumers WHERE name = ? AND topic = ?',
+        ['worker-c', 'orders'],
+      ),
+      [],
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: reversed-name collision fails loudly instead of skipping events', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const reversed = db.stream('worker-c');
+    const offset = reversed.publish({ belongsTo: 'worker-c' });
+    // This is a valid canonical row for stream "worker-c", consumer
+    // "orders", but it looks like a 0.4.6 legacy row for the reversed
+    // pair. The event topic lets the upgrade path reject that guess.
+    reversed.saveOffset('orders', offset);
+
+    assert.throws(
+      () => db.stream('orders').getOffset('worker-c'),
+      (err) =>
+        err instanceof honker.CheckpointMigrationError && err.offset === offset,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: zero-offset legacy checkpoint migrates without event evidence', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const tx = db.transaction();
+    tx.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, 0)',
+      ['orders', 'worker-c'],
+    );
+    tx.commit();
+
+    assert.equal(db.stream('orders').getOffset('worker-c'), 0);
+    assert.deepEqual(
+      db.query(
+        'SELECT offset FROM _honker_stream_consumers WHERE name = ? AND topic = ?',
+        ['worker-c', 'orders'],
+      ),
+      [{ offset: 0 }],
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: identical stream and consumer names need no migration', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const stream = db.stream('same');
+    const offset = stream.publish({ i: 1 });
+    assert.equal(stream.saveOffset('same', offset), true);
+    assert.equal(stream.getOffset('same'), offset);
+    assert.equal(
+      db.query('SELECT COUNT(*) AS count FROM _honker_stream_consumers')[0].count,
+      1,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test('stream: saveOffsetTx respects rollback', () => {
   const { path: p, cleanup } = tmpdb();
   try {
@@ -305,6 +455,40 @@ test('stream: saveOffsetTx respects rollback', () => {
     s.saveOffsetTx(tx, 'c1', 2);
     tx.rollback();
     assert.equal(s.getOffset('c1'), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: saveOffsetTx migrates legacy state in the caller transaction', () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const s = db.stream('events');
+    const first = s.publish({ i: 1 });
+    const second = s.publish({ i: 2 });
+    const seed = db.transaction();
+    seed.execute(
+      'INSERT INTO _honker_stream_consumers (name, topic, offset) VALUES (?, ?, ?)',
+      ['events', 'c1', first],
+    );
+    seed.commit();
+
+    const rolledBack = db.transaction();
+    assert.equal(s.saveOffsetTx(rolledBack, 'c1', second), true);
+    rolledBack.rollback();
+    assert.deepEqual(
+      db.query(
+        'SELECT offset FROM _honker_stream_consumers WHERE name = ? AND topic = ?',
+        ['c1', 'events'],
+      ),
+      [],
+    );
+
+    const committed = db.transaction();
+    assert.equal(s.saveOffsetTx(committed, 'c1', second), true);
+    committed.commit();
+    assert.equal(s.getOffset('c1'), second);
   } finally {
     cleanup();
   }

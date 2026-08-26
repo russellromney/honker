@@ -64,34 +64,30 @@ A direct argument swap is unsafe. Existing Node checkpoints would disappear
 from the corrected lookup, making upgraded consumers resume at offset zero and
 reprocess the full retained stream.
 
-### Migration-safe fix
+### Alpha compatibility fix
 
-- Change new writes to the canonical `(consumer, topic)` key order.
-- On read/save, prefer an existing canonical row. Only when it is absent, read
-  the legacy `(topic, consumer)` row and copy its offset into the canonical row
-  transactionally before continuing.
-- Do not delete the legacy row automatically. It may also be a legitimate
-  canonical checkpoint for the reversed stream/consumer pair; automatic
-  deletion could corrupt that consumer.
-- Document the compatibility behavior and provide an explicit inspection or
-  cleanup recipe for users who know their stream/consumer names do not collide.
-- After a deprecation window, remove the fallback in a major release while
-  keeping the migration recipe available.
-
-If both key orders already exist, the canonical row wins. Taking the maximum
-would avoid some replay, but a legacy-looking row may belong to a real reversed
-pair; using it could skip unprocessed events, which is worse than replay.
+- New writes use the canonical `(consumer, topic)` key order.
+- Reads and saves prefer an existing canonical row. When only the legacy
+  `(topic, consumer)` row exists, verify that its offset identifies a retained
+  event in the requested stream, then copy it to the canonical row in the same
+  transaction.
+- Offset zero is safe to copy. If a nonzero offset is missing or belongs to a
+  different stream, raise `CheckpointMigrationError` rather than guess.
+- Keep the legacy row for rollback. Canonical state wins once present.
+- Treat arbitrary/deleted offsets, reversed-name collisions, and mixed 0.4.6 +
+  corrected-version writers as unsupported alpha upgrade cases. There is no
+  migration CLI, configuration map, provenance table, or automatic cleanup.
 
 ### Verification
 
-- Keep `tests/test_node_python_interop.py` as a strict expected failure until
-  the compatibility implementation lands; removing its marker is part of the
-  fix.
-- Add Node tests for canonical-only, legacy-only, both-rows, and identical
-  consumer/topic names, covering `saveOffset`, `saveOffsetTx`, `getOffset`, and
+- Keep Node tests for canonical-only, legacy-only, canonical precedence, and
+  unverifiable rows, covering `saveOffset`, `saveOffsetTx`, `getOffset`, and
   subscription resume.
-- Prove an on-disk checkpoint written by 0.4.6 survives upgrade without a
-  resume-from-zero replay, while new Node checkpoints are visible to Python.
+- Prove an on-disk checkpoint written by 0.4.6 automatically migrates without
+  a resume-from-zero replay, while new Node checkpoints are visible to Python.
+- Run actual Python→Node and Node→Python publish/checkpoint/resume journeys,
+  including subscription persistence and transactional commit/rollback, in the
+  existing Node OS/version matrix.
 - Call out the migration in the Node release notes before publishing the fixed
   package.
 
