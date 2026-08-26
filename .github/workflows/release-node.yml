@@ -118,6 +118,7 @@ jobs:
         working-directory: packages/honker-node
         run: |
           npm ci
+          python3 ../../scripts/proof/check-node-version-alignment.py
           npm exec -- napi artifacts --output-dir . --npm-dir npm
           ../../scripts/copy-node-extension.sh
           ../../scripts/proof/check-node-native-artifacts.sh honker.*.node npm/*/*.node

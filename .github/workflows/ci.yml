@@ -364,7 +364,7 @@ jobs:
             VENV_PY=.venv/bin/python
             ACTIVATE=.venv/bin/activate
           fi
-          uv pip install --python "$VENV_PY" maturin
+          uv pip install --python "$VENV_PY" maturin pytest pytest-xdist
           cd packages/honker
           . "../../$ACTIVATE"
           if [ "${{ runner.os }}" = "Windows" ]; then
@@ -372,12 +372,24 @@ jobs:
           else
             maturin develop --release --features kernel-watcher,shm-fast-path
           fi
+      - name: Check Node package version alignment
+        shell: bash
+        run: python3 scripts/proof/check-node-version-alignment.py
       - name: Build .node binary
         working-directory: packages/honker-node
         shell: bash
         run: |
           npm ci
           npx napi build --platform --release --features kernel-watcher,shm-fast-path
+      - name: Test Node ↔ Python stream checkpoint journeys
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            VENV_PY=.venv/Scripts/python.exe
+          else
+            VENV_PY=.venv/bin/python
+          fi
+          "$VENV_PY" -m pytest tests/test_node_python_interop.py -q --tb=short
       - name: Test (extension resolver — no addon load)
         working-directory: packages/honker-node
         shell: bash
