@@ -50,6 +50,51 @@ the watcher.
 - Do not make the kernel backend the default anywhere.
 - Do not weaken the test to make it pass.
 
+## Phase Robinson — Migrate Node Stream Checkpoint Keys
+
+> Known data-compatibility defect in `@russellthehippo/honker-node@0.4.6`
+
+Node 0.4.6 calls `honker_stream_save_offset` and
+`honker_stream_get_offset` with `(topic, consumer)` even though the SQL ABI and
+`_honker_stream_consumers(name, topic, offset)` use `(consumer, topic)`. Its
+own save/resume path works because both calls make the same mistake, but other
+bindings silently use a different checkpoint row.
+
+A direct argument swap is unsafe. Existing Node checkpoints would disappear
+from the corrected lookup, making upgraded consumers resume at offset zero and
+reprocess the full retained stream.
+
+### Migration-safe fix
+
+- Change new writes to the canonical `(consumer, topic)` key order.
+- On read/save, prefer an existing canonical row. Only when it is absent, read
+  the legacy `(topic, consumer)` row and copy its offset into the canonical row
+  transactionally before continuing.
+- Do not delete the legacy row automatically. It may also be a legitimate
+  canonical checkpoint for the reversed stream/consumer pair; automatic
+  deletion could corrupt that consumer.
+- Document the compatibility behavior and provide an explicit inspection or
+  cleanup recipe for users who know their stream/consumer names do not collide.
+- After a deprecation window, remove the fallback in a major release while
+  keeping the migration recipe available.
+
+If both key orders already exist, the canonical row wins. Taking the maximum
+would avoid some replay, but a legacy-looking row may belong to a real reversed
+pair; using it could skip unprocessed events, which is worse than replay.
+
+### Verification
+
+- Keep `tests/test_node_python_interop.py` as a strict expected failure until
+  the compatibility implementation lands; removing its marker is part of the
+  fix.
+- Add Node tests for canonical-only, legacy-only, both-rows, and identical
+  consumer/topic names, covering `saveOffset`, `saveOffsetTx`, `getOffset`, and
+  subscription resume.
+- Prove an on-disk checkpoint written by 0.4.6 survives upgrade without a
+  resume-from-zero replay, while new Node checkpoints are visible to Python.
+- Call out the migration in the Node release notes before publishing the fixed
+  package.
+
 ## Phase Ranger — Delegate Locks To Bouncer
 
 > Later architecture work

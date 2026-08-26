@@ -81,4 +81,17 @@ Supported schedule forms:
 - `schedule` is the canonical recurring-schedule option.
 - `cron` still works as a compatibility alias.
 
+### Known issue in 0.4.6: cross-binding stream checkpoints
+
+`stream.saveOffset(consumer, offset)`, `stream.saveOffsetTx(...)`, and
+`stream.getOffset(consumer)` swap the stream topic and consumer name at the SQL
+boundary. Node-to-Node resume is self-consistent, but another binding does not
+see Node's checkpoint, and Node does not see checkpoints saved by Python or
+another binding. Stream publishing and reading are unaffected.
+
+Do not share named stream checkpoints between Node 0.4.6 and another binding.
+Correcting the argument order alone would make existing Node consumers resume
+from zero and replay old events, so the planned fix includes compatibility for
+the transposed rows already on disk.
+
 For streams, notify/listen, SQL functions, and full scheduler docs, see the main repo and docs site.

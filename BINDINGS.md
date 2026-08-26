@@ -159,3 +159,14 @@ Backend contract:
 - Long soak on every OS; scary nightly soaks Linux
 - Ruby and Elixir async listen parity with Python/Node/.NET/Rust/Go/Bun/C++
 - Published Maven Central proof for JVM/Kotlin
+
+## Known Defects
+
+- **Node stream checkpoints are not interoperable in
+  `@russellthehippo/honker-node@0.4.6`.** The wrapper passes `(topic,
+  consumer)` to SQL functions whose contract is `(consumer, topic)`. Node's
+  own save/resume path is self-consistent, but Python and other bindings read a
+  different `_honker_stream_consumers` row. Publishing and reading stream
+  events are unaffected. The strict expected-failure interop test in
+  `tests/test_node_python_interop.py` tracks this until the migration-safe fix
+  described in `ROADMAP.md` ships.
