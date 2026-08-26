@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## Unreleased — Node checkpoint interoperability (Phase Robinson)
+
+- Node stream checkpoint calls now use the shared SQL ABI's canonical
+  `(consumer, topic)` key order, so `saveOffset`, `saveOffsetTx`, `getOffset`,
+  `readFromConsumer`, and `subscribe` interoperate with every other binding.
+- Checkpoints written by Node 0.4.6 migrate automatically on first access when
+  their saved offset can be verified against a retained event in the requested
+  stream. The migration is transactional, canonical state wins, and the old
+  row remains available for rollback.
+- Unverifiable alpha-era checkpoint state fails with
+  `CheckpointMigrationError` on reads instead of silently replaying or skipping
+  events. An explicit `saveOffset` or `saveOffsetTx` establishes canonical
+  progress, so resetting to zero never requires raw SQL. Concurrent use of Node
+  0.4.6 and a corrected release for the same consumer is unsupported during
+  upgrade.
+- Cross-runtime tests publish real events and prove Python→Node and Node→Python
+  named-consumer resume, Node subscription persistence, legacy 0.4.6 migration,
+  and transactional commit/rollback.
+- The Node package and its platform-native packages advance to 0.5.0 for this
+  on-disk resume behavior change.
+
 ## Unreleased — extension reach for every binding (Phase Beavis)
 
 Closes issue #99. Every binding could `open()` a database; almost none

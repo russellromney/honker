@@ -35,6 +35,13 @@ export interface StreamEvent {
   createdAt: number | null
 }
 
+export class CheckpointMigrationError extends Error {
+  readonly code: 'HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE'
+  readonly stream: string
+  readonly consumer: string
+  readonly offset: number
+}
+
 export interface QueueOptions {
   visibilityTimeoutS?: number
   maxAttempts?: number
