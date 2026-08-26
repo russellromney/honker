@@ -50,6 +50,49 @@ the watcher.
 - Do not make the kernel backend the default anywhere.
 - Do not weaken the test to make it pass.
 
+## Phase Robinson — Migrate Node Stream Checkpoint Keys
+
+> Known data-compatibility defect in `@russellthehippo/honker-node@0.4.6`
+
+Node 0.4.6 calls `honker_stream_save_offset` and
+`honker_stream_get_offset` with `(topic, consumer)` even though the SQL ABI and
+`_honker_stream_consumers(name, topic, offset)` use `(consumer, topic)`. Its
+own save/resume path works because both calls make the same mistake, but other
+bindings silently use a different checkpoint row.
+
+A direct argument swap is unsafe. Existing Node checkpoints would disappear
+from the corrected lookup, making upgraded consumers resume at offset zero and
+reprocess the full retained stream.
+
+### Alpha compatibility fix
+
+- New writes use the canonical `(consumer, topic)` key order.
+- Reads and saves prefer an existing canonical row. When only the legacy
+  `(topic, consumer)` row exists, verify that its offset identifies a retained
+  event in the requested stream, then copy it to the canonical row in the same
+  transaction.
+- Offset zero is safe to copy. If a nonzero offset is missing or belongs to a
+  different stream, guarded reads raise `CheckpointMigrationError` rather than
+  guess. Explicit `saveOffset` / `saveOffsetTx` calls bypass that legacy row and
+  establish the caller-supplied canonical progress, including a zero reset.
+- Keep the legacy row for rollback. Canonical state wins once present.
+- Treat arbitrary/deleted offsets, reversed-name collisions, and mixed 0.4.6 +
+  corrected-version writers as unsupported alpha upgrade cases. There is no
+  migration CLI, configuration map, provenance table, or automatic cleanup.
+
+### Verification
+
+- Keep Node tests for canonical-only, legacy-only, canonical precedence,
+  unverifiable reads, explicit recovery, and identical/reversed names, covering
+  `saveOffset`, `saveOffsetTx`, `getOffset`, and subscription resume.
+- Prove an on-disk checkpoint written by 0.4.6 automatically migrates without
+  a resume-from-zero replay, while new Node checkpoints are visible to Python.
+- Run actual Python→Node and Node→Python publish/checkpoint/resume journeys,
+  including subscription persistence and transactional commit/rollback, in the
+  existing Node OS/version matrix.
+- Call out the migration in the Node release notes before publishing the fixed
+  package.
+
 ## Phase Ranger — Delegate Locks To Bouncer
 
 > Later architecture work

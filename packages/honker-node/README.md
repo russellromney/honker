@@ -81,4 +81,35 @@ Supported schedule forms:
 - `schedule` is the canonical recurring-schedule option.
 - `cron` still works as a compatibility alias.
 
+### Upgrading stream checkpoints written by 0.4.6
+
+Node 0.4.6 swapped the stream topic and consumer name at the SQL boundary in
+`stream.saveOffset(consumer, offset)`, `stream.saveOffsetTx(...)`, and
+`stream.getOffset(consumer)`. Publishing and explicit-offset `readSince()` were
+unaffected. Named-consumer `readFromConsumer()` and `subscribe()` were
+self-consistent within Node 0.4.6, but could not share resume positions with
+Python or another binding.
+
+Later versions use the canonical `(consumer, topic)` key and automatically
+migrate a 0.4.6 checkpoint the first time that stream/consumer pair is read or
+saved. Migration is transactional, preserves the old row, and verifies that
+the saved offset belongs to a retained event in the requested stream. A
+canonical row always wins when both key orders exist.
+
+Node 0.5.0's alpha compatibility path deliberately rejects checkpoint state it cannot
+verify—for example, an arbitrary offset or one whose event was manually
+deleted—with `CheckpointMigrationError` and code
+`HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE`. Guarded reads (`getOffset()`,
+`readFromConsumer()`, and `subscribe()`) throw because guessing could skip
+events. Recover by explicitly establishing canonical progress:
+
+```js
+stream.saveOffset("worker-c", 0);           // replay retained events
+stream.saveOffset("worker-c", knownOffset); // resume after a known event
+```
+
+`saveOffsetTx()` supports the same recovery inside a caller-owned transaction.
+Running 0.4.6 and a corrected version against the same consumer concurrently
+is unsupported during the upgrade.
+
 For streams, notify/listen, SQL functions, and full scheduler docs, see the main repo and docs site.
