@@ -60,9 +60,9 @@ O(n) shift-everything was the bottleneck, not the SQL.
 ### Wake / idle watcher
 
 ```
-cross-process notify/listen wake:      p50 ~= 0.7ms on M-series
-PRAGMA data_version poll cost:         ~3.5us/poll
-idle watcher cost at 1kHz:             ~3.5ms CPU/sec per Database
+cross-process notify/listen wake:      p50 ~= 2.9ms on Apple M1 Pro (n=500)
+PRAGMA data_version poll cost:         ~2.0us/poll
+idle watcher cost at 1kHz:             ~2.0ms CPU/sec per Database
 ```
 
 The wake path is intentionally boring: one `PRAGMA data_version` read

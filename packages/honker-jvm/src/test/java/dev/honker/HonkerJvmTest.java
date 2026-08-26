@@ -3,6 +3,7 @@ package dev.honker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.BufferedReader;
 import java.nio.file.Path;
 import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
@@ -930,7 +931,7 @@ class HonkerJvmTest {
     }
 
     @Test
-    void crossProcessListenerWakeLatencyStaysBelowUserVisibleBounds() throws Exception {
+    void crossProcessListenerWakesFromWatcherNotFallbackPoll() throws Exception {
         Path dbPath = tmp.resolve("listener-latency.db");
         Path extension = NativeLoader.resolve(OpenOptions.defaults());
         try (Database db = Honker.open(dbPath, OpenOptions.builder().extensionPath(extension).build())) {
@@ -941,19 +942,19 @@ class HonkerJvmTest {
         for (int i = 0; i < 12; i++) {
             Path ready = tmp.resolve("listener-" + i + ".ready");
             Path done = tmp.resolve("listener-" + i + ".done");
-            Process child = startChild("listener-marker", dbPath, extension, ready, done);
-            try {
-                waitUntil(Duration.ofSeconds(5), () -> Files.isRegularFile(ready), "child listener should become ready");
-                long start = System.nanoTime();
+            Process child = startChildWithStdout("listener-marker", dbPath, extension, ready, done);
+            try (BufferedReader childOutput = child.inputReader(StandardCharsets.UTF_8)) {
+                assertEquals("READY", childOutput.readLine(), "child listener should become ready");
                 try (Database db = Honker.open(dbPath, OpenOptions.builder()
                     .extensionPath(extension)
                     .fallbackPollInterval(Duration.ofSeconds(30))
                     .build())) {
-                    db.notify("multiprocess-listen", "{\"sample\":" + i + "}");
+                    String payload = "{\"sample\":" + i + "}";
+                    long start = System.nanoTime();
+                    db.notify("multiprocess-listen", payload);
+                    assertEquals("WAKE:" + payload, childOutput.readLine(), "child listener should wake");
+                    samples.add(Duration.ofNanos(System.nanoTime() - start).toMillis());
                 }
-                waitUntil(Duration.ofSeconds(5), () -> Files.isRegularFile(done), "child listener should wake");
-                samples.add(Duration.ofNanos(System.nanoTime() - start).toMillis());
-                assertEquals("{\"sample\":" + i + "}", Files.readString(done, StandardCharsets.UTF_8));
                 assertEquals(0, child.waitFor());
             } finally {
                 child.destroyForcibly();
@@ -967,6 +968,19 @@ class HonkerJvmTest {
         // that distinguishes those.
         List<Long> inOrder = List.copyOf(samples);
         samples.sort(Long::compareTo);
+        // These bounds separate mechanisms, they do not police the published
+        // latency figure — bench/wake_latency_bench.py does that, gated at
+        // p50 < 5 ms in CI against 500 samples.
+        //
+        // A watcher that never fires cannot reach here at all: the child sets
+        // fallbackPollInterval to 30 s and gives up after 10 s, so it exits 2
+        // and child.waitFor() above fails. What these catch is the band in
+        // between — a watcher that still fires but has degraded to hundreds of
+        // milliseconds, which no exit code would notice.
+        //
+        // Deliberately loose. This runs on shared PR runners where absolute
+        // wall-clock assertions flake; tightening them toward the real ~3 ms
+        // buys no signal the bench does not already give and costs red builds.
         assertTrue(percentile(samples, 0.50) < 50,
             "listener wake p50 was too slow: sorted=" + samples + " byIteration=" + inOrder);
         assertTrue(percentile(samples, 0.90) < 250,
@@ -1156,6 +1170,14 @@ class HonkerJvmTest {
     }
 
     private static Process startChild(String mode, Path db, Path ext, Path ready, Path done) throws Exception {
+        return childProcess(mode, db, ext, ready, done).redirectErrorStream(true).start();
+    }
+
+    private static Process startChildWithStdout(String mode, Path db, Path ext, Path ready, Path done) throws Exception {
+        return childProcess(mode, db, ext, ready, done).start();
+    }
+
+    private static ProcessBuilder childProcess(String mode, Path db, Path ext, Path ready, Path done) {
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         return new ProcessBuilder(
             java,
@@ -1167,7 +1189,7 @@ class HonkerJvmTest {
             ext.toString(),
             ready.toString(),
             done.toString()
-        ).redirectErrorStream(true).start();
+        );
     }
 
     private static long count(Database db, String sql) {

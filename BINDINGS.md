@@ -19,8 +19,17 @@ extension.
 | Bun `@russellthehippo/honker-bun` | CI | yes | yes | yes | yes | yes | extension C ABI |
 | Elixir `honker` | CI | yes | yes | notify yes, listen no | yes | yes | extension SQL handles |
 | C++ | CI | yes | yes | yes | yes | yes | extension C ABI |
-| JVM `dev.honker:honker` | local + clean consumer | yes | yes | yes | yes | yes | shared JVM watcher |
-| Kotlin `dev.honker:honker-kotlin` | local + clean consumer | wrapper | Flow wrapper | wrapper | wrapper | wrapper | JVM wrapper |
+| JVM `dev.honker:honker` | CI + local clean consumer | yes | yes | yes | yes | yes | shared JVM watcher |
+| Kotlin `dev.honker:honker-kotlin` | local + ORM CI | wrapper | Flow wrapper | wrapper | wrapper | wrapper | JVM wrapper |
+
+### Function Task Helpers
+
+| Binding | Named handler registry | Worker dispatcher | Convenience syntax |
+| --- | ---: | ---: | --- |
+| Python | yes | CLI and in-process | `@task`, `@periodic_task` |
+| JVM | yes | `runTasks` | explicit `TaskRegistry` / `TaskHandle` |
+| Kotlin | yes | `runTasks` | Kotlin helpers over the JVM registry |
+| Node, Rust, Go, Ruby, Bun, Elixir, .NET, C++ | no | no | queue and result primitives only |
 
 ## Extension Reach
 
@@ -147,8 +156,9 @@ Backend contract:
   Bun, Ruby, Elixir, and Ruby/Python interop
 - Packaged-install proof for Python, Node, Ruby, and .NET in clean
   throwaway consumers
-- JVM and Kotlin local Maven proof plus clean consumer proof outside the
-  repo
+- JVM package install/tests and the documented JVM ORM recipes in PR CI
+- Kotlin Exposed ORM recipe in PR CI; Kotlin wrapper package tests and clean
+  consumer proof remain local
 - Representative cross-language wake and table-behavior proofs
 - JVM watcher parity for stable `AUTO`/`PRAGMA_DATA_VERSION` and explicit
   experimental `MMAP_SHM` / `KERNEL_EVENTS`
@@ -156,6 +166,9 @@ Backend contract:
 ## Not Proven Yet
 
 - Every possible cross-language pair; CI covers representative pairs
+- Cross-binding named-consumer checkpoints involving Node. Its current stream
+  wrapper reverses topic and consumer at the offset SQL boundary, so its own
+  resume path works but another binding will not see the same checkpoint.
 - Long soak on every OS; scary nightly soaks Linux
 - Ruby and Elixir async listen parity with Python/Node/.NET/Rust/Go/Bun/C++
 - Published Maven Central proof for JVM/Kotlin
