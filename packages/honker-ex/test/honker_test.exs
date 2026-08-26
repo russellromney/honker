@@ -60,7 +60,13 @@ defmodule HonkerWatcherBackendOptionTest do
 
   test "custom watcher poll interval detects commits" do
     ext = find_extension() || flunk("honker extension not built")
-    dir = Path.join(System.tmp_dir!(), "honker-ex-watch-interval-#{System.unique_integer([:positive])}")
+
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "honker-ex-watch-interval-#{System.unique_integer([:positive])}"
+      )
+
     File.mkdir_p!(dir)
     path = Path.join(dir, "t.db")
 
@@ -324,6 +330,33 @@ defmodule HonkerWatcherBackendQueueTest do
       end
     end
   end
+
+  test "listener backends observe a notification from another process" do
+    ext = find_extension() || flunk("honker extension not built")
+
+    for backend <- @backends do
+      {dir, path} = tmp_db()
+
+      try do
+        if bootstrap(path, ext, backend) != :skip do
+          pin = maybe_pin_shm(path, ext, backend)
+          {:ok, db} = Honker.open(path, extension_path: ext, watcher_backend: backend)
+          {:ok, subscription} = Honker.listen(db, "cross-process", fallback_poll_ms: nil)
+          ref = subscription.ref
+
+          run_helper(["notify", path, ext, "cross-process", ~s({"source":"child"})])
+
+          assert_receive {:honker_notification, ^ref, notification}, 2_000
+          assert notification.payload == %{"source" => "child"}
+          :ok = Honker.unlisten(subscription)
+          Honker.close(db)
+          close_pin(pin)
+        end
+      after
+        File.rm_rf!(dir)
+      end
+    end
+  end
 end
 
 defmodule HonkerTest do
@@ -422,5 +455,117 @@ defmodule HonkerTest do
 
     assert channel == "orders"
     assert Jason.decode!(payload) == %{"id" => 42}
+  end
+
+  test "listen is live-only, channel-filtered, and ordered", ctx do
+    db = ctx.db
+    {:ok, _} = Honker.notify(db, "orders", %{"id" => "historical"})
+    {:ok, subscription} = Honker.listen(db, "orders", fallback_poll_ms: nil)
+    ref = subscription.ref
+
+    refute_receive {:honker_notification, ^ref, _}, 50
+    {:ok, _} = Honker.notify(db, "other", %{"id" => "wrong-channel"})
+    {:ok, _} = Honker.notify(db, "orders", %{"id" => 1})
+    {:ok, _} = Honker.notify(db, "orders", %{"id" => 2})
+
+    assert_receive {:honker_notification, ^ref, first}, 2_000
+    assert_receive {:honker_notification, ^ref, second}, 2_000
+    assert first.payload == %{"id" => 1}
+    assert second.payload == %{"id" => 2}
+    assert first.channel == "orders"
+    assert second.id > first.id
+    assert first.created_at > 0
+    refute_receive {:honker_notification, ^ref, _}, 50
+
+    assert :ok = Honker.unlisten(subscription)
+  end
+
+  test "multiple listeners and wait_for_update all observe one commit", ctx do
+    db = ctx.db
+    {:ok, first} = Honker.listen(db, "orders", fallback_poll_ms: nil)
+    {:ok, second} = Honker.listen(db, "orders", fallback_poll_ms: nil)
+    first_ref = first.ref
+    second_ref = second.ref
+
+    parent = self()
+    waiter = spawn(fn -> send(parent, {:wait_result, Honker.wait_for_update(db, 2_000)}) end)
+
+    {:ok, _} = Honker.notify(db, "orders", %{"id" => 42})
+
+    assert_receive {:honker_notification, ^first_ref, first_notification}, 2_000
+    assert_receive {:honker_notification, ^second_ref, second_notification}, 2_000
+    assert_receive {:wait_result, :changed}, 2_000
+    assert first_notification.id == second_notification.id
+    assert first_notification.payload == %{"id" => 42}
+
+    assert :ok = Honker.unlisten(first)
+    assert :ok = Honker.unlisten(second)
+    refute Process.alive?(waiter)
+  end
+
+  test "listener observes commit but not rollback", ctx do
+    db = ctx.db
+    {:ok, subscription} = Honker.listen(db, "orders", fallback_poll_ms: nil)
+    ref = subscription.ref
+
+    {:ok, tx} = Honker.Transaction.begin(db)
+    {:ok, _} = Honker.notify_tx(tx, "orders", %{"id" => "rolled-back"})
+    :ok = Honker.Transaction.rollback(tx)
+    refute_receive {:honker_notification, ^ref, _}, 50
+
+    {:ok, tx2} = Honker.Transaction.begin(db)
+    {:ok, _} = Honker.notify_tx(tx2, "orders", %{"id" => "committed"})
+    :ok = Honker.Transaction.commit(tx2)
+
+    assert_receive {:honker_notification, ^ref, notification}, 2_000
+    assert notification.payload == %{"id" => "committed"}
+    assert :ok = Honker.unlisten(subscription)
+  end
+
+  test "listener fallback polling does not expose uncommitted rows", ctx do
+    db = ctx.db
+    {:ok, subscription} = Honker.listen(db, "orders", fallback_poll_ms: 10)
+    ref = subscription.ref
+
+    {:ok, tx} = Honker.Transaction.begin(db)
+    {:ok, _} = Honker.notify_tx(tx, "orders", %{"id" => "uncommitted"})
+    refute_receive {:honker_notification, ^ref, _}, 75
+    :ok = Honker.Transaction.rollback(tx)
+    refute_receive {:honker_notification, ^ref, _}, 50
+
+    assert :ok = Honker.unlisten(subscription)
+  end
+
+  test "listener stops when its subscribing process exits", ctx do
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+        send(parent, {:subscription, subscription})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:subscription, subscription}, 1_000
+    listener_monitor = Process.monitor(subscription.pid)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^listener_monitor, :process, _pid, _reason}, 1_000
+  end
+
+  test "closing a database stops its listeners without reporting an error", ctx do
+    {:ok, subscription} = Honker.listen(ctx.db, "orders", fallback_poll_ms: nil)
+    ref = subscription.ref
+    listener_monitor = Process.monitor(subscription.pid)
+
+    :ok = Honker.close(ctx.db)
+
+    assert_receive {:DOWN, ^listener_monitor, :process, _pid, _reason}, 1_000
+    refute_receive {:honker_listener_error, ^ref, _}, 50
+  end
+
+  test "unlisten is idempotent", ctx do
+    {:ok, subscription} = Honker.listen(ctx.db, "orders")
+    assert :ok = Honker.unlisten(subscription)
+    assert :ok = Honker.unlisten(subscription)
   end
 end

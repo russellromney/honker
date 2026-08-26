@@ -230,6 +230,19 @@ if (job = q.claim_one("worker-1"))
 end
 ```
 
+Live pub/sub listeners are channel-filtered and skip notifications that
+already existed when they attached:
+
+```ruby
+db.listen("orders") do |notification|
+  puts notification.payload
+end
+```
+
+Without a block, `listen` returns an enumerable listener. Use
+`listener.next(timeout_s: 5)` for a bounded wait and call `listener.close`
+when finished.
+
 Delayed jobs use `run_at:`:
 
 ```ruby

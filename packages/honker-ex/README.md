@@ -43,6 +43,23 @@ case Honker.Queue.claim_one(db, "emails", "worker-1") do
 end
 ```
 
+Live pub/sub subscriptions are channel-filtered and skip notifications that
+already existed when they attached:
+
+```elixir
+{:ok, subscription} = Honker.listen(db, "orders")
+ref = subscription.ref
+
+receive do
+  {:honker_notification, ^ref, notification} ->
+    IO.inspect(notification.payload)
+end
+
+:ok = Honker.unlisten(subscription)
+```
+
+The listener also stops automatically if the subscribing process exits.
+
 Delayed jobs use `run_at:`:
 
 ```elixir

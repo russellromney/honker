@@ -43,7 +43,7 @@ defmodule Honker do
     A Honker database handle. Wraps the Exqlite reference + a
     registry of per-queue options (visibility timeout, max attempts).
     """
-    defstruct [:conn, :path, :watcher_id, queue_opts: %{}]
+    defstruct [:conn, :path, :update_hub, queue_opts: %{}]
   end
 
   @update_table :honker_local_update_seq
@@ -70,20 +70,28 @@ defmodule Honker do
     backend = watcher_backend_param(Keyword.get(opts, :watcher_backend))
     watcher_poll_interval_ms = Keyword.get(opts, :watcher_poll_interval_ms, 1)
 
-    with {:ok, conn} <- Sqlite3.open(path),
-         :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout = 5000;"),
-         :ok <- Sqlite3.enable_load_extension(conn, true),
-         :ok <- run_bare(conn, "SELECT load_extension(?1)", [extension_path]),
-         :ok <- Sqlite3.enable_load_extension(conn, false),
-         :ok <- Sqlite3.execute(conn, @default_pragmas),
-         :ok <- run_bare(conn, "SELECT honker_bootstrap()", []),
-         {:ok, [watcher_id]} <-
-           query_first(conn, "SELECT honker_update_watcher_open(?1, ?2, ?3)", [
-             path,
-             backend,
-             watcher_poll_interval_ms
-           ]) do
-      {:ok, %Database{conn: conn, path: path, watcher_id: watcher_id}}
+    with {:ok, conn} <- Sqlite3.open(path) do
+      result =
+        with :ok <- Sqlite3.execute(conn, "PRAGMA busy_timeout = 5000;"),
+             :ok <- Sqlite3.enable_load_extension(conn, true),
+             :ok <- run_bare(conn, "SELECT load_extension(?1)", [extension_path]),
+             :ok <- Sqlite3.enable_load_extension(conn, false),
+             :ok <- Sqlite3.execute(conn, @default_pragmas),
+             :ok <- run_bare(conn, "SELECT honker_bootstrap()", []),
+             {:ok, update_hub} <-
+               Honker.UpdateHub.start(path, extension_path, backend, watcher_poll_interval_ms) do
+          {:ok, %Database{conn: conn, path: path, update_hub: update_hub}}
+        end
+
+      case result do
+        {:ok, _db} = ok ->
+          ok
+
+        error ->
+          _ = Sqlite3.enable_load_extension(conn, false)
+          _ = Sqlite3.close(conn)
+          error
+      end
     end
   end
 
@@ -91,8 +99,8 @@ defmodule Honker do
   defp watcher_backend_param(backend) when is_binary(backend), do: backend
   defp watcher_backend_param(backend), do: inspect(backend)
 
-  def close(%Database{conn: conn, watcher_id: watcher_id}) do
-    _ = query_first(conn, "SELECT honker_update_watcher_close(?1)", [watcher_id])
+  def close(%Database{conn: conn, update_hub: update_hub}) do
+    _ = Honker.UpdateHub.close(update_hub)
     Sqlite3.close(conn)
   end
 
@@ -136,6 +144,23 @@ defmodule Honker do
       {:ok, [id]} -> {:ok, id}
       other -> other
     end
+  end
+
+  @doc """
+  Subscribe the calling process to live notifications on `channel`.
+
+  Historical rows are skipped. New notifications arrive as
+  `{:honker_notification, subscription.ref, %Honker.Notification{}}`.
+  Call `unlisten/1` to stop explicitly; the listener also stops when the
+  subscribing process exits.
+  """
+  def listen(%Database{} = db, channel, opts \\ []) do
+    Honker.Listener.start(db, channel, self(), opts)
+  end
+
+  @doc "Stop a live notification subscription. Idempotent."
+  def unlisten(%Honker.Subscription{} = subscription) do
+    Honker.Listener.close(subscription)
   end
 
   @doc """
@@ -242,16 +267,8 @@ defmodule Honker do
   end
 
   @doc false
-  def wait_for_update(%Database{conn: conn, watcher_id: watcher_id}, timeout_ms) do
-    case query_first(conn, "SELECT honker_update_watcher_wait(?1, ?2)", [
-           watcher_id,
-           max(0, timeout_ms)
-         ]) do
-      {:ok, [1]} -> :changed
-      {:ok, [0]} -> :timeout
-      {:ok, [-1]} -> {:error, "honker update watcher closed or died"}
-      other -> other
-    end
+  def wait_for_update(%Database{update_hub: update_hub}, timeout_ms) do
+    Honker.UpdateHub.wait(update_hub, timeout_ms)
   end
 
   @doc false
@@ -267,6 +284,23 @@ defmodule Honker do
 
       err ->
         err
+    end
+  end
+
+  @doc false
+  def query_all(conn, sql, params) do
+    case Sqlite3.prepare(conn, sql) do
+      {:ok, stmt} ->
+        try do
+          with :ok <- Sqlite3.bind(stmt, params) do
+            collect_rows(conn, stmt, [])
+          end
+        after
+          _ = Sqlite3.release(conn, stmt)
+        end
+
+      error ->
+        error
     end
   end
 
@@ -295,6 +329,14 @@ defmodule Honker do
 
       _ ->
         @update_table
+    end
+  end
+
+  defp collect_rows(conn, stmt, rows) do
+    case Sqlite3.step(conn, stmt) do
+      {:row, row} -> collect_rows(conn, stmt, [row | rows])
+      :done -> {:ok, Enum.reverse(rows)}
+      error -> error
     end
   end
 end

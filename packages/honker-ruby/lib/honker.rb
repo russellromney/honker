@@ -159,6 +159,264 @@ module Honker
     end
   end
 
+  # Fans one native watcher out to any number of Ruby waiters. The native
+  # watcher owns a single receiver, so callers must not race each other on
+  # CoreWatcher#wait directly.
+  class UpdateHub
+    WAIT_SLICE_S = 0.1
+
+    def initialize(watcher)
+      @watcher = watcher
+      @mutex = Mutex.new
+      @changed = ConditionVariable.new
+      @generation = 0
+      @seen_by_thread = {}
+      @stopping = false
+      @closed = false
+      @disposed = false
+      @error = nil
+      @thread = Thread.new { run }
+      @thread.name = "honker-update-hub" if @thread.respond_to?(:name=)
+    end
+
+    def snapshot
+      @mutex.synchronize { @generation }
+    end
+
+    def closed?
+      @mutex.synchronize { @closed }
+    end
+
+    def signal
+      @mutex.synchronize do
+        return if @closed
+
+        @generation += 1
+        @changed.broadcast
+      end
+    end
+
+    def wait_after(generation, timeout_s = nil)
+      deadline = timeout_s.nil? ? nil : monotonic_now + [timeout_s.to_f, 0.0].max
+      @mutex.synchronize do
+        loop do
+          raise @error if @error
+          return false if @closed
+          return true if @generation > generation
+
+          if deadline
+            remaining = deadline - monotonic_now
+            return false if remaining <= 0
+
+            @changed.wait(@mutex, remaining)
+          else
+            @changed.wait(@mutex)
+          end
+        end
+      end
+    end
+
+    def wait(timeout_s)
+      deadline = monotonic_now + [timeout_s.to_f, 0.0].max
+      key = Thread.current
+      @mutex.synchronize do
+        @seen_by_thread.delete_if { |thread, _generation| !thread.alive? }
+        loop do
+          raise @error if @error
+          return false if @closed
+          if @generation > @seen_by_thread.fetch(key, 0)
+            @seen_by_thread[key] = @generation
+            return true
+          end
+
+          remaining = deadline - monotonic_now
+          return false if remaining <= 0
+
+          @changed.wait(@mutex, remaining)
+        end
+      end
+    end
+
+    def close
+      @mutex.synchronize do
+        return if @disposed
+
+        if @stopping
+          @changed.wait(@mutex) until @disposed
+          return
+        end
+
+        @stopping = true
+      end
+      begin
+        @thread.join
+        @watcher.close
+      ensure
+        @mutex.synchronize do
+          @disposed = true
+          @closed = true
+          @changed.broadcast
+        end
+      end
+    end
+
+    private
+
+    def run
+      loop do
+        break if @mutex.synchronize { @stopping }
+
+        signal if @watcher.wait(WAIT_SLICE_S)
+      end
+    rescue StandardError => e
+      @mutex.synchronize do
+        @error = e
+        @closed = true
+        @changed.broadcast
+      end
+    ensure
+      @mutex.synchronize do
+        @closed = true unless @stopping
+        @changed.broadcast
+      end
+    end
+
+    def monotonic_now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+  end
+
+  # A live pub/sub notification. Payloads produced by Database#notify are
+  # JSON-decoded; raw non-JSON SQL payloads are returned unchanged.
+  Notification = Struct.new(:id, :channel, :payload, :created_at)
+
+  class Listener
+    include Enumerable
+
+    def initialize(db, channel, fallback_poll_s: 15.0)
+      raise ArgumentError, "channel must not be empty" if channel.to_s.empty?
+      if !fallback_poll_s.nil? && !fallback_poll_s.to_f.positive?
+        raise ArgumentError, "fallback_poll_s must be positive or nil"
+      end
+
+      @db = db
+      @channel = channel.to_s
+      @fallback_poll_s = fallback_poll_s&.to_f
+      @buffer = []
+      @state_mutex = Mutex.new
+      @active_calls = 0
+      @closed = false
+      @read_db = SQLite3::Database.new(@db.path)
+      @read_db.busy_timeout = 5000
+      @read_db.execute("PRAGMA query_only = ON")
+      @last_seen = @read_db.get_first_value(
+        "SELECT COALESCE(MAX(id), 0) FROM _honker_notifications WHERE channel = ?",
+        [@channel],
+      ).to_i
+    rescue StandardError
+      @read_db&.close
+      raise
+    end
+
+    attr_reader :channel
+
+    def next(timeout_s: nil)
+      read_db = begin_call
+      return nil unless read_db
+
+      deadline = timeout_s.nil? ? nil : monotonic_now + [timeout_s.to_f, 0.0].max
+      loop do
+        return nil if closed?
+        return @buffer.shift unless @buffer.empty?
+
+        generation = @db.update_snapshot
+        refill(read_db)
+        next unless @buffer.empty?
+
+        remaining = deadline && deadline - monotonic_now
+        return nil if remaining && remaining <= 0
+
+        wait_s = [remaining, @fallback_poll_s].compact.min
+        @db.wait_for_update_after(generation, wait_s)
+        return nil if @db.updates_closed?
+      end
+    ensure
+      end_call if read_db
+    end
+
+    def each
+      return enum_for(:each) unless block_given?
+
+      while (notification = self.next)
+        yield notification
+      end
+    end
+
+    def close
+      should_signal = @state_mutex.synchronize do
+        next false if @closed
+
+        @closed = true
+        close_read_db_if_idle
+        true
+      end
+      @db.signal_update if should_signal
+      nil
+    end
+
+    def closed?
+      @state_mutex.synchronize { @closed }
+    end
+
+    private
+
+    def refill(read_db)
+      rows = read_db.execute(
+        "SELECT id, channel, payload, created_at " \
+        "FROM _honker_notifications " \
+        "WHERE channel = ? AND id > ? ORDER BY id LIMIT 1000",
+        [@channel, @last_seen],
+      )
+      rows.each do |id, channel, payload, created_at|
+        @last_seen = id.to_i
+        @buffer << Notification.new(id.to_i, channel, decode_payload(payload), created_at.to_i)
+      end
+    end
+
+    def begin_call
+      @state_mutex.synchronize do
+        return nil if @closed
+
+        @active_calls += 1
+        @read_db
+      end
+    end
+
+    def end_call
+      @state_mutex.synchronize do
+        @active_calls -= 1
+        close_read_db_if_idle
+      end
+    end
+
+    def close_read_db_if_idle
+      return unless @closed && @active_calls.zero? && @read_db
+
+      @read_db.close
+      @read_db = nil
+    end
+
+    def decode_payload(payload)
+      JSON.parse(payload)
+    rescue JSON::ParserError, TypeError
+      payload
+    end
+
+    def monotonic_now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+  end
+
   DEFAULT_PRAGMAS = <<~SQL
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -174,7 +432,7 @@ module Honker
   # extension loaded. The constructor bootstraps the schema; safe to
   # open the same path from multiple processes.
   class Database
-    attr_reader :db
+    attr_reader :db, :path
 
     def initialize(path, extension_path: nil, watcher_backend: nil,
                    watcher_poll_interval_ms: nil,
@@ -187,8 +445,8 @@ module Honker
       end
 
       resolved_extension = extension_resolver.resolve(extension_path)
+      @path = path
       @db = SQLite3::Database.new(path)
-      @local_update_seq = 0
       @db.busy_timeout = 5000
       @db.execute("PRAGMA mmap_size = 0")
       @db.enable_load_extension(true)
@@ -196,24 +454,48 @@ module Honker
       @db.enable_load_extension(false)
       @db.execute_batch(DEFAULT_PRAGMAS)
       @db.execute("SELECT honker_bootstrap()")
-      @watcher = CoreWatcher.new(path, resolved_extension, watcher_backend, watcher_poll_interval_ms)
+      watcher = CoreWatcher.new(path, resolved_extension, watcher_backend, watcher_poll_interval_ms)
+      @updates = UpdateHub.new(watcher)
     end
 
     def close
-      @watcher&.close
+      @updates&.close
       @db&.close
     end
 
     def mark_updated
-      @local_update_seq += 1
+      @updates.signal
     end
 
     def update_snapshot
-      @local_update_seq
+      @updates.snapshot
     end
 
     def wait_for_update(timeout_s)
-      @watcher.wait(timeout_s)
+      @updates.wait(timeout_s)
+    end
+
+    def wait_for_update_after(generation, timeout_s)
+      @updates.wait_after(generation, timeout_s)
+    end
+
+    def signal_update
+      @updates.signal
+    end
+
+    def updates_closed?
+      @updates.closed?
+    end
+
+    def listen(channel, fallback_poll_s: 15.0)
+      listener = Listener.new(self, channel, fallback_poll_s: fallback_poll_s)
+      return listener unless block_given?
+
+      begin
+        listener.each { |notification| yield notification }
+      ensure
+        listener.close
+      end
     end
 
     # Returns a Queue handle for a named queue.

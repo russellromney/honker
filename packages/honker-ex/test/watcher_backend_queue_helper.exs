@@ -23,6 +23,12 @@ defmodule HonkerWatcherBackendQueueHelper do
     Honker.close(db)
   end
 
+  def main(["notify", path, ext, channel, payload]) do
+    {:ok, db} = Honker.open(path, extension_path: ext)
+    {:ok, _} = Honker.notify(db, channel, Jason.decode!(payload))
+    Honker.close(db)
+  end
+
   defp drain(db, worker_id, acc, deadline_ms) do
     case Honker.Queue.claim_one(db, "shared", worker_id) do
       {:ok, nil} ->
@@ -37,7 +43,8 @@ defmodule HonkerWatcherBackendQueueHelper do
               drain(db, worker_id, acc, deadline_ms)
             end
 
-          {:error, reason} -> raise "watcher failed: #{inspect(reason)}"
+          {:error, reason} ->
+            raise "watcher failed: #{inspect(reason)}"
         end
 
       {:ok, job} ->
