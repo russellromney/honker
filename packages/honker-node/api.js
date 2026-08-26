@@ -282,6 +282,11 @@ class Job {
   }
 }
 
+// How long the claim waker waits before retrying a deadline it reached but
+// could not claim. Short enough that a contended claim recovers promptly,
+// long enough not to spin on the writer lock.
+const DEADLINE_RETRY_MS = 50;
+
 class ClaimWaker {
   constructor(queue, { idlePollS = 5 } = {}) {
     this._queue = queue;
@@ -296,12 +301,24 @@ class ClaimWaker {
     let job = this._queue.claimOne(workerId);
     if (job) return job;
 
+    // True once we have waited on a run_at/claim_expires_at deadline that
+    // has since passed. next_claim_at only reports deadlines with
+    // run_at > unixepoch(), so it returns 0 the moment one arrives — and
+    // without this, a claim that came back empty right then (a writer lock
+    // held past busy_timeout, a racing worker) would fall through to
+    // idlePollS and park for the whole interval on a queue that has work
+    // ready. Retry briefly instead; a genuinely empty queue never sets it.
+    let deadlinePassed = false;
+
     while (!this._closed && !aborted(opts.signal)) {
       const nextClaimAt = this._queue._nextClaimAt();
       let waitMs = this._idlePollMs;
       if (nextClaimAt && nextClaimAt > 0) {
         const untilDeadline = Math.max(0, nextClaimAt * 1000 - Date.now());
         waitMs = waitMs == null ? untilDeadline : Math.min(waitMs, untilDeadline);
+        deadlinePassed = true;
+      } else if (deadlinePassed) {
+        waitMs = waitMs == null ? DEADLINE_RETRY_MS : Math.min(waitMs, DEADLINE_RETRY_MS);
       }
       await waitForUpdateOrTimeout(this._updates, opts.signal, waitMs);
       if (this._closed || aborted(opts.signal)) return null;
