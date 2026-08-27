@@ -856,6 +856,47 @@ test('claimWaker: returns immediately when a job is already pending', async () =
   }
 });
 
+test('claimWaker: a claim that misses its deadline does not park on idlePollS', { timeout: 12_000 }, async () => {
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const q = db.queue('deadline-miss');
+    const runAt = Math.floor(Date.now() / 1000) + 2;
+    q.enqueue({ hello: 'future' }, { runAt });
+    const waker = q.claimWaker({ idlePollS: 30 });
+
+    // One claim comes back empty exactly at the deadline. That is what a
+    // writer lock held past busy_timeout, or a worker that raced us, looks
+    // like from here. next_claim_at reports 0 from this point on, because
+    // it only lists deadlines with run_at > unixepoch(), so the waker has
+    // nothing left to park on but idlePollS — 30 s, with a claimable job
+    // already in the queue.
+    let missed = false;
+    const realClaim = q.claimOne.bind(q);
+    q.claimOne = (worker) => {
+      if (!missed && Date.now() >= runAt * 1000 - 5) {
+        missed = true;
+        return null;
+      }
+      return realClaim(worker);
+    };
+
+    const t0 = Date.now();
+    const job = await Promise.race([
+      waker.next('w1'),
+      new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
+    ]);
+    const dt = Date.now() - t0;
+    assert.ok(missed, 'the probe never forced a missed claim');
+    assert.ok(job, `waker parked instead of retrying: waited ${dt}ms`);
+    assert.deepEqual(job.payload, { hello: 'future' });
+    job.ack();
+    waker.close();
+  } finally {
+    cleanup();
+  }
+});
+
 test('claimWaker: wakes when runAt deadline arrives', { timeout: 12_000 }, async () => {
   const { path: p, cleanup } = tmpdb();
   try {
