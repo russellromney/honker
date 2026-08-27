@@ -43,8 +43,24 @@ outbox.enqueue({
   variables: {},
 })
 
+db.configureQueueEvents({ maxEvents: 10_000, includePayload: true })
+const queueEvents = db.queueEvents<EmailPayload>({ queue: 'emails', fromOffset: 0 })
+const retained = queueEvents.readSince(0)
+for (const event of retained) {
+  event.type satisfies
+    | 'enqueued'
+    | 'claimed'
+    | 'completed'
+    | 'retry_scheduled'
+    | 'dead_lettered'
+    | 'cancelled'
+  event.payload?.recipient.toUpperCase()
+  event.offset.toFixed(0)
+}
+
 // @ts-expect-error recipient is required by the queue payload contract
 queue.enqueue({ template: 'welcome', variables: {} })
 
 waker.close()
+queueEvents.close()
 db.close()

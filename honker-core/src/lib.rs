@@ -428,6 +428,12 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       offset INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (name, topic)
     );
+    CREATE TABLE IF NOT EXISTS _honker_queue_event_config (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+      max_events INTEGER NOT NULL CHECK (max_events > 0),
+      include_payload INTEGER NOT NULL CHECK (include_payload IN (0, 1))
+    );
 ";
 
 /// Install the honker queue schema on `conn`. Idempotent. See
@@ -2425,6 +2431,18 @@ while True:
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(sc_cols, vec!["name", "topic", "offset"]);
+
+        let queue_event_config_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_honker_queue_event_config')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            queue_event_config_cols,
+            vec!["singleton", "enabled", "max_events", "include_payload"]
+        );
     }
 
     // -----------------------------------------------------------------

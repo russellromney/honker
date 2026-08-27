@@ -47,7 +47,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "npm run test:types && node --test test/extension.js test/api.test.js test/basic.js test/parity.test.js test/cross_lang_python_to_node.js test/cross_lang_node_to_python.js test/cross_lang_supporting.js test/watcher_backends.js test/watcher_backends_e2e.js test/watcher_backends_queue_e2e.js test/phase_mantle.js test/typed_jobs_e2e.js",
+    "test": "npm run test:types && node --test test/extension.js test/api.test.js test/basic.js test/parity.test.js test/cross_lang_python_to_node.js test/cross_lang_node_to_python.js test/cross_lang_supporting.js test/watcher_backends.js test/watcher_backends_e2e.js test/watcher_backends_queue_e2e.js test/phase_mantle.js test/typed_jobs_e2e.js test/queue_events.test.js test/queue_events_e2e.js",
     "test:types": "tsc -p test/types/tsconfig.json"
   },
   "devDependencies": {

@@ -766,6 +766,86 @@ class Stream {
   }
 }
 
+class QueueEvent {
+  constructor(row) {
+    this.version = row.version;
+    this.offset = row.offset;
+    this.type = row.type;
+    this.queue = row.queue;
+    this.jobId = row.job_id;
+    this.occurredAt = row.occurred_at;
+    this.attempts = row.attempts;
+    this.workerId = row.worker_id ?? null;
+    this.runAt = row.run_at ?? null;
+    this.error = row.error ?? null;
+    if (Object.prototype.hasOwnProperty.call(row, 'payload')) {
+      this.payload = row.payload;
+    }
+  }
+}
+
+class QueueEvents {
+  constructor(
+    db,
+    { queue = null, fromOffset = 0, fallbackPollS = 1, signal = null } = {},
+  ) {
+    this._db = db;
+    this.queue = queue;
+    this._fallbackPollMs =
+      fallbackPollS == null ? null : Math.max(0, fallbackPollS * 1000);
+    this._signal = signal;
+    // Subscribe before the first read so a commit cannot land in the
+    // snapshot/listen gap and leave this iterator parked until fallback.
+    this._updates = db.updateEvents();
+    this._closed = false;
+    this._pending = [];
+    this._lastSeen = fromOffset;
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+
+  get lastOffset() {
+    return this._lastSeen;
+  }
+
+  readSince(offset, limit = 256) {
+    const rowsJson = this._db._callScalar(
+      'SELECT honker_queue_events_read_since(?, ?, ?)',
+      [offset, this.queue, limit],
+    );
+    return JSON.parse(rowsJson || '[]').map((row) => new QueueEvent(row));
+  }
+
+  _loadPending() {
+    this._pending.push(...this.readSince(this._lastSeen));
+  }
+
+  async next() {
+    while (!this._closed && !aborted(this._signal)) {
+      if (this._pending.length === 0) this._loadPending();
+      if (this._pending.length > 0) {
+        const event = this._pending.shift();
+        this._lastSeen = event.offset;
+        return { done: false, value: event };
+      }
+      await waitForUpdateOrTimeout(
+        this._updates,
+        this._signal,
+        this._fallbackPollMs,
+      );
+    }
+    return { done: true, value: undefined };
+  }
+
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._updates.close();
+  }
+}
+
 class Listener {
   constructor(db, channel, { fallbackPollS = 15 } = {}) {
     this._db = db;
@@ -990,6 +1070,20 @@ class Database {
     return unwrapTx(tx).notify(channel, payload);
   }
 
+  configureQueueEvents({ enabled = true, maxEvents = 10_000, includePayload = false } = {}) {
+    return (
+      this._callScalar('SELECT honker_queue_events_configure(?, ?, ?)', [
+        enabled ? 1 : 0,
+        maxEvents,
+        includePayload ? 1 : 0,
+      ]) === 1
+    );
+  }
+
+  queueEvents(opts = {}) {
+    return new QueueEvents(this, opts);
+  }
+
   queue(name, opts = {}) {
     return new Queue(this, name, opts);
   }
@@ -1075,6 +1169,8 @@ module.exports = function buildApi(nativeBinding) {
     Stream,
     StreamEvent,
     StreamSubscription,
+    QueueEvent,
+    QueueEvents,
     CheckpointMigrationError,
     Listener,
     Scheduler,

@@ -84,6 +84,24 @@ if (job) {
 Payload generics describe the expected JSON shape at compile time; Honker does
 not perform runtime schema validation.
 
+Queue lifecycle events are an opt-in, bounded observability feed. Configuration
+is stored in the database so producers and workers in other processes use the
+same behavior:
+
+```ts
+db.configureQueueEvents({ maxEvents: 10_000, includePayload: false });
+
+const events = db.queueEvents({ queue: "emails", fromOffset: 0 });
+for await (const event of events) {
+  console.log(event.offset, event.type, event.jobId);
+}
+```
+
+Events are appended in the same SQLite transaction as successful queue state
+transitions. They are intended for dashboards, metrics, and debugging—not as a
+permanent audit log or an exactly-once business event bus. Save the last offset
+to replay retained events after reconnecting.
+
 Recurring schedules use `schedule`:
 
 ```js

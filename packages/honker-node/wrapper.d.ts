@@ -35,6 +35,41 @@ export interface StreamEvent {
   createdAt: number | null
 }
 
+export type QueueEventType =
+  | 'enqueued'
+  | 'claimed'
+  | 'completed'
+  | 'retry_scheduled'
+  | 'dead_lettered'
+  | 'cancelled'
+
+export class QueueEvent<TPayload = JsonValue> {
+  readonly version: 1
+  readonly offset: number
+  readonly type: QueueEventType
+  readonly queue: string
+  readonly jobId: number
+  readonly occurredAt: number
+  readonly attempts: number
+  readonly workerId: string | null
+  readonly runAt: number | null
+  readonly error: string | null
+  readonly payload?: TPayload
+}
+
+export interface QueueEventsOptions {
+  queue?: string | null
+  fromOffset?: number
+  fallbackPollS?: number | null
+  signal?: AbortSignal | null
+}
+
+export interface QueueEventsConfig {
+  enabled?: boolean
+  maxEvents?: number
+  includePayload?: boolean
+}
+
 export class CheckpointMigrationError extends Error {
   readonly code: 'HONKER_CHECKPOINT_MIGRATION_UNVERIFIABLE'
   readonly stream: string
@@ -149,6 +184,16 @@ export class StreamSubscription implements AsyncIterableIterator<StreamEvent> {
   close(): void
 }
 
+export class QueueEvents<TPayload = JsonValue>
+  implements AsyncIterableIterator<QueueEvent<TPayload>> {
+  readonly queue: string | null
+  readonly lastOffset: number
+  readSince(offset: number, limit?: number): QueueEvent<TPayload>[]
+  next(): Promise<IteratorResult<QueueEvent<TPayload>>>
+  [Symbol.asyncIterator](): AsyncIterableIterator<QueueEvent<TPayload>>
+  close(): void
+}
+
 export class Stream {
   publish(payload: JsonValue): number
   publishWithKey(key: string, payload: JsonValue): number
@@ -223,6 +268,8 @@ export class Database {
   pruneNotifications(olderThanS?: number | null, maxKeep?: number | null): number
   notify(channel: string, payload: JsonValue): number
   notifyTx(tx: Transaction | any, channel: string, payload: JsonValue): number
+  configureQueueEvents(opts?: QueueEventsConfig): boolean
+  queueEvents<TPayload = JsonValue>(opts?: QueueEventsOptions): QueueEvents<TPayload>
   queue<TPayload = JsonValue>(name: string, opts?: QueueOptions): Queue<TPayload>
   outbox<TPayload = JsonValue>(name: string, delivery: (payload: TPayload, job: Job<TPayload>) => any | Promise<any>, opts?: OutboxOptions): Outbox<TPayload>
   stream(name: string): Stream

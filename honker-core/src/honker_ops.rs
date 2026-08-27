@@ -23,6 +23,19 @@ use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 
+const QUEUE_EVENTS_TOPIC: &str = "_honker:queue-events:v1";
+
+struct QueueEventRecord<'a> {
+    event_type: &'a str,
+    job_id: i64,
+    queue: &'a str,
+    payload: &'a str,
+    attempts: i64,
+    worker_id: Option<&'a str>,
+    run_at: Option<i64>,
+    error: Option<&'a str>,
+}
+
 /// Read an integer argument, accepting the REAL that dynamically typed
 /// clients send for whole numbers.
 ///
@@ -587,6 +600,33 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // Queue lifecycle events are an opt-in, bounded stream maintained
+    // transactionally by the queue mutation functions below.
+    conn.create_scalar_function(
+        "honker_queue_events_configure",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let enabled = arg_i64(ctx, 0)? != 0;
+            let max_events = arg_i64(ctx, 1)?;
+            let include_payload = arg_i64(ctx, 2)? != 0;
+            let db = unsafe { ctx.get_connection() }?;
+            queue_events_configure(&db, enabled, max_events, include_payload).map_err(to_sql_err)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_queue_events_read_since",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let offset = arg_i64(ctx, 0)?;
+            let queue: Option<String> = ctx.get(1)?;
+            let limit = arg_i64(ctx, 2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            queue_events_read_since(&db, offset, queue.as_deref(), limit).map_err(to_sql_err)
+        },
+    )?;
+
     Ok(())
 }
 
@@ -642,8 +682,30 @@ fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'max attempts exceeded', ?8)",
     )?;
     let count = rows.len() as i64;
-    for r in rows {
-        insert.execute(rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7])?;
+    for (id, queue, payload, priority, run_at, max_attempts, attempts, created_at) in rows {
+        insert.execute(rusqlite::params![
+            id,
+            queue,
+            payload,
+            priority,
+            run_at,
+            max_attempts,
+            attempts,
+            created_at
+        ])?;
+        emit_queue_event(
+            conn,
+            QueueEventRecord {
+                event_type: "dead_lettered",
+                job_id: id,
+                queue: &queue,
+                payload: &payload,
+                attempts,
+                worker_id: None,
+                run_at: Some(run_at),
+                error: Some("max attempts exceeded"),
+            },
+        )?;
     }
     Ok(count)
 }
@@ -715,6 +777,19 @@ pub fn claim_batch(
             created_at,
             expires_at,
         ) = row?;
+        emit_queue_event(
+            conn,
+            QueueEventRecord {
+                event_type: "claimed",
+                job_id: id,
+                queue: &q,
+                payload: &payload,
+                attempts,
+                worker_id: Some(&w),
+                run_at: Some(run_at),
+                error: None,
+            },
+        )?;
         // payload stays a JSON string (double-encoded on the wire) so
         // every binding's existing parse path keeps working.
         out.push(json!({
@@ -736,17 +811,42 @@ pub fn claim_batch(
 }
 
 pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
-    let mut stmt = conn.prepare_cached(
-        "DELETE FROM _honker_live
-         WHERE id IN (SELECT value FROM json_each(?1))
-           AND worker_id = ?2
-           AND claim_expires_at >= unixepoch()
-         RETURNING id",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![ids_json, worker_id])?;
-    let mut count = 0;
-    while rows.next()?.is_some() {
-        count += 1;
+    #[allow(clippy::type_complexity)]
+    let jobs: Vec<(i64, String, String, i64, i64, String)> = {
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM _honker_live
+             WHERE id IN (SELECT value FROM json_each(?1))
+               AND worker_id = ?2
+               AND claim_expires_at >= unixepoch()
+             RETURNING id, queue, payload, attempts, run_at, worker_id",
+        )?;
+        stmt.query_map(rusqlite::params![ids_json, worker_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let count = jobs.len() as i64;
+    for (id, queue, payload, attempts, run_at, worker_id) in jobs {
+        emit_queue_event(
+            conn,
+            QueueEventRecord {
+                event_type: "completed",
+                job_id: id,
+                queue: &queue,
+                payload: &payload,
+                attempts,
+                worker_id: Some(&worker_id),
+                run_at: Some(run_at),
+                error: None,
+            },
+        )?;
     }
     Ok(count)
 }
@@ -837,6 +937,19 @@ pub fn enqueue(
         ],
         |r| r.get(0),
     )?;
+    emit_queue_event(
+        conn,
+        QueueEventRecord {
+            event_type: "enqueued",
+            job_id: id,
+            queue,
+            payload,
+            attempts: 0,
+            worker_id: None,
+            run_at: Some(run_at_val),
+            error: None,
+        },
+    )?;
     Ok(id)
 }
 
@@ -844,12 +957,34 @@ pub fn enqueue(
 /// valid. Returns 1 on success, 0 if the claim expired or the row
 /// isn't ours.
 pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<i64> {
-    let deleted = conn.execute(
+    let row: Option<(String, String, i64, i64, String)> = match conn.query_row(
         "DELETE FROM _honker_live
-         WHERE id = ?1 AND worker_id = ?2 AND claim_expires_at >= unixepoch()",
+         WHERE id = ?1 AND worker_id = ?2 AND claim_expires_at >= unixepoch()
+         RETURNING queue, payload, attempts, run_at, worker_id",
         rusqlite::params![job_id, worker_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ) {
+        Ok(row) => Some(row),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error),
+    };
+    let Some((queue, payload, attempts, run_at, worker_id)) = row else {
+        return Ok(0);
+    };
+    emit_queue_event(
+        conn,
+        QueueEventRecord {
+            event_type: "completed",
+            job_id,
+            queue: &queue,
+            payload: &payload,
+            attempts,
+            worker_id: Some(&worker_id),
+            run_at: Some(run_at),
+            error: None,
+        },
     )?;
-    Ok(deleted as i64)
+    Ok(1)
 }
 
 /// Retry or fail based on `attempts` vs `max_attempts`. If another
@@ -895,7 +1030,7 @@ pub fn retry(
     else {
         return Ok(0);
     };
-    if attempts >= max_attempts {
+    let (event_type, event_run_at) = if attempts >= max_attempts {
         conn.execute(
             "DELETE FROM _honker_live WHERE id = ?1",
             rusqlite::params![id],
@@ -917,19 +1052,36 @@ pub fn retry(
                 created_at
             ],
         )?;
+        ("dead_lettered", run_at)
     } else {
-        conn.execute(
+        let retry_run_at = conn.query_row(
             "UPDATE _honker_live
              SET state = 'pending',
                  run_at = unixepoch() + ?2,
                  worker_id = NULL,
                  claim_expires_at = NULL
-             WHERE id = ?1",
+             WHERE id = ?1
+             RETURNING run_at",
             rusqlite::params![id, delay_s],
+            |r| r.get(0),
         )?;
         // Wake comes from the live-table UPDATE + commit (data_version).
         // No synthetic notification row — see enqueue() for rationale.
-    }
+        ("retry_scheduled", retry_run_at)
+    };
+    emit_queue_event(
+        conn,
+        QueueEventRecord {
+            event_type,
+            job_id: id,
+            queue: &queue,
+            payload: &payload,
+            attempts,
+            worker_id: Some(worker_id),
+            run_at: Some(event_run_at),
+            error: Some(error),
+        },
+    )?;
     Ok(1)
 }
 
@@ -980,6 +1132,19 @@ pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rus
             created_at
         ],
     )?;
+    emit_queue_event(
+        conn,
+        QueueEventRecord {
+            event_type: "dead_lettered",
+            job_id: id,
+            queue: &queue,
+            payload: &payload,
+            attempts,
+            worker_id: Some(worker_id),
+            run_at: Some(run_at),
+            error: Some(error),
+        },
+    )?;
     Ok(1)
 }
 
@@ -993,11 +1158,34 @@ pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rus
 /// the worker holding the claim will see `ack()` return 0 on its
 /// next call — same shape as a claim that simply expired.
 pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
-    let n = conn.execute(
-        "DELETE FROM _honker_live WHERE id = ?1 AND state IN ('pending', 'processing')",
+    let row: Option<(String, String, i64, i64, Option<String>)> = match conn.query_row(
+        "DELETE FROM _honker_live
+         WHERE id = ?1 AND state IN ('pending', 'processing')
+         RETURNING queue, payload, attempts, run_at, worker_id",
         rusqlite::params![job_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ) {
+        Ok(row) => Some(row),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error),
+    };
+    let Some((queue, payload, attempts, run_at, worker_id)) = row else {
+        return Ok(0);
+    };
+    emit_queue_event(
+        conn,
+        QueueEventRecord {
+            event_type: "cancelled",
+            job_id,
+            queue: &queue,
+            payload: &payload,
+            attempts,
+            worker_id: worker_id.as_deref(),
+            run_at: Some(run_at),
+            error: None,
+        },
     )?;
-    Ok(n as i64)
+    Ok(1)
 }
 
 /// Read a single job row by id. Returns a JSON object on success or
@@ -1138,8 +1326,30 @@ pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'expired', ?8)",
     )?;
     let count = rows.len() as i64;
-    for r in rows {
-        insert.execute(rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7])?;
+    for (id, queue, payload, priority, run_at, max_attempts, attempts, created_at) in rows {
+        insert.execute(rusqlite::params![
+            id,
+            queue,
+            payload,
+            priority,
+            run_at,
+            max_attempts,
+            attempts,
+            created_at
+        ])?;
+        emit_queue_event(
+            conn,
+            QueueEventRecord {
+                event_type: "dead_lettered",
+                job_id: id,
+                queue: &queue,
+                payload: &payload,
+                attempts,
+                worker_id: None,
+                run_at: Some(run_at),
+                error: Some("expired"),
+            },
+        )?;
     }
     Ok(count)
 }
@@ -1667,6 +1877,153 @@ pub fn result_sweep(conn: &Connection) -> rusqlite::Result<i64> {
 // Streams
 // ---------------------------------------------------------------------
 
+pub fn queue_events_configure(
+    conn: &Connection,
+    enabled: bool,
+    max_events: i64,
+    include_payload: bool,
+) -> rusqlite::Result<i64> {
+    if !(1..=1_000_000).contains(&max_events) {
+        return Err(to_sql_err(
+            "honker: queue event max_events must be between 1 and 1000000",
+        ));
+    }
+    conn.execute(
+        "INSERT INTO _honker_queue_event_config
+           (singleton, enabled, max_events, include_payload)
+         VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(singleton) DO UPDATE SET
+           enabled = excluded.enabled,
+           max_events = excluded.max_events,
+           include_payload = excluded.include_payload",
+        rusqlite::params![enabled as i64, max_events, include_payload as i64],
+    )?;
+    Ok(1)
+}
+
+fn queue_event_config(conn: &Connection) -> rusqlite::Result<Option<(i64, bool)>> {
+    match conn.query_row(
+        "SELECT max_events, include_payload
+         FROM _honker_queue_event_config
+         WHERE singleton = 1 AND enabled = 1",
+        [],
+        |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+    ) {
+        Ok(config) => Ok(Some(config)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => {
+            // A newer core can share a database with an older binding that
+            // has not created the opt-in config table yet. Queue mutations
+            // must remain backwards-compatible in that mixed-version case;
+            // the absence of configuration means events are disabled.
+            let table_exists: i64 = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_schema
+                   WHERE type = 'table' AND name = '_honker_queue_event_config'
+                 )",
+                [],
+                |r| r.get(0),
+            )?;
+            if table_exists == 0 {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn emit_queue_event(
+    conn: &Connection,
+    event: QueueEventRecord<'_>,
+) -> rusqlite::Result<Option<i64>> {
+    let Some((max_events, include_payload)) = queue_event_config(conn)? else {
+        return Ok(None);
+    };
+    let occurred_at = now_unix(conn)?;
+    let mut body = json!({
+        "version": 1,
+        "type": event.event_type,
+        "job_id": event.job_id,
+        "queue": event.queue,
+        "occurred_at": occurred_at,
+        "attempts": event.attempts,
+        "worker_id": event.worker_id,
+        "run_at": event.run_at,
+        "error": event.error,
+    });
+    if include_payload {
+        let payload = serde_json::from_str(event.payload)
+            .unwrap_or_else(|_| Value::String(event.payload.to_string()));
+        body.as_object_mut()
+            .expect("queue event body is always an object")
+            .insert("payload".to_string(), payload);
+    }
+
+    let offset = stream_publish(
+        conn,
+        QUEUE_EVENTS_TOPIC,
+        Some(event.queue),
+        &body.to_string(),
+    )?;
+
+    // `_honker_stream.offset` is global across topics. Using its distance
+    // as the trim bound may retain fewer than max_events when application
+    // streams are very busy, but it can never retain more. That keeps the
+    // queue feed strictly bounded without a COUNT/OFFSET scan on every
+    // queue transition.
+    let trim_through = offset.saturating_sub(max_events);
+    if trim_through > 0 {
+        conn.execute(
+            "DELETE FROM _honker_stream WHERE topic = ?1 AND offset <= ?2",
+            rusqlite::params![QUEUE_EVENTS_TOPIC, trim_through],
+        )?;
+    }
+    Ok(Some(offset))
+}
+
+pub fn queue_events_read_since(
+    conn: &Connection,
+    offset: i64,
+    queue: Option<&str>,
+    limit: i64,
+) -> rusqlite::Result<String> {
+    if offset < 0 {
+        return Err(to_sql_err(
+            "honker: queue event offset must be greater than or equal to zero",
+        ));
+    }
+    if !(1..=10_000).contains(&limit) {
+        return Err(to_sql_err(
+            "honker: queue event read limit must be between 1 and 10000",
+        ));
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT offset, payload
+         FROM _honker_stream
+         WHERE topic = ?1 AND offset > ?2
+           AND (?3 IS NULL OR key = ?3)
+         ORDER BY offset ASC
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![QUEUE_EVENTS_TOPIC, offset, queue, limit],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (event_offset, payload) = row?;
+        let mut event: Value = serde_json::from_str(&payload).map_err(to_sql_err)?;
+        event
+            .as_object_mut()
+            .ok_or_else(|| to_sql_err("honker: stored queue event is not an object"))?
+            .insert("offset".to_string(), json!(event_offset));
+        out.push(event);
+    }
+    Ok(Value::Array(out).to_string())
+}
+
 pub fn stream_publish(
     conn: &Connection,
     topic: &str,
@@ -1951,5 +2308,216 @@ mod real_arg_tests {
         assert!(probe(f64::NAN).is_err(), "NaN must reject");
         // Negative zero is whole and must coerce to 0, not error.
         assert!(probe(-0.0).is_ok(), "-0.0 must pass");
+    }
+}
+
+#[cfg(test)]
+mod queue_event_tests {
+    use super::*;
+    use crate::{attach_honker_functions, bootstrap_honker_schema};
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        attach_honker_functions(&conn).unwrap();
+        bootstrap_honker_schema(&conn).unwrap();
+        conn
+    }
+
+    fn events(conn: &Connection, queue: Option<&str>) -> Vec<Value> {
+        serde_json::from_str(&queue_events_read_since(conn, 0, queue, 10_000).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn queue_events_are_disabled_by_default() {
+        let conn = db();
+        enqueue(&conn, "emails", "{}", None, None, 0, 3, None).unwrap();
+        assert!(events(&conn, None).is_empty());
+    }
+
+    #[test]
+    fn queue_mutations_remain_compatible_with_pre_event_schema() {
+        let conn = db();
+        conn.execute("DROP TABLE _honker_queue_event_config", [])
+            .unwrap();
+
+        let id = enqueue(&conn, "emails", "{}", None, None, 0, 3, None).unwrap();
+        claim_batch(&conn, "emails", "legacy-worker", 1, 300).unwrap();
+        assert_eq!(ack(&conn, id, "legacy-worker").unwrap(), 1);
+    }
+
+    #[test]
+    fn queue_events_follow_committed_lifecycle_transitions() {
+        let conn = db();
+        queue_events_configure(&conn, true, 100, false).unwrap();
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let rolled_back = enqueue(
+            &conn,
+            "emails",
+            "{\"rolled_back\":true}",
+            None,
+            None,
+            0,
+            3,
+            None,
+        )
+        .unwrap();
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM _honker_live WHERE id = ?1",
+                [rolled_back],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(events(&conn, None).is_empty());
+
+        let id = enqueue(
+            &conn,
+            "emails",
+            "{\"to\":\"alice@example.com\"}",
+            None,
+            None,
+            7,
+            3,
+            None,
+        )
+        .unwrap();
+        claim_batch(&conn, "emails", "worker-1", 1, 300).unwrap();
+        assert_eq!(ack(&conn, id, "not-the-owner").unwrap(), 0);
+        retry(&conn, id, "worker-1", 0, "temporary").unwrap();
+        claim_batch(&conn, "emails", "worker-2", 1, 300).unwrap();
+        ack(&conn, id, "worker-2").unwrap();
+
+        let retained = events(&conn, None);
+        let types: Vec<&str> = retained
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "enqueued",
+                "claimed",
+                "retry_scheduled",
+                "claimed",
+                "completed"
+            ]
+        );
+        assert!(retained.iter().all(|event| event.get("payload").is_none()));
+        assert!(
+            retained
+                .windows(2)
+                .all(|pair| pair[0]["offset"].as_i64() < pair[1]["offset"].as_i64())
+        );
+    }
+
+    #[test]
+    fn queue_events_cover_terminal_and_batch_transitions() {
+        let conn = db();
+        queue_events_configure(&conn, true, 100, false).unwrap();
+
+        let dead_id = enqueue(&conn, "jobs", "{}", None, None, 0, 1, None).unwrap();
+        claim_batch(&conn, "jobs", "worker-1", 1, 300).unwrap();
+        retry(&conn, dead_id, "worker-1", 0, "permanent").unwrap();
+
+        let cancel_id = enqueue(&conn, "jobs", "{}", None, None, 0, 3, None).unwrap();
+        cancel(&conn, cancel_id).unwrap();
+
+        let batch_a = enqueue(&conn, "batch", "{}", None, None, 0, 3, None).unwrap();
+        let batch_b = enqueue(&conn, "batch", "{}", None, None, 0, 3, None).unwrap();
+        claim_batch(&conn, "batch", "worker-batch", 2, 300).unwrap();
+        assert_eq!(
+            ack_batch(
+                &conn,
+                &json!([batch_a, batch_b]).to_string(),
+                "worker-batch"
+            )
+            .unwrap(),
+            2
+        );
+
+        let retained = events(&conn, None);
+        assert!(
+            retained
+                .iter()
+                .any(|event| { event["job_id"] == dead_id && event["type"] == "dead_lettered" })
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|event| { event["job_id"] == cancel_id && event["type"] == "cancelled" })
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|event| event["type"] == "completed")
+                .count(),
+            2
+        );
+
+        let expired_id = enqueue(&conn, "jobs", "{}", None, None, 0, 3, Some(0)).unwrap();
+        assert_eq!(sweep_expired(&conn, "jobs").unwrap(), 1);
+
+        let abandoned_id = enqueue(&conn, "jobs", "{}", None, None, 0, 1, None).unwrap();
+        claim_batch(&conn, "jobs", "abandoned-worker", 1, 300).unwrap();
+        conn.execute(
+            "UPDATE _honker_live
+             SET claim_expires_at = unixepoch() - 1
+             WHERE id = ?1",
+            [abandoned_id],
+        )
+        .unwrap();
+        assert!(
+            serde_json::from_str::<Vec<Value>>(
+                &claim_batch(&conn, "jobs", "next-worker", 1, 300).unwrap()
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let terminal = events(&conn, None);
+        assert!(terminal.iter().any(|event| {
+            event["job_id"] == expired_id
+                && event["type"] == "dead_lettered"
+                && event["error"] == "expired"
+        }));
+        assert!(terminal.iter().any(|event| {
+            event["job_id"] == abandoned_id
+                && event["type"] == "dead_lettered"
+                && event["error"] == "max attempts exceeded"
+        }));
+    }
+
+    #[test]
+    fn queue_events_are_bounded_filterable_and_optionally_include_payloads() {
+        let conn = db();
+        queue_events_configure(&conn, true, 3, true).unwrap();
+
+        for i in 0..5 {
+            let queue = if i % 2 == 0 { "alpha" } else { "beta" };
+            enqueue(
+                &conn,
+                queue,
+                &json!({ "sequence": i }).to_string(),
+                None,
+                None,
+                0,
+                3,
+                None,
+            )
+            .unwrap();
+        }
+
+        let retained = events(&conn, None);
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[0]["payload"]["sequence"], 2);
+        assert_eq!(retained[2]["payload"]["sequence"], 4);
+
+        let alpha = events(&conn, Some("alpha"));
+        assert_eq!(alpha.len(), 2);
+        assert!(alpha.iter().all(|event| event["queue"] == "alpha"));
     }
 }
