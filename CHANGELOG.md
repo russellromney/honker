@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 2026-08-27 — Node 0.5.1
+
+- Node `@russellthehippo/honker-node`: 0.5.1, with the four
+  `honker-node-<platform>` packages moved to 0.5.1 alongside it. The fix
+  is JavaScript only and the Rust addon is unchanged, but the loader
+  pins the native package version exactly, so the natives release in
+  lockstep. `honker-ext-<platform>` is untouched and stays at 0.4.6.
+- `claimWaker().next()` no longer parks on `idlePollS` after a `runAt`
+  deadline it was waiting for has passed. `honker_queue_next_claim_at`
+  only reports deadlines still in the future, so it returns 0 the moment
+  one arrives; if the claim taken at that instant came back empty — a
+  writer holding the lock past the 5 s `busy_timeout`, or another worker
+  taking the row — the waker had nothing to park on and slept the whole
+  idle interval on a queue with claimable work. A worker using `runAt`
+  with a long `idlePollS` could stall well past its deadline under write
+  contention. The waker now retries briefly instead. A queue that was
+  never waiting on a deadline polls exactly as before.
+- Regression test claims a job at a deadline with one claim forced to
+  return empty: it fails on the unpatched `api.js` and passes on the fix.
+
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
 - Node stream checkpoint calls now use the shared SQL ABI's canonical
