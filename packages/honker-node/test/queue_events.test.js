@@ -129,3 +129,73 @@ test('queue events cover retry, completion, cancellation, filtering, and retenti
     cleanup();
   }
 });
+
+test('queue event iterators close on abort, early return, and pending close', async () => {
+  const { path, open, cleanup } = tmpdb();
+  let db;
+  let abortedFeed;
+  let breakFeed;
+  let closedFeed;
+  let errorFeed;
+  try {
+    db = open(path);
+    db.configureQueueEvents();
+
+    const controller = new AbortController();
+    abortedFeed = db.queueEvents({ signal: controller.signal, fallbackPollS: null });
+    const abortedNext = abortedFeed.next();
+    controller.abort();
+    assert.deepEqual(await abortedNext, { done: true, value: undefined });
+    assert.equal(abortedFeed._updates._closed, true);
+
+    breakFeed = db.queueEvents();
+    db.queue('iterator-cleanup').enqueue({ sequence: 1 });
+    for await (const event of breakFeed) {
+      assert.equal(event.type, 'enqueued');
+      break;
+    }
+    assert.equal(breakFeed._updates._closed, true);
+
+    closedFeed = db.queueEvents({
+      fromOffset: breakFeed.lastOffset,
+      fallbackPollS: null,
+    });
+    const closedNext = closedFeed.next();
+    closedFeed.close();
+    assert.deepEqual(await closedNext, { done: true, value: undefined });
+    assert.equal(closedFeed._updates._closed, true);
+
+    errorFeed = db.queueEvents({ fromOffset: breakFeed.lastOffset });
+    const dropStream = db.transaction();
+    dropStream.execute('DROP TABLE _honker_stream');
+    dropStream.commit();
+    await assert.rejects(errorFeed.next(), /no such table: _honker_stream/);
+    assert.equal(errorFeed._updates._closed, true);
+  } finally {
+    try { errorFeed?.close(); } catch {}
+    try { closedFeed?.close(); } catch {}
+    try { breakFeed?.close(); } catch {}
+    try { abortedFeed?.close(); } catch {}
+    cleanup();
+  }
+});
+
+test('the internal queue event stream topic is reserved', () => {
+  const { path, open, cleanup } = tmpdb();
+  let db;
+  try {
+    db = open(path);
+    assert.throws(
+      () => db.stream('_honker:queue-events:v1').publish({ forged: true }),
+      /reserved for queue lifecycle events/,
+    );
+
+    db.configureQueueEvents({ includePayload: true });
+    const id = db.queue('reserved-topic').enqueue({ legitimate: true });
+    const [event] = db.queueEvents({ queue: 'reserved-topic' }).readSince(0);
+    assert.equal(event.jobId, id);
+    assert.deepEqual(event.payload, { legitimate: true });
+  } finally {
+    cleanup();
+  }
+});

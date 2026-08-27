@@ -823,19 +823,30 @@ class QueueEvents {
   }
 
   async next() {
-    while (!this._closed && !aborted(this._signal)) {
-      if (this._pending.length === 0) this._loadPending();
-      if (this._pending.length > 0) {
-        const event = this._pending.shift();
-        this._lastSeen = event.offset;
-        return { done: false, value: event };
+    try {
+      while (!this._closed && !aborted(this._signal)) {
+        if (this._pending.length === 0) this._loadPending();
+        if (this._pending.length > 0) {
+          const event = this._pending.shift();
+          this._lastSeen = event.offset;
+          return { done: false, value: event };
+        }
+        await waitForUpdateOrTimeout(
+          this._updates,
+          this._signal,
+          this._fallbackPollMs,
+        );
       }
-      await waitForUpdateOrTimeout(
-        this._updates,
-        this._signal,
-        this._fallbackPollMs,
-      );
+    } catch (error) {
+      this.close();
+      throw error;
     }
+    this.close();
+    return { done: true, value: undefined };
+  }
+
+  async return() {
+    this.close();
     return { done: true, value: undefined };
   }
 

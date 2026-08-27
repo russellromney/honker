@@ -62,5 +62,6 @@ for (const event of retained) {
 queue.enqueue({ template: 'welcome', variables: {} })
 
 waker.close()
+void queueEvents.return()
 queueEvents.close()
 db.close()

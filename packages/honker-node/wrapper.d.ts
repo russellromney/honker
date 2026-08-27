@@ -190,6 +190,7 @@ export class QueueEvents<TPayload = JsonValue>
   readonly lastOffset: number
   readSince(offset: number, limit?: number): QueueEvent<TPayload>[]
   next(): Promise<IteratorResult<QueueEvent<TPayload>>>
+  return(): Promise<IteratorResult<QueueEvent<TPayload>>>
   [Symbol.asyncIterator](): AsyncIterableIterator<QueueEvent<TPayload>>
   close(): void
 }

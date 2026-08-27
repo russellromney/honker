@@ -18,6 +18,8 @@ for that. These catch order-of-magnitude regressions only.
 """
 
 import asyncio
+import json
+import statistics
 import time
 
 import pytest
@@ -71,6 +73,59 @@ def test_claim_batch_throughput_floor(db_path):
         f"claim_batch 10k took {elapsed:.3f}s (floor: 3.0s). "
         f"Likely regression in the _honker_live_claim partial index "
         f"or honker_claim_batch."
+    )
+
+
+def test_disabled_queue_events_do_not_multiply_ack_batch_cost(db_path):
+    """The disabled event path must stay close to the lean DELETE.
+
+    Queue events originally materialized every job payload and queried
+    configuration once per ack even while disabled, making a 5k ack batch
+    roughly 6x slower. Compare the public UDF with its underlying DELETE so
+    that regression trips independently of runner speed.
+    """
+    db = honker.open(db_path)
+    direct_times = []
+    udf_times = []
+
+    for round_number in range(3):
+        direct_q = db.queue(f"perf-ack-direct-{round_number}")
+        udf_q = db.queue(f"perf-ack-udf-{round_number}")
+        with db.transaction() as tx:
+            for i in range(5_000):
+                direct_q.enqueue({"i": i}, tx=tx)
+                udf_q.enqueue({"i": i}, tx=tx)
+
+        direct_jobs = direct_q.claim_batch("direct-worker", 5_000)
+        udf_jobs = udf_q.claim_batch("udf-worker", 5_000)
+        direct_ids = [job.id for job in direct_jobs]
+        udf_ids = [job.id for job in udf_jobs]
+
+        t0 = time.perf_counter()
+        with db.transaction() as tx:
+            tx.execute(
+                "DELETE FROM _honker_live "
+                "WHERE id IN (SELECT value FROM json_each(?)) "
+                "AND worker_id = ? AND claim_expires_at >= unixepoch()",
+                [json.dumps(direct_ids), "direct-worker"],
+            )
+        direct_times.append(time.perf_counter() - t0)
+        assert db.query(
+            "SELECT COUNT(*) AS c FROM _honker_live WHERE queue = ?",
+            [direct_q.name],
+        )[0]["c"] == 0
+
+        t0 = time.perf_counter()
+        assert udf_q.ack_batch(udf_ids, "udf-worker") == 5_000
+        udf_times.append(time.perf_counter() - t0)
+
+    direct_median = statistics.median(direct_times)
+    udf_median = statistics.median(udf_times)
+    bound = direct_median * 2.0 + 0.010
+    assert udf_median < bound, (
+        f"disabled queue-event ack_batch took {udf_median:.4f}s versus "
+        f"{direct_median:.4f}s for the lean DELETE (bound: {bound:.4f}s). "
+        "Likely repeated config reads or payload materialization."
     )
 
 

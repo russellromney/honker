@@ -86,7 +86,8 @@ not perform runtime schema validation.
 
 Queue lifecycle events are an opt-in, bounded observability feed. Configuration
 is stored in the database so producers and workers in other processes use the
-same behavior:
+same behavior. Existing connections refresh configuration within 100 ms; the
+connection that calls `configureQueueEvents()` sees it immediately:
 
 ```ts
 db.configureQueueEvents({ maxEvents: 10_000, includePayload: false });
@@ -100,7 +101,9 @@ for await (const event of events) {
 Events are appended in the same SQLite transaction as successful queue state
 transitions. They are intended for dashboards, metrics, and debugging—not as a
 permanent audit log or an exactly-once business event bus. Save the last offset
-to replay retained events after reconnecting.
+to replay retained events after reconnecting. The internal
+`_honker:queue-events:v1` stream topic is reserved and cannot be published via
+`db.stream()`.
 
 Recurring schedules use `schedule`:
 

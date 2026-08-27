@@ -22,8 +22,12 @@ use rusqlite::Connection;
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 const QUEUE_EVENTS_TOPIC: &str = "_honker:queue-events:v1";
+const QUEUE_EVENT_CONFIG_CACHE_TTL: Duration = Duration::from_millis(100);
 
 struct QueueEventRecord<'a> {
     event_type: &'a str,
@@ -34,6 +38,35 @@ struct QueueEventRecord<'a> {
     worker_id: Option<&'a str>,
     run_at: Option<i64>,
     error: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct QueueEventConfig {
+    max_events: i64,
+    include_payload: bool,
+}
+
+struct QueueEventConfigCache {
+    encoded: AtomicU64,
+    expires_at_ms: AtomicU64,
+    bypass_until_autocommit: AtomicBool,
+}
+
+impl Default for QueueEventConfigCache {
+    fn default() -> Self {
+        Self {
+            encoded: AtomicU64::new(0),
+            expires_at_ms: AtomicU64::new(0),
+            bypass_until_autocommit: AtomicBool::new(false),
+        }
+    }
+}
+
+struct QueueEventEmitter<'a> {
+    conn: &'a Connection,
+    config: QueueEventConfig,
+    occurred_at: i64,
+    last_offset: Option<i64>,
 }
 
 /// Read an integer argument, accepting the REAL that dynamically typed
@@ -103,27 +136,50 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 /// per-connection: creating the same function twice is a rusqlite
 /// error, so call exactly once per connection.
 pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
+    let queue_event_cache = Arc::new(QueueEventConfigCache::default());
+
     conn.create_scalar_function("honker_bootstrap", 0, FunctionFlags::SQLITE_UTF8, |ctx| {
         let db = unsafe { ctx.get_connection() }?;
         super::bootstrap_honker_schema(&db).map_err(to_sql_err)?;
         Ok(1i64)
     })?;
 
-    conn.create_scalar_function("honker_claim_batch", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let queue: String = ctx.get(0)?;
-        let worker_id: String = ctx.get(1)?;
-        let n: i64 = arg_i64(ctx, 2)?;
-        let timeout_s: i64 = arg_i64(ctx, 3)?;
-        let db = unsafe { ctx.get_connection() }?;
-        claim_batch(&db, &queue, &worker_id, n, timeout_s).map_err(to_sql_err)
-    })?;
+    let claim_event_cache = Arc::clone(&queue_event_cache);
+    conn.create_scalar_function(
+        "honker_claim_batch",
+        4,
+        FunctionFlags::SQLITE_UTF8,
+        move |ctx| {
+            let queue: String = ctx.get(0)?;
+            let worker_id: String = ctx.get(1)?;
+            let n: i64 = arg_i64(ctx, 2)?;
+            let timeout_s: i64 = arg_i64(ctx, 3)?;
+            let db = unsafe { ctx.get_connection() }?;
+            claim_batch_with_cache(
+                &db,
+                &queue,
+                &worker_id,
+                n,
+                timeout_s,
+                Some(&claim_event_cache),
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
 
-    conn.create_scalar_function("honker_ack_batch", 2, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let ids_json: String = ctx.get(0)?;
-        let worker_id: String = ctx.get(1)?;
-        let db = unsafe { ctx.get_connection() }?;
-        ack_batch(&db, &ids_json, &worker_id).map_err(to_sql_err)
-    })?;
+    let ack_batch_event_cache = Arc::clone(&queue_event_cache);
+    conn.create_scalar_function(
+        "honker_ack_batch",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        move |ctx| {
+            let ids_json: String = ctx.get(0)?;
+            let worker_id: String = ctx.get(1)?;
+            let db = unsafe { ctx.get_connection() }?;
+            ack_batch_with_cache(&db, &ids_json, &worker_id, Some(&ack_batch_event_cache))
+                .map_err(to_sql_err)
+        },
+    )?;
 
     conn.create_scalar_function(
         "honker_queue_next_claim_at",
@@ -136,14 +192,15 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    let sweep_event_cache = Arc::clone(&queue_event_cache);
     conn.create_scalar_function(
         "honker_sweep_expired",
         1,
         FunctionFlags::SQLITE_UTF8,
-        |ctx| {
+        move |ctx| {
             let queue: String = ctx.get(0)?;
             let db = unsafe { ctx.get_connection() }?;
-            sweep_expired(&db, &queue).map_err(to_sql_err)
+            sweep_expired_with_cache(&db, &queue, Some(&sweep_event_cache)).map_err(to_sql_err)
         },
     )?;
 
@@ -279,14 +336,16 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // job_id}` to the output array. Caller typically holds
     // `_honker_locks` entry 'honker-scheduler' for mutual
     // exclusion across scheduler processes.
+    let scheduler_tick_event_cache = Arc::clone(&queue_event_cache);
     conn.create_scalar_function(
         "honker_scheduler_tick",
         1,
         FunctionFlags::SQLITE_UTF8,
-        |ctx| {
+        move |ctx| {
             let now_unix: i64 = arg_i64(ctx, 0)?;
             let db = unsafe { ctx.get_connection() }?;
-            scheduler_tick(&db, now_unix).map_err(to_sql_err)
+            scheduler_tick_with_cache(&db, now_unix, Some(&scheduler_tick_event_cache))
+                .map_err(to_sql_err)
         },
     )?;
 
@@ -442,35 +501,43 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // else if `run_at` is not NULL, use that literal; else use
     // `unixepoch()`. `expires` is `unixepoch() + expires` if non-NULL,
     // else NULL (never expires).
-    conn.create_scalar_function("honker_enqueue", 7, FunctionFlags::SQLITE_UTF8, |ctx| {
-        let queue: String = ctx.get(0)?;
-        let payload: String = ctx.get(1)?;
-        let run_at: Option<i64> = arg_opt_i64(ctx, 2)?;
-        let delay: Option<i64> = arg_opt_i64(ctx, 3)?;
-        let priority: i64 = arg_i64(ctx, 4)?;
-        let max_attempts: i64 = arg_i64(ctx, 5)?;
-        let expires: Option<i64> = arg_opt_i64(ctx, 6)?;
-        let db = unsafe { ctx.get_connection() }?;
-        enqueue(
-            &db,
-            &queue,
-            &payload,
-            run_at,
-            delay,
-            priority,
-            max_attempts,
-            expires,
-        )
-        .map_err(to_sql_err)
-    })?;
+    let enqueue_event_cache = Arc::clone(&queue_event_cache);
+    conn.create_scalar_function(
+        "honker_enqueue",
+        7,
+        FunctionFlags::SQLITE_UTF8,
+        move |ctx| {
+            let queue: String = ctx.get(0)?;
+            let payload: String = ctx.get(1)?;
+            let run_at: Option<i64> = arg_opt_i64(ctx, 2)?;
+            let delay: Option<i64> = arg_opt_i64(ctx, 3)?;
+            let priority: i64 = arg_i64(ctx, 4)?;
+            let max_attempts: i64 = arg_i64(ctx, 5)?;
+            let expires: Option<i64> = arg_opt_i64(ctx, 6)?;
+            let db = unsafe { ctx.get_connection() }?;
+            enqueue_with_cache(
+                &db,
+                &queue,
+                &payload,
+                run_at,
+                delay,
+                priority,
+                max_attempts,
+                expires,
+                Some(&enqueue_event_cache),
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
 
     // honker_ack(job_id, worker_id) -> 1 if ack'd, 0 if claim expired /
     // not ours.
-    conn.create_scalar_function("honker_ack", 2, FunctionFlags::SQLITE_UTF8, |ctx| {
+    let ack_event_cache = Arc::clone(&queue_event_cache);
+    conn.create_scalar_function("honker_ack", 2, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let job_id: i64 = arg_i64(ctx, 0)?;
         let worker_id: String = ctx.get(1)?;
         let db = unsafe { ctx.get_connection() }?;
-        ack(&db, job_id, &worker_id).map_err(to_sql_err)
+        ack_with_cache(&db, job_id, &worker_id, Some(&ack_event_cache)).map_err(to_sql_err)
     })?;
 
     // honker_retry(job_id, worker_id, delay_s, error) -> 1 if retried /
@@ -478,23 +545,34 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // moves the row to `_honker_dead` instead of flipping it back
     // to pending. Fires a notify on the queue's channel on successful
     // pending-flip (so waiting workers wake).
-    conn.create_scalar_function("honker_retry", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
+    let retry_event_cache = Arc::clone(&queue_event_cache);
+    conn.create_scalar_function("honker_retry", 4, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let job_id: i64 = arg_i64(ctx, 0)?;
         let worker_id: String = ctx.get(1)?;
         let delay_s: i64 = arg_i64(ctx, 2)?;
         let error: String = ctx.get(3)?;
         let db = unsafe { ctx.get_connection() }?;
-        retry(&db, job_id, &worker_id, delay_s, &error).map_err(to_sql_err)
+        retry_with_cache(
+            &db,
+            job_id,
+            &worker_id,
+            delay_s,
+            &error,
+            Some(&retry_event_cache),
+        )
+        .map_err(to_sql_err)
     })?;
 
     // honker_fail(job_id, worker_id, error) -> 1 if failed-to-dead, 0 if
     // not our claim.
-    conn.create_scalar_function("honker_fail", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
+    let fail_event_cache = Arc::clone(&queue_event_cache);
+    conn.create_scalar_function("honker_fail", 3, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let job_id: i64 = arg_i64(ctx, 0)?;
         let worker_id: String = ctx.get(1)?;
         let error: String = ctx.get(2)?;
         let db = unsafe { ctx.get_connection() }?;
-        fail(&db, job_id, &worker_id, &error).map_err(to_sql_err)
+        fail_with_cache(&db, job_id, &worker_id, &error, Some(&fail_event_cache))
+            .map_err(to_sql_err)
     })?;
 
     // honker_heartbeat(job_id, worker_id, extend_s) -> 1 if extended, 0
@@ -509,10 +587,11 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 
     // honker_cancel(job_id) -> 1 if a pending/processing row was removed,
     // 0 otherwise. Idempotent on missing.
-    conn.create_scalar_function("honker_cancel", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+    let cancel_event_cache = Arc::clone(&queue_event_cache);
+    conn.create_scalar_function("honker_cancel", 1, FunctionFlags::SQLITE_UTF8, move |ctx| {
         let job_id: i64 = arg_i64(ctx, 0)?;
         let db = unsafe { ctx.get_connection() }?;
-        cancel(&db, job_id).map_err(to_sql_err)
+        cancel_with_cache(&db, job_id, Some(&cancel_event_cache)).map_err(to_sql_err)
     })?;
 
     // honker_get_job(job_id) -> JSON object on hit, empty string on miss.
@@ -602,16 +681,20 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 
     // Queue lifecycle events are an opt-in, bounded stream maintained
     // transactionally by the queue mutation functions below.
+    let configure_event_cache = Arc::clone(&queue_event_cache);
     conn.create_scalar_function(
         "honker_queue_events_configure",
         3,
         FunctionFlags::SQLITE_UTF8,
-        |ctx| {
+        move |ctx| {
             let enabled = arg_i64(ctx, 0)? != 0;
             let max_events = arg_i64(ctx, 1)?;
             let include_payload = arg_i64(ctx, 2)? != 0;
             let db = unsafe { ctx.get_connection() }?;
-            queue_events_configure(&db, enabled, max_events, include_payload).map_err(to_sql_err)
+            let configured = queue_events_configure(&db, enabled, max_events, include_payload)
+                .map_err(to_sql_err)?;
+            configure_event_cache.invalidate_after_configure(&db);
+            Ok(configured)
         },
     )?;
     conn.create_scalar_function(
@@ -644,7 +727,11 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 /// processing with an expired visibility timeout. In-flight claims
 /// that still hold a valid timeout are left alone so the holder can
 /// still ack / retry / fail.
-fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+fn dead_letter_exhausted_claimable(
+    conn: &Connection,
+    queue: &str,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<i64> {
     let mut select = conn.prepare_cached(
         "DELETE FROM _honker_live
          WHERE queue = ?1
@@ -682,6 +769,7 @@ fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'max attempts exceeded', ?8)",
     )?;
     let count = rows.len() as i64;
+    let mut emitter = queue_event_emitter(conn, cache)?;
     for (id, queue, payload, priority, run_at, max_attempts, attempts, created_at) in rows {
         insert.execute(rusqlite::params![
             id,
@@ -693,9 +781,8 @@ fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::
             attempts,
             created_at
         ])?;
-        emit_queue_event(
-            conn,
-            QueueEventRecord {
+        if let Some(emitter) = emitter.as_mut() {
+            emitter.emit(QueueEventRecord {
                 event_type: "dead_lettered",
                 job_id: id,
                 queue: &queue,
@@ -704,25 +791,40 @@ fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::
                 worker_id: None,
                 run_at: Some(run_at),
                 error: Some("max attempts exceeded"),
-            },
-        )?;
+            })?;
+        }
+    }
+    if let Some(emitter) = emitter {
+        emitter.finish()?;
     }
     Ok(count)
 }
 
 /// Returns JSON text containing the complete claimed-job snapshot.
-pub fn claim_batch(
+#[cfg(test)]
+fn claim_batch(
     conn: &Connection,
     queue: &str,
     worker_id: &str,
     n: i64,
     timeout_s: i64,
 ) -> rusqlite::Result<String> {
+    claim_batch_with_cache(conn, queue, worker_id, n, timeout_s, None)
+}
+
+fn claim_batch_with_cache(
+    conn: &Connection,
+    queue: &str,
+    worker_id: &str,
+    n: i64,
+    timeout_s: i64,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<String> {
     // Drop reclaimable rows that already used their attempt budget so
     // they cannot be claimed again (and so they don't clog the claim
     // index forever). Same outer SQL statement / connection, so this
     // shares the caller's transaction with the claim UPDATE below.
-    dead_letter_exhausted_claimable(conn, queue)?;
+    dead_letter_exhausted_claimable(conn, queue, cache)?;
 
     let mut stmt = conn.prepare_cached(
         "UPDATE _honker_live
@@ -762,6 +864,10 @@ pub fn claim_batch(
         ))
     })?;
     let mut out = Vec::new();
+    // Three states distinguish "no claimed rows yet" from "rows exist but
+    // events are disabled". That keeps empty worker polls free of config
+    // reads while loading configuration only once for a non-empty batch.
+    let mut emitter: Option<Option<QueueEventEmitter<'_>>> = None;
     for row in rows {
         let (
             id,
@@ -777,9 +883,11 @@ pub fn claim_batch(
             created_at,
             expires_at,
         ) = row?;
-        emit_queue_event(
-            conn,
-            QueueEventRecord {
+        if emitter.is_none() {
+            emitter = Some(queue_event_emitter(conn, cache)?);
+        }
+        if let Some(Some(emitter)) = emitter.as_mut() {
+            emitter.emit(QueueEventRecord {
                 event_type: "claimed",
                 job_id: id,
                 queue: &q,
@@ -788,8 +896,8 @@ pub fn claim_batch(
                 worker_id: Some(&w),
                 run_at: Some(run_at),
                 error: None,
-            },
-        )?;
+            })?;
+        }
         // payload stays a JSON string (double-encoded on the wire) so
         // every binding's existing parse path keeps working.
         out.push(json!({
@@ -807,10 +915,34 @@ pub fn claim_batch(
             "expires_at": expires_at,
         }));
     }
+    if let Some(Some(emitter)) = emitter {
+        emitter.finish()?;
+    }
     Ok(Value::Array(out).to_string())
 }
 
-pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
+#[cfg(test)]
+fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
+    ack_batch_with_cache(conn, ids_json, worker_id, None)
+}
+
+fn ack_batch_with_cache(
+    conn: &Connection,
+    ids_json: &str,
+    worker_id: &str,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<i64> {
+    let Some(mut emitter) = queue_event_emitter(conn, cache)? else {
+        let deleted = conn.execute(
+            "DELETE FROM _honker_live
+             WHERE id IN (SELECT value FROM json_each(?1))
+               AND worker_id = ?2
+               AND claim_expires_at >= unixepoch()",
+            rusqlite::params![ids_json, worker_id],
+        )?;
+        return Ok(deleted as i64);
+    };
+
     #[allow(clippy::type_complexity)]
     let jobs: Vec<(i64, String, String, i64, i64, String)> = {
         let mut stmt = conn.prepare_cached(
@@ -834,20 +966,18 @@ pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite
     };
     let count = jobs.len() as i64;
     for (id, queue, payload, attempts, run_at, worker_id) in jobs {
-        emit_queue_event(
-            conn,
-            QueueEventRecord {
-                event_type: "completed",
-                job_id: id,
-                queue: &queue,
-                payload: &payload,
-                attempts,
-                worker_id: Some(&worker_id),
-                run_at: Some(run_at),
-                error: None,
-            },
-        )?;
+        emitter.emit(QueueEventRecord {
+            event_type: "completed",
+            job_id: id,
+            queue: &queue,
+            payload: &payload,
+            attempts,
+            worker_id: Some(&worker_id),
+            run_at: Some(run_at),
+            error: None,
+        })?;
     }
+    emitter.finish()?;
     Ok(count)
 }
 
@@ -899,7 +1029,8 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
 ///   - delay set            → `unixepoch() + delay` (wins over run_at)
 ///
 /// Expiration: NULL = never; `Some(s)` = `unixepoch() + s`.
-pub fn enqueue(
+#[cfg(test)]
+fn enqueue(
     conn: &Connection,
     queue: &str,
     payload: &str,
@@ -908,6 +1039,31 @@ pub fn enqueue(
     priority: i64,
     max_attempts: i64,
     expires: Option<i64>,
+) -> rusqlite::Result<i64> {
+    enqueue_with_cache(
+        conn,
+        queue,
+        payload,
+        run_at,
+        delay,
+        priority,
+        max_attempts,
+        expires,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_with_cache(
+    conn: &Connection,
+    queue: &str,
+    payload: &str,
+    run_at: Option<i64>,
+    delay: Option<i64>,
+    priority: i64,
+    max_attempts: i64,
+    expires: Option<i64>,
+    cache: Option<&QueueEventConfigCache>,
 ) -> rusqlite::Result<i64> {
     let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
     let run_at_val: i64 = match (delay, run_at) {
@@ -939,6 +1095,7 @@ pub fn enqueue(
     )?;
     emit_queue_event(
         conn,
+        cache,
         QueueEventRecord {
             event_type: "enqueued",
             job_id: id,
@@ -956,7 +1113,27 @@ pub fn enqueue(
 /// Single-job ack. DELETEs the row if the caller's claim is still
 /// valid. Returns 1 on success, 0 if the claim expired or the row
 /// isn't ours.
-pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<i64> {
+#[cfg(test)]
+fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<i64> {
+    ack_with_cache(conn, job_id, worker_id, None)
+}
+
+fn ack_with_cache(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<i64> {
+    let Some(mut emitter) = queue_event_emitter(conn, cache)? else {
+        let deleted = conn.execute(
+            "DELETE FROM _honker_live
+             WHERE id = ?1 AND worker_id = ?2
+               AND claim_expires_at >= unixepoch()",
+            rusqlite::params![job_id, worker_id],
+        )?;
+        return Ok(deleted as i64);
+    };
+
     let row: Option<(String, String, i64, i64, String)> = match conn.query_row(
         "DELETE FROM _honker_live
          WHERE id = ?1 AND worker_id = ?2 AND claim_expires_at >= unixepoch()
@@ -971,19 +1148,17 @@ pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<
     let Some((queue, payload, attempts, run_at, worker_id)) = row else {
         return Ok(0);
     };
-    emit_queue_event(
-        conn,
-        QueueEventRecord {
-            event_type: "completed",
-            job_id,
-            queue: &queue,
-            payload: &payload,
-            attempts,
-            worker_id: Some(&worker_id),
-            run_at: Some(run_at),
-            error: None,
-        },
-    )?;
+    emitter.emit(QueueEventRecord {
+        event_type: "completed",
+        job_id,
+        queue: &queue,
+        payload: &payload,
+        attempts,
+        worker_id: Some(&worker_id),
+        run_at: Some(run_at),
+        error: None,
+    })?;
+    emitter.finish()?;
     Ok(1)
 }
 
@@ -995,12 +1170,24 @@ pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<
 ///
 /// Returns 1 if either branch ran, 0 if the claim is no longer valid
 /// (expired / not our worker / row moved on).
-pub fn retry(
+#[cfg(test)]
+fn retry(
     conn: &Connection,
     job_id: i64,
     worker_id: &str,
     delay_s: i64,
     error: &str,
+) -> rusqlite::Result<i64> {
+    retry_with_cache(conn, job_id, worker_id, delay_s, error, None)
+}
+
+fn retry_with_cache(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    delay_s: i64,
+    error: &str,
+    cache: Option<&QueueEventConfigCache>,
 ) -> rusqlite::Result<i64> {
     #[allow(clippy::type_complexity)]
     let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
@@ -1071,6 +1258,7 @@ pub fn retry(
     };
     emit_queue_event(
         conn,
+        cache,
         QueueEventRecord {
             event_type,
             job_id: id,
@@ -1087,7 +1275,13 @@ pub fn retry(
 
 /// Unconditionally move the claim to `_honker_dead` with the given
 /// error. Returns 1 if moved, 0 if not our claim.
-pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rusqlite::Result<i64> {
+fn fail_with_cache(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    error: &str,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<i64> {
     #[allow(clippy::type_complexity)]
     let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
         .query_row(
@@ -1134,6 +1328,7 @@ pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rus
     )?;
     emit_queue_event(
         conn,
+        cache,
         QueueEventRecord {
             event_type: "dead_lettered",
             job_id: id,
@@ -1157,7 +1352,25 @@ pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rus
 /// changed their mind). Note that for a `state='processing'` row,
 /// the worker holding the claim will see `ack()` return 0 on its
 /// next call — same shape as a claim that simply expired.
-pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
+#[cfg(test)]
+fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
+    cancel_with_cache(conn, job_id, None)
+}
+
+fn cancel_with_cache(
+    conn: &Connection,
+    job_id: i64,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<i64> {
+    let Some(mut emitter) = queue_event_emitter(conn, cache)? else {
+        let deleted = conn.execute(
+            "DELETE FROM _honker_live
+             WHERE id = ?1 AND state IN ('pending', 'processing')",
+            rusqlite::params![job_id],
+        )?;
+        return Ok(deleted as i64);
+    };
+
     let row: Option<(String, String, i64, i64, Option<String>)> = match conn.query_row(
         "DELETE FROM _honker_live
          WHERE id = ?1 AND state IN ('pending', 'processing')
@@ -1172,19 +1385,17 @@ pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
     let Some((queue, payload, attempts, run_at, worker_id)) = row else {
         return Ok(0);
     };
-    emit_queue_event(
-        conn,
-        QueueEventRecord {
-            event_type: "cancelled",
-            job_id,
-            queue: &queue,
-            payload: &payload,
-            attempts,
-            worker_id: worker_id.as_deref(),
-            run_at: Some(run_at),
-            error: None,
-        },
-    )?;
+    emitter.emit(QueueEventRecord {
+        event_type: "cancelled",
+        job_id,
+        queue: &queue,
+        payload: &payload,
+        attempts,
+        worker_id: worker_id.as_deref(),
+        run_at: Some(run_at),
+        error: None,
+    })?;
+    emitter.finish()?;
     Ok(1)
 }
 
@@ -1291,7 +1502,16 @@ pub fn heartbeat(
 
 /// Move expired-pending rows from `_honker_live` to `_honker_dead`
 /// with `last_error='expired'`. Returns count moved.
-pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+#[cfg(test)]
+fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+    sweep_expired_with_cache(conn, queue, None)
+}
+
+fn sweep_expired_with_cache(
+    conn: &Connection,
+    queue: &str,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<i64> {
     let mut select = conn.prepare_cached(
         "DELETE FROM _honker_live
          WHERE queue = ?1
@@ -1326,6 +1546,7 @@ pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'expired', ?8)",
     )?;
     let count = rows.len() as i64;
+    let mut emitter = queue_event_emitter(conn, cache)?;
     for (id, queue, payload, priority, run_at, max_attempts, attempts, created_at) in rows {
         insert.execute(rusqlite::params![
             id,
@@ -1337,9 +1558,8 @@ pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
             attempts,
             created_at
         ])?;
-        emit_queue_event(
-            conn,
-            QueueEventRecord {
+        if let Some(emitter) = emitter.as_mut() {
+            emitter.emit(QueueEventRecord {
                 event_type: "dead_lettered",
                 job_id: id,
                 queue: &queue,
@@ -1348,8 +1568,11 @@ pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
                 worker_id: None,
                 run_at: Some(run_at),
                 error: Some("expired"),
-            },
-        )?;
+            })?;
+        }
+    }
+    if let Some(emitter) = emitter {
+        emitter.finish()?;
     }
     Ok(count)
 }
@@ -1554,7 +1777,11 @@ pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 /// boundaries remain in the past (catches up after a scheduler
 /// outage), up to [`SCHEDULER_MAX_CATCHUP_FIRES`] per task.
 /// Returns a JSON array of `{name, queue, fire_at, job_id}` fires.
-pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<String> {
+fn scheduler_tick_with_cache(
+    conn: &Connection,
+    now_unix: i64,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<String> {
     #[allow(clippy::type_complexity)]
     let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64, i64)> = {
         let mut stmt = conn.prepare_cached(
@@ -1596,7 +1823,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
             // max_attempts comes from the schedule row, not a constant.
-            let job_id = enqueue(
+            let job_id = enqueue_with_cache(
                 conn,
                 &queue,
                 &payload,
@@ -1605,6 +1832,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 priority,
                 max_attempts,
                 expires_s,
+                cache,
             )?;
             out.push(json!({
                 "name": name,
@@ -1901,14 +2129,21 @@ pub fn queue_events_configure(
     Ok(1)
 }
 
-fn queue_event_config(conn: &Connection) -> rusqlite::Result<Option<(i64, bool)>> {
-    match conn.query_row(
-        "SELECT max_events, include_payload
-         FROM _honker_queue_event_config
-         WHERE singleton = 1 AND enabled = 1",
-        [],
-        |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
-    ) {
+fn load_queue_event_config(conn: &Connection) -> rusqlite::Result<Option<QueueEventConfig>> {
+    let result = (|| {
+        let mut stmt = conn.prepare_cached(
+            "SELECT max_events, include_payload
+             FROM _honker_queue_event_config
+             WHERE singleton = 1 AND enabled = 1",
+        )?;
+        stmt.query_row([], |r| {
+            Ok(QueueEventConfig {
+                max_events: r.get(0)?,
+                include_payload: r.get::<_, i64>(1)? != 0,
+            })
+        })
+    })();
+    match result {
         Ok(config) => Ok(Some(config)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => {
@@ -1933,53 +2168,156 @@ fn queue_event_config(conn: &Connection) -> rusqlite::Result<Option<(i64, bool)>
     }
 }
 
-fn emit_queue_event(
-    conn: &Connection,
-    event: QueueEventRecord<'_>,
-) -> rusqlite::Result<Option<i64>> {
-    let Some((max_events, include_payload)) = queue_event_config(conn)? else {
+impl QueueEventConfigCache {
+    fn get(&self, conn: &Connection) -> rusqlite::Result<Option<QueueEventConfig>> {
+        if self.bypass_until_autocommit.load(Ordering::Acquire) {
+            if conn.is_autocommit() {
+                self.bypass_until_autocommit.store(false, Ordering::Release);
+                self.invalidate();
+            } else {
+                return load_queue_event_config(conn);
+            }
+        }
+
+        let now_ms = queue_event_cache_millis();
+        if now_ms < self.expires_at_ms.load(Ordering::Acquire) {
+            let encoded = self.encoded.load(Ordering::Relaxed);
+            return Ok(decode_queue_event_config(encoded));
+        }
+
+        let config = load_queue_event_config(conn)?;
+        self.encoded
+            .store(encode_queue_event_config(config), Ordering::Relaxed);
+        self.expires_at_ms.store(
+            now_ms + QUEUE_EVENT_CONFIG_CACHE_TTL.as_millis() as u64,
+            Ordering::Release,
+        );
+        Ok(config)
+    }
+
+    fn invalidate_after_configure(&self, conn: &Connection) {
+        self.invalidate();
+        // A configure call inside an explicit transaction may still roll
+        // back. Do not cache its uncommitted value until autocommit resumes.
+        self.bypass_until_autocommit
+            .store(!conn.is_autocommit(), Ordering::Release);
+    }
+
+    fn invalidate(&self) {
+        self.expires_at_ms.store(0, Ordering::Release);
+        self.encoded.store(0, Ordering::Relaxed);
+    }
+}
+
+fn queue_event_cache_millis() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn encode_queue_event_config(config: Option<QueueEventConfig>) -> u64 {
+    match config {
+        None => 0,
+        Some(config) => {
+            let payload_bit = u64::from(config.include_payload) << 63;
+            payload_bit | config.max_events as u64
+        }
+    }
+}
+
+fn decode_queue_event_config(encoded: u64) -> Option<QueueEventConfig> {
+    if encoded == 0 {
+        return None;
+    }
+    Some(QueueEventConfig {
+        max_events: (encoded & i64::MAX as u64) as i64,
+        include_payload: encoded >> 63 == 1,
+    })
+}
+
+fn queue_event_emitter<'a>(
+    conn: &'a Connection,
+    cache: Option<&QueueEventConfigCache>,
+) -> rusqlite::Result<Option<QueueEventEmitter<'a>>> {
+    let config = match cache {
+        Some(cache) => cache.get(conn)?,
+        None => load_queue_event_config(conn)?,
+    };
+    let Some(config) = config else {
         return Ok(None);
     };
-    let occurred_at = now_unix(conn)?;
-    let mut body = json!({
-        "version": 1,
-        "type": event.event_type,
-        "job_id": event.job_id,
-        "queue": event.queue,
-        "occurred_at": occurred_at,
-        "attempts": event.attempts,
-        "worker_id": event.worker_id,
-        "run_at": event.run_at,
-        "error": event.error,
-    });
-    if include_payload {
-        let payload = serde_json::from_str(event.payload)
-            .unwrap_or_else(|_| Value::String(event.payload.to_string()));
-        body.as_object_mut()
-            .expect("queue event body is always an object")
-            .insert("payload".to_string(), payload);
-    }
-
-    let offset = stream_publish(
+    Ok(Some(QueueEventEmitter {
         conn,
-        QUEUE_EVENTS_TOPIC,
-        Some(event.queue),
-        &body.to_string(),
-    )?;
+        config,
+        occurred_at: now_unix(conn)?,
+        last_offset: None,
+    }))
+}
 
-    // `_honker_stream.offset` is global across topics. Using its distance
-    // as the trim bound may retain fewer than max_events when application
-    // streams are very busy, but it can never retain more. That keeps the
-    // queue feed strictly bounded without a COUNT/OFFSET scan on every
-    // queue transition.
-    let trim_through = offset.saturating_sub(max_events);
-    if trim_through > 0 {
-        conn.execute(
-            "DELETE FROM _honker_stream WHERE topic = ?1 AND offset <= ?2",
-            rusqlite::params![QUEUE_EVENTS_TOPIC, trim_through],
-        )?;
+fn emit_queue_event(
+    conn: &Connection,
+    cache: Option<&QueueEventConfigCache>,
+    event: QueueEventRecord<'_>,
+) -> rusqlite::Result<()> {
+    let Some(mut emitter) = queue_event_emitter(conn, cache)? else {
+        return Ok(());
+    };
+    emitter.emit(event)?;
+    emitter.finish()
+}
+
+impl QueueEventEmitter<'_> {
+    fn emit(&mut self, event: QueueEventRecord<'_>) -> rusqlite::Result<()> {
+        let mut body = json!({
+            "version": 1,
+            "type": event.event_type,
+            "job_id": event.job_id,
+            "queue": event.queue,
+            "occurred_at": self.occurred_at,
+            "attempts": event.attempts,
+            "worker_id": event.worker_id,
+            "run_at": event.run_at,
+            "error": event.error,
+        });
+        if self.config.include_payload {
+            let payload = serde_json::from_str(event.payload)
+                .unwrap_or_else(|_| Value::String(event.payload.to_string()));
+            body.as_object_mut()
+                .expect("queue event body is always an object")
+                .insert("payload".to_string(), payload);
+        }
+
+        self.last_offset = Some(stream_publish_internal(
+            self.conn,
+            QUEUE_EVENTS_TOPIC,
+            Some(event.queue),
+            &body.to_string(),
+        )?);
+        Ok(())
     }
-    Ok(Some(offset))
+
+    fn finish(self) -> rusqlite::Result<()> {
+        let Some(last_offset) = self.last_offset else {
+            return Ok(());
+        };
+
+        // `_honker_stream.offset` is global across topics. Using its distance
+        // as the trim bound may retain fewer than max_events when application
+        // streams are very busy, but it can never retain more. Batch callers
+        // trim once after their final event, avoiding one DELETE per job.
+        let trim_through = last_offset.saturating_sub(self.config.max_events);
+        if trim_through > 0 {
+            let mut stmt = self
+                .conn
+                .prepare_cached("DELETE FROM _honker_stream WHERE topic = ?1 AND offset <= ?2")?;
+            stmt.execute(rusqlite::params![QUEUE_EVENTS_TOPIC, trim_through])?;
+        }
+        Ok(())
+    }
 }
 
 pub fn queue_events_read_since(
@@ -2030,15 +2368,27 @@ pub fn stream_publish(
     key: Option<&str>,
     payload: &str,
 ) -> rusqlite::Result<i64> {
+    if topic == QUEUE_EVENTS_TOPIC {
+        return Err(to_sql_err(
+            "honker: topic '_honker:queue-events:v1' is reserved for queue lifecycle events",
+        ));
+    }
+    stream_publish_internal(conn, topic, key, payload)
+}
+
+fn stream_publish_internal(
+    conn: &Connection,
+    topic: &str,
+    key: Option<&str>,
+    payload: &str,
+) -> rusqlite::Result<i64> {
     // Stream row INSERT advances data_version on commit — same wake
     // path as enqueue. No synthetic notification row (see enqueue).
-    let offset: i64 = conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO _honker_stream (topic, key, payload)
-         VALUES (?1, ?2, ?3)
-         RETURNING offset",
-        rusqlite::params![topic, key, payload],
-        |r| r.get(0),
+         VALUES (?1, ?2, ?3) RETURNING offset",
     )?;
+    let offset: i64 = stmt.query_row(rusqlite::params![topic, key, payload], |r| r.get(0))?;
     Ok(offset)
 }
 
@@ -2315,6 +2665,8 @@ mod real_arg_tests {
 mod queue_event_tests {
     use super::*;
     use crate::{attach_honker_functions, bootstrap_honker_schema};
+    use rusqlite::OpenFlags;
+    use std::thread;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -2325,6 +2677,15 @@ mod queue_event_tests {
 
     fn events(conn: &Connection, queue: Option<&str>) -> Vec<Value> {
         serde_json::from_str(&queue_events_read_since(conn, 0, queue, 10_000).unwrap()).unwrap()
+    }
+
+    fn sql_enqueue(conn: &Connection, queue: &str) -> i64 {
+        conn.query_row(
+            "SELECT honker_enqueue(?1, '{}', NULL, NULL, 0, 3, NULL)",
+            [queue],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2343,6 +2704,102 @@ mod queue_event_tests {
         let id = enqueue(&conn, "emails", "{}", None, None, 0, 3, None).unwrap();
         claim_batch(&conn, "emails", "legacy-worker", 1, 300).unwrap();
         assert_eq!(ack(&conn, id, "legacy-worker").unwrap(), 1);
+    }
+
+    #[test]
+    fn queue_event_config_cache_refreshes_across_connections() {
+        let uri = format!(
+            "file:honker-queue-event-cache-{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI;
+        let first = Connection::open_with_flags(&uri, flags).unwrap();
+        let second = Connection::open_with_flags(&uri, flags).unwrap();
+        attach_honker_functions(&first).unwrap();
+        attach_honker_functions(&second).unwrap();
+        bootstrap_honker_schema(&first).unwrap();
+
+        sql_enqueue(&first, "before-enable");
+        second
+            .query_row("SELECT honker_queue_events_configure(1, 100, 0)", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        thread::sleep(QUEUE_EVENT_CONFIG_CACHE_TTL + Duration::from_millis(25));
+        let enabled_id = sql_enqueue(&first, "after-enable");
+        assert!(
+            events(&first, None)
+                .iter()
+                .any(|event| { event["job_id"] == enabled_id && event["type"] == "enqueued" })
+        );
+
+        second
+            .query_row("SELECT honker_queue_events_configure(0, 100, 0)", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        thread::sleep(QUEUE_EVENT_CONFIG_CACHE_TTL + Duration::from_millis(25));
+        let last_offset = events(&first, None).last().unwrap()["offset"]
+            .as_i64()
+            .unwrap();
+        sql_enqueue(&first, "after-disable");
+        assert!(
+            serde_json::from_str::<Vec<Value>>(
+                &queue_events_read_since(&first, last_offset, None, 100).unwrap()
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn queue_event_config_cache_encodes_the_largest_retention() {
+        for include_payload in [false, true] {
+            let config = QueueEventConfig {
+                max_events: i64::MAX,
+                include_payload,
+            };
+            let decoded = decode_queue_event_config(encode_queue_event_config(Some(config)))
+                .expect("enabled configuration should round-trip");
+            assert_eq!(decoded.max_events, i64::MAX);
+            assert_eq!(decoded.include_payload, include_payload);
+        }
+        assert!(decode_queue_event_config(encode_queue_event_config(None)).is_none());
+    }
+
+    #[test]
+    fn rolled_back_configuration_does_not_poison_connection_cache() {
+        let conn = db();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.query_row("SELECT honker_queue_events_configure(1, 100, 0)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+        sql_enqueue(&conn, "rolled-back-config");
+        conn.execute_batch("ROLLBACK").unwrap();
+
+        let id = sql_enqueue(&conn, "still-disabled");
+        assert!(
+            events(&conn, None)
+                .iter()
+                .all(|event| event["job_id"] != id)
+        );
+    }
+
+    #[test]
+    fn queue_event_topic_rejects_public_stream_writes() {
+        let conn = db();
+        assert!(stream_publish(&conn, QUEUE_EVENTS_TOPIC, None, "{}").is_err());
+
+        queue_events_configure(&conn, true, 100, false).unwrap();
+        let id = enqueue(&conn, "internal", "{}", None, None, 0, 3, None).unwrap();
+        assert!(
+            events(&conn, None)
+                .iter()
+                .any(|event| { event["job_id"] == id && event["type"] == "enqueued" })
+        );
     }
 
     #[test]
@@ -2489,6 +2946,38 @@ mod queue_event_tests {
                 && event["type"] == "dead_lettered"
                 && event["error"] == "max attempts exceeded"
         }));
+    }
+
+    #[test]
+    fn scheduler_enqueues_emit_through_the_cached_core_path() {
+        let conn = db();
+        queue_events_configure(&conn, true, 100, false).unwrap();
+        conn.query_row(
+            "SELECT honker_scheduler_register(
+               'scheduled-event', 'scheduled', '* * * * *', '{}', 0, NULL
+             )",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        let next_fire: i64 = conn
+            .query_row(
+                "SELECT next_fire_at FROM _honker_scheduler_tasks
+                 WHERE name = 'scheduled-event'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.query_row("SELECT honker_scheduler_tick(?1)", [next_fire], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+
+        assert!(
+            events(&conn, Some("scheduled"))
+                .iter()
+                .any(|event| { event["type"] == "enqueued" && event["queue"] == "scheduled" })
+        );
     }
 
     #[test]
