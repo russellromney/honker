@@ -74,8 +74,14 @@ test('queue: enqueue + claimOne + ack', () => {
     assert.ok(job);
     assert.equal(job.queue, 'emails');
     assert.deepEqual(job.payload, { to: 'alice@example.com' });
+    assert.equal(job.state, 'processing');
+    assert.equal(job.priority, 0);
+    assert.ok(job.runAt > 0);
     assert.equal(job.workerId, 'w1');
     assert.equal(job.attempts, 1);
+    assert.equal(job.maxAttempts, 3);
+    assert.ok(job.createdAt > 0);
+    assert.equal(job.expiresAt, null);
     assert.equal(job.ack(), true);
     assert.equal(q.claimOne('w1'), null);
   } finally {

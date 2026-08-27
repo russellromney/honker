@@ -139,8 +139,16 @@ test('queue.getJob returns row, cancel removes pending', () => {
     const row = q.getJob(jid);
     assert.equal(row.queue, 'emails');
     assert.equal(row.state, 'pending');
-    assert.deepEqual(JSON.parse(row.payload), { to: 'alice@example.com' });
+    assert.deepEqual(row.payload, { to: 'alice@example.com' });
     assert.equal(row.id, jid);
+    assert.equal(row.priority, 0);
+    assert.ok(row.runAt > 0);
+    assert.equal(row.workerId, null);
+    assert.equal(row.claimExpiresAt, null);
+    assert.equal(row.attempts, 0);
+    assert.equal(row.maxAttempts, 3);
+    assert.ok(row.createdAt > 0);
+    assert.equal(row.expiresAt, null);
 
     assert.equal(q.cancel(jid), true);
     assert.equal(q.cancel(jid), false); // idempotent

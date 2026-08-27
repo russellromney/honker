@@ -260,9 +260,15 @@ class Job {
     this.id = row.id;
     this.queue = row.queue;
     this.payload = parseJson(row.payload);
+    this.state = row.state;
+    this.priority = row.priority;
+    this.runAt = row.run_at;
     this.workerId = row.worker_id;
     this.attempts = row.attempts;
     this.claimExpiresAt = row.claim_expires_at ?? null;
+    this.maxAttempts = row.max_attempts;
+    this.createdAt = row.created_at;
+    this.expiresAt = row.expires_at ?? null;
   }
 
   ack() {
@@ -466,7 +472,21 @@ class Queue {
   getJob(jobId) {
     const raw = this._db._callScalar('SELECT honker_get_job(?)', [jobId]);
     if (!raw) return null;
-    return JSON.parse(raw);
+    const row = JSON.parse(raw);
+    return {
+      id: row.id,
+      queue: row.queue,
+      payload: parseJson(row.payload),
+      state: row.state,
+      priority: row.priority,
+      runAt: row.run_at,
+      workerId: row.worker_id ?? null,
+      claimExpiresAt: row.claim_expires_at ?? null,
+      attempts: row.attempts,
+      maxAttempts: row.max_attempts,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at ?? null,
+    };
   }
 }
 

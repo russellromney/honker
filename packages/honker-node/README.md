@@ -62,6 +62,28 @@ Delayed jobs use `runAt`:
 q.enqueue({ to: "later@example.com" }, { runAt: Math.floor(Date.now() / 1000) + 10 });
 ```
 
+TypeScript callers can give a queue a payload contract. Claimed jobs and
+`getJob()` snapshots preserve it:
+
+```ts
+interface EmailPayload {
+  to: string;
+  template: "welcome" | "receipt";
+}
+
+const emails = db.queue<EmailPayload>("emails");
+emails.enqueue({ to: "alice@example.com", template: "welcome" });
+
+const job = emails.claimOne("worker-1");
+if (job) {
+  console.log(job.payload.template, job.priority, job.runAt, job.createdAt);
+  job.ack();
+}
+```
+
+Payload generics describe the expected JSON shape at compile time; Honker does
+not perform runtime schema validation.
+
 Recurring schedules use `schedule`:
 
 ```js

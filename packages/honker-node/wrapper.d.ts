@@ -102,21 +102,44 @@ export class Lock {
   heartbeat(ttlS: number): boolean
 }
 
-export class Job {
+export type JobState = 'pending' | 'processing'
+
+export interface JobSnapshot<TPayload = JsonValue> {
   readonly id: number
   readonly queue: string
-  readonly payload: JsonValue
+  readonly payload: TPayload
+  readonly state: JobState
+  readonly priority: number
+  readonly runAt: number
+  readonly workerId: string | null
+  readonly claimExpiresAt: number | null
+  readonly attempts: number
+  readonly maxAttempts: number
+  readonly createdAt: number
+  readonly expiresAt: number | null
+}
+
+export class Job<TPayload = JsonValue> {
+  readonly id: number
+  readonly queue: string
+  readonly payload: TPayload
+  readonly state: 'processing'
+  readonly priority: number
+  readonly runAt: number
   readonly workerId: string
   readonly attempts: number
   readonly claimExpiresAt: number | null
+  readonly maxAttempts: number
+  readonly createdAt: number
+  readonly expiresAt: number | null
   ack(): boolean
   retry(delayS?: number, error?: string): boolean
   fail(error?: string): boolean
   heartbeat(extendS: number): boolean
 }
 
-export class ClaimWaker {
-  next(workerId: string, opts?: { signal?: AbortSignal }): Promise<Job | null>
+export class ClaimWaker<TPayload = JsonValue> {
+  next(workerId: string, opts?: { signal?: AbortSignal }): Promise<Job<TPayload> | null>
   close(): void
 }
 
@@ -159,18 +182,20 @@ export class Scheduler {
   run(owner: string, signal?: AbortSignal): Promise<void>
 }
 
-export class Queue {
+export class Queue<TPayload = JsonValue> {
   readonly name: string
   readonly visibilityTimeoutS: number
   readonly maxAttempts: number
-  enqueue(payload: JsonValue, opts?: EnqueueOptions): number
-  enqueueTx(tx: Transaction | any, payload: JsonValue, opts?: EnqueueOptions): number
-  claimBatch(workerId: string, n: number): Job[]
-  claimOne(workerId: string): Job | null
-  claim(workerId: string, opts?: { idlePollS?: number | null, signal?: AbortSignal }): AsyncIterableIterator<Job>
+  enqueue(payload: TPayload, opts?: EnqueueOptions): number
+  enqueueTx(tx: Transaction | any, payload: TPayload, opts?: EnqueueOptions): number
+  claimBatch(workerId: string, n: number): Job<TPayload>[]
+  claimOne(workerId: string): Job<TPayload> | null
+  claim(workerId: string, opts?: { idlePollS?: number | null, signal?: AbortSignal }): AsyncIterableIterator<Job<TPayload>>
   ackBatch(ids: number[], workerId: string): number
   sweepExpired(): number
-  claimWaker(opts?: { idlePollS?: number | null }): ClaimWaker
+  claimWaker(opts?: { idlePollS?: number | null }): ClaimWaker<TPayload>
+  cancel(jobId: number): boolean
+  getJob(jobId: number): JobSnapshot<TPayload> | null
 }
 
 export interface OutboxOptions {
@@ -179,13 +204,13 @@ export interface OutboxOptions {
   baseBackoffS?: number
 }
 
-export class Outbox {
+export class Outbox<TPayload = JsonValue> {
   readonly name: string
-  readonly queue: Queue
+  readonly queue: Queue<TPayload>
   readonly maxAttempts: number
   readonly baseBackoffS: number
-  enqueue(payload: JsonValue, opts?: EnqueueOptions): number
-  enqueueTx(tx: Transaction | any, payload: JsonValue, opts?: EnqueueOptions): number
+  enqueue(payload: TPayload, opts?: EnqueueOptions): number
+  enqueueTx(tx: Transaction | any, payload: TPayload, opts?: EnqueueOptions): number
   runWorker(workerId: string, opts?: { idlePollS?: number | null, signal?: AbortSignal }): Promise<void>
 }
 
@@ -198,8 +223,8 @@ export class Database {
   pruneNotifications(olderThanS?: number | null, maxKeep?: number | null): number
   notify(channel: string, payload: JsonValue): number
   notifyTx(tx: Transaction | any, channel: string, payload: JsonValue): number
-  queue(name: string, opts?: QueueOptions): Queue
-  outbox(name: string, delivery: (payload: JsonValue, job: Job) => any | Promise<any>, opts?: OutboxOptions): Outbox
+  queue<TPayload = JsonValue>(name: string, opts?: QueueOptions): Queue<TPayload>
+  outbox<TPayload = JsonValue>(name: string, delivery: (payload: TPayload, job: Job<TPayload>) => any | Promise<any>, opts?: OutboxOptions): Outbox<TPayload>
   stream(name: string): Stream
   listen(channel: string, opts?: { fallbackPollS?: number | null }): Listener
   scheduler(): Scheduler
