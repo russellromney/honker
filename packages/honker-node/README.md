@@ -90,13 +90,37 @@ same behavior. Existing connections refresh configuration within 100 ms; the
 connection that calls `configureQueueEvents()` sees it immediately:
 
 ```ts
-db.configureQueueEvents({ maxEvents: 10_000, includePayload: false });
+db.configureQueueEvents({ retentionTarget: 10_000, includePayload: false });
 
-const events = db.queueEvents({ queue: "emails", fromOffset: 0 });
+const events = db.queueEvents({ queue: "emails" });
 for await (const event of events) {
   console.log(event.offset, event.type, event.jobId);
 }
 ```
+
+`retentionTarget` is approximate: Honker trims the queue-event topic in bounded
+chunks so normal job transactions do not run a retention delete on every state
+change. Constructing `queueEvents()` without `fromOffset` starts at the oldest
+retained event. An explicit checkpoint that fell behind retention throws
+`QueueEventOffsetExpiredError` instead of silently skipping activity.
+
+For familiar live `EventEmitter` ergonomics, use a listener backed by the same
+durable, cross-process feed. It starts at the latest event unless configured
+otherwise:
+
+```ts
+const listener = db.queueEventListener({ queue: "emails" });
+listener.on("enqueued", event => console.log(event.jobId));
+listener.on("completed", event => console.log(event.jobId));
+listener.on("error", error => console.error(error));
+
+// Later:
+listener.close();
+```
+
+Queue events remain disabled until `configureQueueEvents()` is called; creating
+a listener while disabled throws an actionable `QueueEventsDisabledError`.
+`includePayload` is feed-wide, so enabling it stores payloads for every queue.
 
 Events are appended in the same SQLite transaction as successful queue state
 transitions. They are intended for dashboards, metrics, and debugging—not as a

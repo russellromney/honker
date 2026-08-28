@@ -43,6 +43,11 @@ export type QueueEventType =
   | 'dead_lettered'
   | 'cancelled'
 
+export type QueueEventReason =
+  | 'explicit_failure'
+  | 'attempts_exhausted'
+  | 'job_expired'
+
 export class QueueEvent<TPayload = JsonValue> {
   readonly version: 1
   readonly offset: number
@@ -53,6 +58,7 @@ export class QueueEvent<TPayload = JsonValue> {
   readonly attempts: number
   readonly workerId: string | null
   readonly runAt: number | null
+  readonly reason: QueueEventReason | null
   readonly error: string | null
   readonly payload?: TPayload
 }
@@ -66,8 +72,24 @@ export interface QueueEventsOptions {
 
 export interface QueueEventsConfig {
   enabled?: boolean
-  maxEvents?: number
+  retentionTarget?: number
   includePayload?: boolean
+}
+
+export interface QueueEventListenerOptions extends Omit<QueueEventsOptions, 'fromOffset'> {
+  fromOffset?: number
+  startAt?: 'latest' | 'oldest'
+}
+
+export class QueueEventOffsetExpiredError extends Error {
+  readonly code: 'HONKER_QUEUE_EVENT_OFFSET_EXPIRED'
+  readonly requestedOffset: number
+  readonly trimmedThroughOffset: number
+  readonly oldestAvailableOffset: number | null
+}
+
+export class QueueEventsDisabledError extends Error {
+  readonly code: 'HONKER_QUEUE_EVENTS_DISABLED'
 }
 
 export class CheckpointMigrationError extends Error {
@@ -195,6 +217,23 @@ export class QueueEvents<TPayload = JsonValue>
   close(): void
 }
 
+export class QueueEventListener<TPayload = JsonValue> {
+  readonly lastOffset: number
+  on(type: QueueEventType, listener: (event: QueueEvent<TPayload>) => void): this
+  on(type: 'event', listener: (event: QueueEvent<TPayload>) => void): this
+  on(type: 'error', listener: (error: Error) => void): this
+  on(type: 'close', listener: () => void): this
+  once(type: QueueEventType, listener: (event: QueueEvent<TPayload>) => void): this
+  once(type: 'event', listener: (event: QueueEvent<TPayload>) => void): this
+  once(type: 'error', listener: (error: Error) => void): this
+  once(type: 'close', listener: () => void): this
+  off(type: QueueEventType, listener: (event: QueueEvent<TPayload>) => void): this
+  off(type: 'event', listener: (event: QueueEvent<TPayload>) => void): this
+  off(type: 'error', listener: (error: Error) => void): this
+  off(type: 'close', listener: () => void): this
+  close(): void
+}
+
 export class Stream {
   publish(payload: JsonValue): number
   publishWithKey(key: string, payload: JsonValue): number
@@ -271,6 +310,7 @@ export class Database {
   notifyTx(tx: Transaction | any, channel: string, payload: JsonValue): number
   configureQueueEvents(opts?: QueueEventsConfig): boolean
   queueEvents<TPayload = JsonValue>(opts?: QueueEventsOptions): QueueEvents<TPayload>
+  queueEventListener<TPayload = JsonValue>(opts?: QueueEventListenerOptions): QueueEventListener<TPayload>
   queue<TPayload = JsonValue>(name: string, opts?: QueueOptions): Queue<TPayload>
   outbox<TPayload = JsonValue>(name: string, delivery: (payload: TPayload, job: Job<TPayload>) => any | Promise<any>, opts?: OutboxOptions): Outbox<TPayload>
   stream(name: string): Stream

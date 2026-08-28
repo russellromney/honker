@@ -1,4 +1,4 @@
-import { open, type Job, type JobSnapshot } from '../..'
+import { open, type Job, type JobSnapshot, type QueueEventReason } from '../..'
 
 interface EmailPayload {
   recipient: string
@@ -43,8 +43,16 @@ outbox.enqueue({
   variables: {},
 })
 
-db.configureQueueEvents({ maxEvents: 10_000, includePayload: true })
+db.configureQueueEvents({ retentionTarget: 10_000, includePayload: true })
 const queueEvents = db.queueEvents<EmailPayload>({ queue: 'emails', fromOffset: 0 })
+const queueEventListener = db.queueEventListener<EmailPayload>({
+  queue: 'emails',
+  startAt: 'latest',
+})
+queueEventListener.on('enqueued', (event) => {
+  event.payload?.recipient.toUpperCase()
+  event.reason satisfies QueueEventReason | null
+})
 const retained = queueEvents.readSince(0)
 for (const event of retained) {
   event.type satisfies
@@ -64,4 +72,5 @@ queue.enqueue({ template: 'welcome', variables: {} })
 waker.close()
 void queueEvents.return()
 queueEvents.close()
+queueEventListener.close()
 db.close()

@@ -20,6 +20,27 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — transactional Node queue lifecycle events
+
+- New opt-in, Rust-core queue lifecycle feed for `enqueued`, `claimed`,
+  `completed`, `retry_scheduled`, `dead_lettered`, and `cancelled` transitions.
+  Events commit atomically with the queue mutation and are observable across
+  processes through the Node async iterator or EventEmitter-style listener.
+- `configureQueueEvents({ retentionTarget, includePayload })` persists one
+  feed-wide policy. `retentionTarget` is approximate because topic-specific
+  cleanup runs in bounded chunks rather than adding a delete to every job
+  transaction; `includePayload` applies to every queue and defaults to false.
+- Explicit replay checkpoints that predate retained history now throw
+  `QueueEventOffsetExpiredError`. Omitting `fromOffset` starts at the oldest
+  retained event, while `queueEventListener()` defaults to live events at the
+  latest offset and errors clearly when the feed is disabled.
+- Terminal events include a stable `reason` (`explicit_failure`,
+  `attempts_exhausted`, or `job_expired`) separately from human-readable error
+  text. The internal queue-event topic rejects public stream publications.
+- Queue-event configuration is cached per connection for 100 ms. Disabled
+  mutations retain their lean SQL paths, batch transitions configure and trim
+  once, and a steady-state performance floor guards against per-event cleanup.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry

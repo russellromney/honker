@@ -55,6 +55,7 @@ function wrapDatabase(db, tracked) {
   wrapMethod(db, 'updateEvents', (resource) => trackCloseable(tracked, resource));
   wrapMethod(db, 'listen', (resource) => trackCloseable(tracked, resource));
   wrapMethod(db, 'queueEvents', (resource) => trackCloseable(tracked, resource));
+  wrapMethod(db, 'queueEventListener', (resource) => trackCloseable(tracked, resource));
   wrapMethod(db, 'stream', (stream) => {
     wrapMethod(stream, 'subscribe', (resource) => trackCloseable(tracked, resource));
     return stream;

@@ -24,7 +24,7 @@ test('queue events are opt-in and follow successful committed transitions', asyn
     feed.close();
 
     assert.equal(
-      db.configureQueueEvents({ maxEvents: 100, includePayload: true }),
+      db.configureQueueEvents({ retentionTarget: 100, includePayload: true }),
       true,
     );
     feed = db.queueEvents({ fromOffset: 0 });
@@ -61,7 +61,7 @@ test('queue events cover retry, completion, cancellation, filtering, and retenti
   let alphaFeed;
   try {
     db = open(path);
-    db.configureQueueEvents({ maxEvents: 100, includePayload: false });
+    db.configureQueueEvents({ retentionTarget: 100, includePayload: false });
 
     const queue = db.queue('jobs', { maxAttempts: 3 });
     const id = queue.enqueue({ secret: 'not retained' });
@@ -93,39 +93,125 @@ test('queue events cover retry, completion, cancellation, filtering, and retenti
       .filter((event) => event.jobId === failed)
       .at(-1);
     assert.equal(failedEvent.type, 'dead_lettered');
+    assert.equal(failedEvent.reason, 'explicit_failure');
     assert.equal(failedEvent.error, 'permanent');
     assert.equal(failedEvent.workerId, 'worker-fail');
     assert.equal(failedEvent.attempts, 1);
     assert.ok(lifecycle.every((event) => event.payload === undefined));
 
-    db.configureQueueEvents({ maxEvents: 3, includePayload: true });
+    db.configureQueueEvents({ retentionTarget: 3, includePayload: true });
     const alpha = db.queue('alpha');
     const beta = db.queue('beta');
     alpha.enqueue({ sequence: 1 });
+    db.stream('app').publish({ unrelated: 1 });
     beta.enqueue({ sequence: 2 });
+    db.stream('app').publish({ unrelated: 2 });
     alpha.enqueue({ sequence: 3 });
+    db.stream('app').publish({ unrelated: 3 });
     beta.enqueue({ sequence: 4 });
+    db.stream('app').publish({ unrelated: 4 });
     alpha.enqueue({ sequence: 5 });
 
     globalFeed.close();
-    globalFeed = db.queueEvents({ fromOffset: 0 });
-    const retained = globalFeed.readSince(0, 100);
+    globalFeed = db.queueEvents();
+    const retained = globalFeed.readSince(globalFeed.lastOffset, 100);
     assert.equal(retained.length, 3);
     assert.deepEqual(retained.map((event) => event.payload.sequence), [3, 4, 5]);
 
-    alphaFeed = db.queueEvents({ queue: 'alpha', fromOffset: 0 });
+    const staleFeed = db.queueEvents({ fromOffset: 0 });
+    assert.throws(
+      () => staleFeed.readSince(0, 100),
+      (error) => {
+        assert.ok(error instanceof honker.QueueEventOffsetExpiredError);
+        assert.equal(error.code, 'HONKER_QUEUE_EVENT_OFFSET_EXPIRED');
+        assert.equal(error.requestedOffset, 0);
+        assert.ok(error.trimmedThroughOffset > 0);
+        assert.equal(error.oldestAvailableOffset, retained[0].offset);
+        return true;
+      },
+    );
+    staleFeed.close();
+
+    alphaFeed = db.queueEvents({ queue: 'alpha' });
     assert.deepEqual(
-      alphaFeed.readSince(0, 100).map((event) => event.payload.sequence),
+      alphaFeed.readSince(alphaFeed.lastOffset, 100).map((event) => event.payload.sequence),
       [3, 5],
     );
 
     const finalOffset = retained.at(-1).offset;
-    db.configureQueueEvents({ enabled: false, maxEvents: 3 });
+    db.configureQueueEvents({ enabled: false, retentionTarget: 3 });
     alpha.enqueue({ sequence: 6 });
     assert.deepEqual(globalFeed.readSince(finalOffset, 100), []);
   } finally {
     try { alphaFeed?.close(); } catch {}
     try { globalFeed?.close(); } catch {}
+    cleanup();
+  }
+});
+
+test('queue event listener provides live EventEmitter ergonomics over the durable feed', async () => {
+  const { path, open, cleanup } = tmpdb();
+  let db;
+  let listener;
+  let replayListener;
+  let gapListener;
+  try {
+    db = open(path);
+    assert.throws(
+      () => db.queueEventListener(),
+      (error) => error instanceof honker.QueueEventsDisabledError &&
+        error.code === 'HONKER_QUEUE_EVENTS_DISABLED',
+    );
+
+    db.configureQueueEvents({ includePayload: true });
+    db.queue('listener').enqueue({ sequence: 1 });
+    assert.throws(
+      () => db.queueEventListener({ startAt: 'middle' }),
+      /startAt must be 'latest' or 'oldest'/,
+    );
+    assert.throws(
+      () => db.queueEventListener({ fromOffset: 0, startAt: 'oldest' }),
+      /Specify either fromOffset or startAt/,
+    );
+
+    listener = db.queueEventListener({ queue: 'listener' });
+    const allLiveEvents = [];
+    listener.on('event', (item) => allLiveEvents.push(item));
+    const live = new Promise((resolve, reject) => {
+      listener.once('enqueued', resolve);
+      listener.once('error', reject);
+    });
+    const liveId = db.queue('listener').enqueue({ sequence: 2 });
+    const event = await live;
+    assert.equal(event.jobId, liveId);
+    assert.equal(event.payload.sequence, 2);
+    assert.deepEqual(allLiveEvents, [event]);
+
+    replayListener = db.queueEventListener({ queue: 'listener', startAt: 'oldest' });
+    const replayed = new Promise((resolve, reject) => {
+      replayListener.once('enqueued', resolve);
+      replayListener.once('error', reject);
+    });
+    assert.equal((await replayed).payload.sequence, 1);
+
+    let closeCount = 0;
+    listener.on('close', () => closeCount++);
+    listener.close();
+    listener.close();
+    assert.equal(closeCount, 1);
+    replayListener.close();
+    db.configureQueueEvents({ retentionTarget: 1, includePayload: false });
+    db.queue('listener-gap').enqueue({ sequence: 3 });
+    db.queue('listener-gap').enqueue({ sequence: 4 });
+    gapListener = db.queueEventListener({ fromOffset: 0 });
+    const gap = new Promise((resolve) => gapListener.once('error', resolve));
+    const gapError = await gap;
+    assert.ok(gapError instanceof honker.QueueEventOffsetExpiredError);
+    assert.equal(gapError.requestedOffset, 0);
+  } finally {
+    try { gapListener?.close(); } catch {}
+    try { replayListener?.close(); } catch {}
+    try { listener?.close(); } catch {}
     cleanup();
   }
 });

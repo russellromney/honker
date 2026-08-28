@@ -1,5 +1,6 @@
 'use strict';
 
+const { EventEmitter } = require('node:events');
 const { setTimeout: delay } = require('node:timers/promises');
 
 function scalar(rows) {
@@ -99,6 +100,31 @@ class CheckpointMigrationError extends Error {
     this.stream = stream;
     this.consumer = consumer;
     this.offset = offset;
+  }
+}
+
+class QueueEventOffsetExpiredError extends Error {
+  constructor(requestedOffset, trimmedThroughOffset, oldestAvailableOffset) {
+    super(
+      `Queue-event offset ${requestedOffset} is no longer retained; ` +
+        `events through offset ${trimmedThroughOffset} were trimmed. ` +
+        `Start without fromOffset to consume from the oldest retained event.`,
+    );
+    this.name = 'QueueEventOffsetExpiredError';
+    this.code = 'HONKER_QUEUE_EVENT_OFFSET_EXPIRED';
+    this.requestedOffset = requestedOffset;
+    this.trimmedThroughOffset = trimmedThroughOffset;
+    this.oldestAvailableOffset = oldestAvailableOffset;
+  }
+}
+
+class QueueEventsDisabledError extends Error {
+  constructor() {
+    super(
+      'Queue events are disabled; call configureQueueEvents({ enabled: true }) first.',
+    );
+    this.name = 'QueueEventsDisabledError';
+    this.code = 'HONKER_QUEUE_EVENTS_DISABLED';
   }
 }
 
@@ -777,6 +803,7 @@ class QueueEvent {
     this.attempts = row.attempts;
     this.workerId = row.worker_id ?? null;
     this.runAt = row.run_at ?? null;
+    this.reason = row.reason ?? null;
     this.error = row.error ?? null;
     if (Object.prototype.hasOwnProperty.call(row, 'payload')) {
       this.payload = row.payload;
@@ -785,10 +812,12 @@ class QueueEvent {
 }
 
 class QueueEvents {
-  constructor(
-    db,
-    { queue = null, fromOffset = 0, fallbackPollS = 1, signal = null } = {},
-  ) {
+  constructor(db, opts = {}) {
+    const {
+      queue = null,
+      fallbackPollS = 1,
+      signal = null,
+    } = opts;
     this._db = db;
     this.queue = queue;
     this._fallbackPollMs =
@@ -797,9 +826,18 @@ class QueueEvents {
     // Subscribe before the first read so a commit cannot land in the
     // snapshot/listen gap and leave this iterator parked until fallback.
     this._updates = db.updateEvents();
+    let status;
+    try {
+      status = db._queueEventsStatus();
+    } catch (error) {
+      this._updates.close();
+      throw error;
+    }
     this._closed = false;
     this._pending = [];
-    this._lastSeen = fromOffset;
+    this._lastSeen = Object.prototype.hasOwnProperty.call(opts, 'fromOffset')
+      ? opts.fromOffset
+      : status.trimmedThroughOffset;
   }
 
   [Symbol.asyncIterator]() {
@@ -811,10 +849,23 @@ class QueueEvents {
   }
 
   readSince(offset, limit = 256) {
-    const rowsJson = this._db._callScalar(
-      'SELECT honker_queue_events_read_since(?, ?, ?)',
-      [offset, this.queue, limit],
-    );
+    let rowsJson;
+    try {
+      rowsJson = this._db._callScalar(
+        'SELECT honker_queue_events_read_since(?, ?, ?)',
+        [offset, this.queue, limit],
+      );
+    } catch (error) {
+      if (!String(error?.message).includes('HONKER_QUEUE_EVENT_OFFSET_EXPIRED')) {
+        throw error;
+      }
+      const status = this._db._queueEventsStatus();
+      throw new QueueEventOffsetExpiredError(
+        offset,
+        status.trimmedThroughOffset,
+        status.oldestOffset,
+      );
+    }
     return JSON.parse(rowsJson || '[]').map((row) => new QueueEvent(row));
   }
 
@@ -854,6 +905,55 @@ class QueueEvents {
     if (this._closed) return;
     this._closed = true;
     this._updates.close();
+  }
+}
+
+class QueueEventListener extends EventEmitter {
+  constructor(db, opts = {}) {
+    super();
+    const status = db._queueEventsStatus();
+    if (!status.enabled) throw new QueueEventsDisabledError();
+    if (
+      Object.prototype.hasOwnProperty.call(opts, 'fromOffset') &&
+      Object.prototype.hasOwnProperty.call(opts, 'startAt')
+    ) {
+      throw new TypeError('Specify either fromOffset or startAt, not both');
+    }
+    const { startAt = 'latest', ...feedOpts } = opts;
+    if (!Object.prototype.hasOwnProperty.call(opts, 'fromOffset')) {
+      if (startAt === 'latest') {
+        feedOpts.fromOffset = status.latestOffset ?? status.trimmedThroughOffset;
+      } else if (startAt !== 'oldest') {
+        throw new TypeError("startAt must be 'latest' or 'oldest'");
+      }
+    }
+    this._feed = new QueueEvents(db, feedOpts);
+    this._closed = false;
+    queueMicrotask(() => this._pump());
+  }
+
+  get lastOffset() {
+    return this._feed.lastOffset;
+  }
+
+  async _pump() {
+    try {
+      for await (const event of this._feed) {
+        this.emit(event.type, event);
+        this.emit('event', event);
+      }
+    } catch (error) {
+      if (!this._closed) this.emit('error', error);
+    } finally {
+      this.close();
+    }
+  }
+
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._feed.close();
+    this.emit('close');
   }
 }
 
@@ -1081,18 +1181,35 @@ class Database {
     return unwrapTx(tx).notify(channel, payload);
   }
 
-  configureQueueEvents({ enabled = true, maxEvents = 10_000, includePayload = false } = {}) {
+  configureQueueEvents({ enabled = true, retentionTarget = 10_000, includePayload = false } = {}) {
     return (
       this._callScalar('SELECT honker_queue_events_configure(?, ?, ?)', [
         enabled ? 1 : 0,
-        maxEvents,
+        retentionTarget,
         includePayload ? 1 : 0,
       ]) === 1
     );
   }
 
+  _queueEventsStatus() {
+    const raw = this._callScalar('SELECT honker_queue_events_status()');
+    const row = JSON.parse(raw || '{}');
+    return {
+      enabled: Boolean(row.enabled),
+      retentionTarget: row.retention_target ?? 10_000,
+      includePayload: Boolean(row.include_payload),
+      trimmedThroughOffset: row.trimmed_through_offset ?? 0,
+      oldestOffset: row.oldest_offset ?? null,
+      latestOffset: row.latest_offset ?? null,
+    };
+  }
+
   queueEvents(opts = {}) {
     return new QueueEvents(this, opts);
+  }
+
+  queueEventListener(opts = {}) {
+    return new QueueEventListener(this, opts);
   }
 
   queue(name, opts = {}) {
@@ -1182,6 +1299,9 @@ module.exports = function buildApi(nativeBinding) {
     StreamSubscription,
     QueueEvent,
     QueueEvents,
+    QueueEventListener,
+    QueueEventOffsetExpiredError,
+    QueueEventsDisabledError,
     CheckpointMigrationError,
     Listener,
     Scheduler,
