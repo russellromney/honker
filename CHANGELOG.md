@@ -20,6 +20,19 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — typed Node jobs
+
+- Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
+  a payload generic that defaults to `JsonValue`, preserving existing callers
+  while allowing application-specific payload contracts.
+- `Queue.getJob()` and `Queue.cancel()` are included in the public TypeScript
+  declarations. Claimed jobs and job snapshots expose state, priority,
+  scheduling, attempt, worker, creation, claim-expiry, and job-expiry details.
+- The Rust claim ABI now returns the complete live-job snapshot, so claimed
+  jobs provide the same operational details as `getJob()`.
+- **Behavior change:** Node `getJob()` now returns the documented camelCase
+  `JobSnapshot` shape instead of exposing the SQL ABI's raw snake_case row.
+
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
 - Node stream checkpoint calls now use the shared SQL ABI's canonical
