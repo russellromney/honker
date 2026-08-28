@@ -652,6 +652,74 @@ def test_extension_enqueue_returns_id_without_wake_row(ext_db_path):
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_queue_events_are_transactional_bounded_and_gap_aware(ext_db_path):
+    """Exercise queue events entirely through the shipped loadable extension.
+
+    This covers the user-facing SQL ABI, transaction rollback, unrelated stream
+    traffic, topic-specific retention, payloads, stale checkpoints, and the
+    reserved-topic guard without relying on either language binding.
+    """
+    conn = _open_ext(ext_db_path)
+    assert conn.execute(
+        "SELECT honker_queue_events_configure(1, 3, 1)"
+    ).fetchone()[0] == 1
+    conn.commit()
+
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "SELECT honker_enqueue('events', '{\"sequence\":0}', NULL, NULL, 0, 3, NULL)"
+    )
+    conn.rollback()
+    assert (
+        json.loads(
+            conn.execute(
+                "SELECT honker_queue_events_read_since(0, NULL, 100)"
+            ).fetchone()[0]
+        )
+        == []
+    )
+
+    for sequence in range(1, 6):
+        conn.execute(
+            "SELECT honker_enqueue('events', ?, NULL, NULL, 0, 3, NULL)",
+            [json.dumps({"sequence": sequence})],
+        )
+        conn.execute(
+            "SELECT honker_stream_publish('application', NULL, ?)",
+            [json.dumps({"sequence": sequence})],
+        )
+        conn.commit()
+
+    status = json.loads(
+        conn.execute("SELECT honker_queue_events_status()").fetchone()[0]
+    )
+    assert status["trimmed_through_offset"] > 0
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute(
+            "SELECT honker_queue_events_read_since(0, NULL, 100)"
+        ).fetchone()
+
+    retained = json.loads(
+        conn.execute(
+            "SELECT honker_queue_events_read_since(?, NULL, 100)",
+            [status["trimmed_through_offset"]],
+        ).fetchone()[0]
+    )
+    assert [event["type"] for event in retained] == ["enqueued"] * 3
+    assert [event["payload"]["sequence"] for event in retained] == [3, 4, 5]
+    assert all(event["queue"] == "events" for event in retained)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM _honker_stream WHERE topic = 'application'"
+    ).fetchone()[0] == 5
+
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute(
+            "SELECT honker_stream_publish('_honker:queue-events:v1', NULL, '{}')"
+        ).fetchone()
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 def test_extension_enqueue_delay_overrides_run_at(ext_db_path):
     """Delay wins over run_at per the documented precedence."""
     conn = _open_ext(ext_db_path)

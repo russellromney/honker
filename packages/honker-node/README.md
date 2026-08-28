@@ -100,8 +100,10 @@ for await (const event of events) {
 
 `retentionTarget` is approximate: Honker trims the queue-event topic in bounded
 chunks so normal job transactions do not run a retention delete on every state
-change. Constructing `queueEvents()` without `fromOffset` starts at the oldest
-retained event. An explicit checkpoint that fell behind retention throws
+change. Trim scheduling is stored in SQLite, so the bound also holds across
+short-lived connections and multiple worker processes. Constructing
+`queueEvents()` without `fromOffset` starts at the oldest retained event. An
+explicit checkpoint that fell behind retention throws
 `QueueEventOffsetExpiredError` instead of silently skipping activity.
 
 For familiar live `EventEmitter` ergonomics, use a listener backed by the same

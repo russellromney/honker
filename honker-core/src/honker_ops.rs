@@ -51,7 +51,6 @@ struct QueueEventConfigCache {
     encoded: AtomicU64,
     expires_at_ms: AtomicU64,
     bypass_until_autocommit: AtomicBool,
-    events_since_trim: AtomicU64,
 }
 
 impl Default for QueueEventConfigCache {
@@ -60,7 +59,6 @@ impl Default for QueueEventConfigCache {
             encoded: AtomicU64::new(0),
             expires_at_ms: AtomicU64::new(0),
             bypass_until_autocommit: AtomicBool::new(false),
-            events_since_trim: AtomicU64::new(0),
         }
     }
 }
@@ -71,7 +69,6 @@ struct QueueEventEmitter<'a> {
     occurred_at: i64,
     last_offset: Option<i64>,
     emitted_events: u64,
-    cache: Option<&'a QueueEventConfigCache>,
 }
 
 /// Read an integer argument, accepting the REAL that dynamically typed
@@ -2142,14 +2139,23 @@ pub fn queue_events_configure(
     }
     conn.execute(
         "INSERT INTO _honker_queue_event_config
-           (singleton, enabled, retention_target, include_payload)
-         VALUES (1, ?1, ?2, ?3)
+           (singleton, enabled, retention_target, include_payload, events_since_trim)
+         VALUES (1, ?1, ?2, ?3, 0)
          ON CONFLICT(singleton) DO UPDATE SET
            enabled = excluded.enabled,
            retention_target = excluded.retention_target,
-           include_payload = excluded.include_payload",
+           include_payload = excluded.include_payload,
+           events_since_trim = 0",
         rusqlite::params![enabled as i64, retention_target, include_payload as i64],
     )?;
+    if let Some(trim_through) = trim_queue_events(conn, retention_target)? {
+        conn.execute(
+            "UPDATE _honker_queue_event_config
+             SET trimmed_through_offset = MAX(trimmed_through_offset, ?1)
+             WHERE singleton = 1",
+            [trim_through],
+        )?;
+    }
     Ok(1)
 }
 
@@ -2279,20 +2285,6 @@ impl QueueEventConfigCache {
     fn invalidate(&self) {
         self.expires_at_ms.store(0, Ordering::Release);
         self.encoded.store(0, Ordering::Relaxed);
-        self.events_since_trim.store(0, Ordering::Relaxed);
-    }
-
-    fn should_trim(&self, emitted_events: u64, interval: u64) -> bool {
-        let previous = self
-            .events_since_trim
-            .fetch_add(emitted_events, Ordering::Relaxed);
-        let total = previous.saturating_add(emitted_events);
-        if total < interval {
-            return false;
-        }
-        self.events_since_trim
-            .store(total % interval, Ordering::Relaxed);
-        true
     }
 }
 
@@ -2347,7 +2339,6 @@ fn queue_event_emitter<'a>(
         occurred_at: now_unix(conn)?,
         last_offset: None,
         emitted_events: 0,
-        cache,
     }))
 }
 
@@ -2400,47 +2391,71 @@ impl QueueEventEmitter<'_> {
             return Ok(());
         }
 
-        let interval = queue_event_trim_interval(self.config.retention_target);
-        if let Some(cache) = self.cache
-            && !cache.should_trim(self.emitted_events, interval)
-        {
+        // Count emissions in the database, not in a connection-local cache.
+        // Queue writers commonly open short-lived connections and may run in
+        // several processes; the singleton row makes trim scheduling global,
+        // serialized with the queue mutation, and rollback-safe. Batch
+        // mutations still update the counter only once.
+        let (events_since_trim, retention_target): (i64, i64) = self.conn.query_row(
+            "UPDATE _honker_queue_event_config
+             SET events_since_trim = events_since_trim + ?1
+             WHERE singleton = 1
+             RETURNING events_since_trim, retention_target",
+            [self.emitted_events as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let interval = queue_event_trim_interval(retention_target) as i64;
+        if events_since_trim < interval {
             return Ok(());
         }
 
-        // Find the (retention_target + 1)-th newest queue event, then delete it and
-        // everything older on this topic. Generic stream traffic uses the
-        // same global offset sequence but must never consume queue-event
-        // retention. Batch callers still trim once after their final event.
-        let trim_through = {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT offset FROM _honker_stream
-                 WHERE topic = ?1
-                 ORDER BY offset DESC
-                 LIMIT 1 OFFSET ?2",
-            )?;
-            match stmt.query_row(
-                rusqlite::params![QUEUE_EVENTS_TOPIC, self.config.retention_target],
-                |row| row.get::<_, i64>(0),
-            ) {
-                Ok(offset) => Some(offset),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(error) => return Err(error),
-            }
-        };
+        let trim_through = trim_queue_events(self.conn, retention_target)?;
         if let Some(trim_through) = trim_through {
-            let mut delete = self
-                .conn
-                .prepare_cached("DELETE FROM _honker_stream WHERE topic = ?1 AND offset <= ?2")?;
-            delete.execute(rusqlite::params![QUEUE_EVENTS_TOPIC, trim_through])?;
             self.conn.execute(
                 "UPDATE _honker_queue_event_config
-                 SET trimmed_through_offset = MAX(trimmed_through_offset, ?1)
+                 SET events_since_trim = events_since_trim % ?1,
+                     trimmed_through_offset = MAX(trimmed_through_offset, ?2)
                  WHERE singleton = 1",
-                [trim_through],
+                rusqlite::params![interval, trim_through],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE _honker_queue_event_config
+                 SET events_since_trim = events_since_trim % ?1
+                 WHERE singleton = 1",
+                [interval],
             )?;
         }
         Ok(())
     }
+}
+
+/// Delete queue events beyond the configured target and return the newest
+/// deleted offset. Offsets are global to all stream topics, so both the
+/// threshold lookup and deletion must explicitly select the reserved topic.
+fn trim_queue_events(conn: &Connection, retention_target: i64) -> rusqlite::Result<Option<i64>> {
+    let trim_through = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT offset FROM _honker_stream
+             WHERE topic = ?1
+             ORDER BY offset DESC
+             LIMIT 1 OFFSET ?2",
+        )?;
+        match stmt.query_row(
+            rusqlite::params![QUEUE_EVENTS_TOPIC, retention_target],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(offset) => Some(offset),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error),
+        }
+    };
+    if let Some(trim_through) = trim_through {
+        let mut delete =
+            conn.prepare_cached("DELETE FROM _honker_stream WHERE topic = ?1 AND offset <= ?2")?;
+        delete.execute(rusqlite::params![QUEUE_EVENTS_TOPIC, trim_through])?;
+    }
+    Ok(trim_through)
 }
 
 pub fn queue_events_read_since(
@@ -3196,6 +3211,110 @@ mod queue_event_tests {
             )
             .unwrap();
         assert_eq!(after_trim, 100);
+        assert!(status["trimmed_through_offset"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn retention_accounting_survives_connection_churn() {
+        let uri = format!(
+            "file:honker-queue-event-retention-{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI;
+        let keeper = Connection::open_with_flags(&uri, flags).unwrap();
+        attach_honker_functions(&keeper).unwrap();
+        bootstrap_honker_schema(&keeper).unwrap();
+        keeper
+            .query_row("SELECT honker_queue_events_configure(1, 20, 0)", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        // Model request-scoped and multi-process clients: every mutation gets
+        // a fresh SQLite connection and therefore a fresh config cache.
+        for _ in 0..45 {
+            let writer = Connection::open_with_flags(&uri, flags).unwrap();
+            attach_honker_functions(&writer).unwrap();
+            sql_enqueue(&writer, "short-lived-writers");
+        }
+
+        let retained: i64 = keeper
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_stream WHERE topic = ?1",
+                [QUEUE_EVENTS_TOPIC],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (events_since_trim, trimmed_through): (i64, i64) = keeper
+            .query_row(
+                "SELECT events_since_trim, trimmed_through_offset
+                 FROM _honker_queue_event_config WHERE singleton = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, 21);
+        assert_eq!(events_since_trim, 1);
+        assert!(trimmed_through > 0);
+        assert!(queue_events_read_since(&keeper, 0, None, 100).is_err());
+    }
+
+    #[test]
+    fn retention_counter_is_transactional() {
+        let conn = db();
+        queue_events_configure(&conn, true, 100, false).unwrap();
+
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        sql_enqueue(&conn, "rolled-back-counter");
+        assert_eq!(
+            conn.query_row(
+                "SELECT events_since_trim FROM _honker_queue_event_config",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT events_since_trim FROM _honker_queue_event_config",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn lowering_retention_trims_existing_events_immediately() {
+        let conn = db();
+        queue_events_configure(&conn, true, 100, false).unwrap();
+        for _ in 0..5 {
+            enqueue(&conn, "reconfigured", "{}", None, None, 0, 3, None).unwrap();
+        }
+
+        queue_events_configure(&conn, true, 3, false).unwrap();
+        let status = event_status(&conn);
+        let retained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_stream WHERE topic = ?1",
+                [QUEUE_EVENTS_TOPIC],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let events_since_trim: i64 = conn
+            .query_row(
+                "SELECT events_since_trim FROM _honker_queue_event_config",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 3);
+        assert_eq!(events_since_trim, 0);
         assert!(status["trimmed_through_offset"].as_i64().unwrap() > 0);
     }
 }

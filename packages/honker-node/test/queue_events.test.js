@@ -149,6 +149,43 @@ test('queue events cover retry, completion, cancellation, filtering, and retenti
   }
 });
 
+test('queue event retention remains bounded across short-lived connections', () => {
+  const { path, open, cleanup } = tmpdb();
+  let reader;
+  let feed;
+  try {
+    const configured = open(path);
+    configured.configureQueueEvents({ retentionTarget: 20 });
+    configured.close();
+
+    // Model request-scoped clients and separate worker processes. Each enqueue
+    // uses a fresh native database handle and a fresh Rust config cache.
+    for (let sequence = 0; sequence < 45; sequence++) {
+      const writer = open(path);
+      writer.queue('short-lived-writers').enqueue({ sequence });
+      writer.close();
+    }
+
+    reader = open(path);
+    feed = reader.queueEvents();
+    assert.ok(feed.lastOffset > 0);
+    const retained = feed.readSince(feed.lastOffset, 100);
+    assert.equal(retained.length, 21);
+    assert.deepEqual(
+      retained.map((event) => event.jobId),
+      [...retained.map((event) => event.jobId)].sort((a, b) => a - b),
+    );
+    assert.throws(
+      () => feed.readSince(0, 100),
+      (error) => error instanceof honker.QueueEventOffsetExpiredError &&
+        error.trimmedThroughOffset === feed.lastOffset,
+    );
+  } finally {
+    try { feed?.close(); } catch {}
+    cleanup();
+  }
+});
+
 test('queue event listener provides live EventEmitter ergonomics over the durable feed', async () => {
   const { path, open, cleanup } = tmpdb();
   let db;

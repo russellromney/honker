@@ -29,7 +29,9 @@
 - `configureQueueEvents({ retentionTarget, includePayload })` persists one
   feed-wide policy. `retentionTarget` is approximate because topic-specific
   cleanup runs in bounded chunks rather than adding a delete to every job
-  transaction; `includePayload` applies to every queue and defaults to false.
+  transaction; its scheduling is coordinated in SQLite across short-lived
+  connections and processes. `includePayload` applies to every queue and
+  defaults to false.
 - Explicit replay checkpoints that predate retained history now throw
   `QueueEventOffsetExpiredError`. Omitting `fromOffset` starts at the oldest
   retained event, while `queueEventListener()` defaults to live events at the

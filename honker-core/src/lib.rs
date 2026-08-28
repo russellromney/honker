@@ -434,7 +434,9 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       retention_target INTEGER NOT NULL CHECK (retention_target > 0),
       include_payload INTEGER NOT NULL CHECK (include_payload IN (0, 1)),
       trimmed_through_offset INTEGER NOT NULL DEFAULT 0
-        CHECK (trimmed_through_offset >= 0)
+        CHECK (trimmed_through_offset >= 0),
+      events_since_trim INTEGER NOT NULL DEFAULT 0
+        CHECK (events_since_trim >= 0)
     );
 ";
 
@@ -531,6 +533,28 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
             "ALTER TABLE _honker_queue_event_config \
              ADD COLUMN trimmed_through_offset INTEGER NOT NULL DEFAULT 0 \
              CHECK (trimmed_through_offset >= 0)",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Migration: retention scheduling must survive short-lived connections
+    // and coordinate across processes. Earlier drafts kept this counter in a
+    // per-connection cache, which could prevent trimming indefinitely.
+    let has_queue_event_trim_counter: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM pragma_table_info('_honker_queue_event_config') \
+             WHERE name='events_since_trim'",
+        )?;
+        stmt.query_row([], |_| Ok(true)).unwrap_or(false)
+    };
+    if !has_queue_event_trim_counter {
+        match conn.execute(
+            "ALTER TABLE _honker_queue_event_config \
+             ADD COLUMN events_since_trim INTEGER NOT NULL DEFAULT 0 \
+             CHECK (events_since_trim >= 0)",
             [],
         ) {
             Ok(_) => {}
@@ -2361,7 +2385,7 @@ while True:
     }
 
     #[test]
-    fn bootstrap_draft_queue_event_config_gets_trim_watermark() {
+    fn bootstrap_draft_queue_event_config_gets_current_columns() {
         let conn = mem();
         conn.execute_batch(
             "CREATE TABLE _honker_queue_event_config (
@@ -2377,15 +2401,16 @@ while True:
         .unwrap();
 
         bootstrap_honker_schema(&conn).unwrap();
-        let row: (i64, i64, i64) = conn
+        let row: (i64, i64, i64, i64) = conn
             .query_row(
-                "SELECT retention_target, include_payload, trimmed_through_offset
+                "SELECT retention_target, include_payload, trimmed_through_offset,
+                        events_since_trim
                  FROM _honker_queue_event_config WHERE singleton = 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(row, (321, 1, 0));
+        assert_eq!(row, (321, 1, 0, 0));
         bootstrap_honker_schema(&conn).unwrap();
     }
 
@@ -2525,7 +2550,8 @@ while True:
                 "enabled",
                 "retention_target",
                 "include_payload",
-                "trimmed_through_offset"
+                "trimmed_through_offset",
+                "events_since_trim"
             ]
         );
     }
