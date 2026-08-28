@@ -37,12 +37,13 @@ struct QueueEventRecord<'a> {
     attempts: i64,
     worker_id: Option<&'a str>,
     run_at: Option<i64>,
+    reason: Option<&'a str>,
     error: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
 struct QueueEventConfig {
-    max_events: i64,
+    retention_target: i64,
     include_payload: bool,
 }
 
@@ -50,6 +51,7 @@ struct QueueEventConfigCache {
     encoded: AtomicU64,
     expires_at_ms: AtomicU64,
     bypass_until_autocommit: AtomicBool,
+    events_since_trim: AtomicU64,
 }
 
 impl Default for QueueEventConfigCache {
@@ -58,6 +60,7 @@ impl Default for QueueEventConfigCache {
             encoded: AtomicU64::new(0),
             expires_at_ms: AtomicU64::new(0),
             bypass_until_autocommit: AtomicBool::new(false),
+            events_since_trim: AtomicU64::new(0),
         }
     }
 }
@@ -67,6 +70,8 @@ struct QueueEventEmitter<'a> {
     config: QueueEventConfig,
     occurred_at: i64,
     last_offset: Option<i64>,
+    emitted_events: u64,
+    cache: Option<&'a QueueEventConfigCache>,
 }
 
 /// Read an integer argument, accepting the REAL that dynamically typed
@@ -688,11 +693,12 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         FunctionFlags::SQLITE_UTF8,
         move |ctx| {
             let enabled = arg_i64(ctx, 0)? != 0;
-            let max_events = arg_i64(ctx, 1)?;
+            let retention_target = arg_i64(ctx, 1)?;
             let include_payload = arg_i64(ctx, 2)? != 0;
             let db = unsafe { ctx.get_connection() }?;
-            let configured = queue_events_configure(&db, enabled, max_events, include_payload)
-                .map_err(to_sql_err)?;
+            let configured =
+                queue_events_configure(&db, enabled, retention_target, include_payload)
+                    .map_err(to_sql_err)?;
             configure_event_cache.invalidate_after_configure(&db);
             Ok(configured)
         },
@@ -707,6 +713,15 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let limit = arg_i64(ctx, 2)?;
             let db = unsafe { ctx.get_connection() }?;
             queue_events_read_since(&db, offset, queue.as_deref(), limit).map_err(to_sql_err)
+        },
+    )?;
+    conn.create_scalar_function(
+        "honker_queue_events_status",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let db = unsafe { ctx.get_connection() }?;
+            queue_events_status(&db).map_err(to_sql_err)
         },
     )?;
 
@@ -790,6 +805,7 @@ fn dead_letter_exhausted_claimable(
                 attempts,
                 worker_id: None,
                 run_at: Some(run_at),
+                reason: Some("attempts_exhausted"),
                 error: Some("max attempts exceeded"),
             })?;
         }
@@ -895,6 +911,7 @@ fn claim_batch_with_cache(
                 attempts,
                 worker_id: Some(&w),
                 run_at: Some(run_at),
+                reason: None,
                 error: None,
             })?;
         }
@@ -974,6 +991,7 @@ fn ack_batch_with_cache(
             attempts,
             worker_id: Some(&worker_id),
             run_at: Some(run_at),
+            reason: None,
             error: None,
         })?;
     }
@@ -1104,6 +1122,7 @@ fn enqueue_with_cache(
             attempts: 0,
             worker_id: None,
             run_at: Some(run_at_val),
+            reason: None,
             error: None,
         },
     )?;
@@ -1156,6 +1175,7 @@ fn ack_with_cache(
         attempts,
         worker_id: Some(&worker_id),
         run_at: Some(run_at),
+        reason: None,
         error: None,
     })?;
     emitter.finish()?;
@@ -1267,6 +1287,7 @@ fn retry_with_cache(
             attempts,
             worker_id: Some(worker_id),
             run_at: Some(event_run_at),
+            reason: (event_type == "dead_lettered").then_some("attempts_exhausted"),
             error: Some(error),
         },
     )?;
@@ -1337,6 +1358,7 @@ fn fail_with_cache(
             attempts,
             worker_id: Some(worker_id),
             run_at: Some(run_at),
+            reason: Some("explicit_failure"),
             error: Some(error),
         },
     )?;
@@ -1393,6 +1415,7 @@ fn cancel_with_cache(
         attempts,
         worker_id: worker_id.as_deref(),
         run_at: Some(run_at),
+        reason: None,
         error: None,
     })?;
     emitter.finish()?;
@@ -1567,6 +1590,7 @@ fn sweep_expired_with_cache(
                 attempts,
                 worker_id: None,
                 run_at: Some(run_at),
+                reason: Some("job_expired"),
                 error: Some("expired"),
             })?;
         }
@@ -2108,37 +2132,86 @@ pub fn result_sweep(conn: &Connection) -> rusqlite::Result<i64> {
 pub fn queue_events_configure(
     conn: &Connection,
     enabled: bool,
-    max_events: i64,
+    retention_target: i64,
     include_payload: bool,
 ) -> rusqlite::Result<i64> {
-    if !(1..=1_000_000).contains(&max_events) {
+    if !(1..=1_000_000).contains(&retention_target) {
         return Err(to_sql_err(
-            "honker: queue event max_events must be between 1 and 1000000",
+            "honker: queue event retention_target must be between 1 and 1000000",
         ));
     }
     conn.execute(
         "INSERT INTO _honker_queue_event_config
-           (singleton, enabled, max_events, include_payload)
+           (singleton, enabled, retention_target, include_payload)
          VALUES (1, ?1, ?2, ?3)
          ON CONFLICT(singleton) DO UPDATE SET
            enabled = excluded.enabled,
-           max_events = excluded.max_events,
+           retention_target = excluded.retention_target,
            include_payload = excluded.include_payload",
-        rusqlite::params![enabled as i64, max_events, include_payload as i64],
+        rusqlite::params![enabled as i64, retention_target, include_payload as i64],
     )?;
     Ok(1)
+}
+
+pub fn queue_events_status(conn: &Connection) -> rusqlite::Result<String> {
+    let config = match conn.query_row(
+        "SELECT enabled, retention_target, include_payload, trimmed_through_offset
+             FROM _honker_queue_event_config WHERE singleton = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)? != 0,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    ) {
+        Ok(config) => Some(config),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error),
+    };
+    let (enabled, retention_target, include_payload, trimmed_through_offset) =
+        config.unwrap_or((false, 10_000, false, 0));
+    let (oldest_offset, latest_offset): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT MIN(offset), MAX(offset) FROM _honker_stream WHERE topic = ?1",
+        [QUEUE_EVENTS_TOPIC],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(json!({
+        "enabled": enabled,
+        "retention_target": retention_target,
+        "include_payload": include_payload,
+        "trimmed_through_offset": trimmed_through_offset,
+        "oldest_offset": oldest_offset,
+        "latest_offset": latest_offset,
+    })
+    .to_string())
+}
+
+fn queue_events_trimmed_through(conn: &Connection) -> rusqlite::Result<i64> {
+    match conn.query_row(
+        "SELECT trimmed_through_offset
+         FROM _honker_queue_event_config WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(offset) => Ok(offset),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(error) => Err(error),
+    }
 }
 
 fn load_queue_event_config(conn: &Connection) -> rusqlite::Result<Option<QueueEventConfig>> {
     let result = (|| {
         let mut stmt = conn.prepare_cached(
-            "SELECT max_events, include_payload
+            "SELECT retention_target, include_payload
              FROM _honker_queue_event_config
              WHERE singleton = 1 AND enabled = 1",
         )?;
         stmt.query_row([], |r| {
             Ok(QueueEventConfig {
-                max_events: r.get(0)?,
+                retention_target: r.get(0)?,
                 include_payload: r.get::<_, i64>(1)? != 0,
             })
         })
@@ -2206,7 +2279,25 @@ impl QueueEventConfigCache {
     fn invalidate(&self) {
         self.expires_at_ms.store(0, Ordering::Release);
         self.encoded.store(0, Ordering::Relaxed);
+        self.events_since_trim.store(0, Ordering::Relaxed);
     }
+
+    fn should_trim(&self, emitted_events: u64, interval: u64) -> bool {
+        let previous = self
+            .events_since_trim
+            .fetch_add(emitted_events, Ordering::Relaxed);
+        let total = previous.saturating_add(emitted_events);
+        if total < interval {
+            return false;
+        }
+        self.events_since_trim
+            .store(total % interval, Ordering::Relaxed);
+        true
+    }
+}
+
+fn queue_event_trim_interval(retention_target: i64) -> u64 {
+    ((retention_target as u64) / 10).clamp(1, 1_000)
 }
 
 fn queue_event_cache_millis() -> u64 {
@@ -2224,7 +2315,7 @@ fn encode_queue_event_config(config: Option<QueueEventConfig>) -> u64 {
         None => 0,
         Some(config) => {
             let payload_bit = u64::from(config.include_payload) << 63;
-            payload_bit | config.max_events as u64
+            payload_bit | config.retention_target as u64
         }
     }
 }
@@ -2234,14 +2325,14 @@ fn decode_queue_event_config(encoded: u64) -> Option<QueueEventConfig> {
         return None;
     }
     Some(QueueEventConfig {
-        max_events: (encoded & i64::MAX as u64) as i64,
+        retention_target: (encoded & i64::MAX as u64) as i64,
         include_payload: encoded >> 63 == 1,
     })
 }
 
 fn queue_event_emitter<'a>(
     conn: &'a Connection,
-    cache: Option<&QueueEventConfigCache>,
+    cache: Option<&'a QueueEventConfigCache>,
 ) -> rusqlite::Result<Option<QueueEventEmitter<'a>>> {
     let config = match cache {
         Some(cache) => cache.get(conn)?,
@@ -2255,6 +2346,8 @@ fn queue_event_emitter<'a>(
         config,
         occurred_at: now_unix(conn)?,
         last_offset: None,
+        emitted_events: 0,
+        cache,
     }))
 }
 
@@ -2281,6 +2374,7 @@ impl QueueEventEmitter<'_> {
             "attempts": event.attempts,
             "worker_id": event.worker_id,
             "run_at": event.run_at,
+            "reason": event.reason,
             "error": event.error,
         });
         if self.config.include_payload {
@@ -2297,24 +2391,53 @@ impl QueueEventEmitter<'_> {
             Some(event.queue),
             &body.to_string(),
         )?);
+        self.emitted_events += 1;
         Ok(())
     }
 
     fn finish(self) -> rusqlite::Result<()> {
-        let Some(last_offset) = self.last_offset else {
+        if self.last_offset.is_none() {
             return Ok(());
-        };
+        }
 
-        // `_honker_stream.offset` is global across topics. Using its distance
-        // as the trim bound may retain fewer than max_events when application
-        // streams are very busy, but it can never retain more. Batch callers
-        // trim once after their final event, avoiding one DELETE per job.
-        let trim_through = last_offset.saturating_sub(self.config.max_events);
-        if trim_through > 0 {
-            let mut stmt = self
+        let interval = queue_event_trim_interval(self.config.retention_target);
+        if let Some(cache) = self.cache
+            && !cache.should_trim(self.emitted_events, interval)
+        {
+            return Ok(());
+        }
+
+        // Find the (retention_target + 1)-th newest queue event, then delete it and
+        // everything older on this topic. Generic stream traffic uses the
+        // same global offset sequence but must never consume queue-event
+        // retention. Batch callers still trim once after their final event.
+        let trim_through = {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT offset FROM _honker_stream
+                 WHERE topic = ?1
+                 ORDER BY offset DESC
+                 LIMIT 1 OFFSET ?2",
+            )?;
+            match stmt.query_row(
+                rusqlite::params![QUEUE_EVENTS_TOPIC, self.config.retention_target],
+                |row| row.get::<_, i64>(0),
+            ) {
+                Ok(offset) => Some(offset),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(trim_through) = trim_through {
+            let mut delete = self
                 .conn
                 .prepare_cached("DELETE FROM _honker_stream WHERE topic = ?1 AND offset <= ?2")?;
-            stmt.execute(rusqlite::params![QUEUE_EVENTS_TOPIC, trim_through])?;
+            delete.execute(rusqlite::params![QUEUE_EVENTS_TOPIC, trim_through])?;
+            self.conn.execute(
+                "UPDATE _honker_queue_event_config
+                 SET trimmed_through_offset = MAX(trimmed_through_offset, ?1)
+                 WHERE singleton = 1",
+                [trim_through],
+            )?;
         }
         Ok(())
     }
@@ -2335,6 +2458,14 @@ pub fn queue_events_read_since(
         return Err(to_sql_err(
             "honker: queue event read limit must be between 1 and 10000",
         ));
+    }
+
+    let trimmed_through = queue_events_trimmed_through(conn)?;
+    if offset < trimmed_through {
+        return Err(to_sql_err(format!(
+            "HONKER_QUEUE_EVENT_OFFSET_EXPIRED: requested offset {offset} is older than \
+             trimmed-through offset {trimmed_through}"
+        )));
     }
 
     let mut stmt = conn.prepare_cached(
@@ -2679,6 +2810,10 @@ mod queue_event_tests {
         serde_json::from_str(&queue_events_read_since(conn, 0, queue, 10_000).unwrap()).unwrap()
     }
 
+    fn event_status(conn: &Connection) -> Value {
+        serde_json::from_str(&queue_events_status(conn).unwrap()).unwrap()
+    }
+
     fn sql_enqueue(conn: &Connection, queue: &str) -> i64 {
         conn.query_row(
             "SELECT honker_enqueue(?1, '{}', NULL, NULL, 0, 3, NULL)",
@@ -2758,12 +2893,12 @@ mod queue_event_tests {
     fn queue_event_config_cache_encodes_the_largest_retention() {
         for include_payload in [false, true] {
             let config = QueueEventConfig {
-                max_events: i64::MAX,
+                retention_target: i64::MAX,
                 include_payload,
             };
             let decoded = decode_queue_event_config(encode_queue_event_config(Some(config)))
                 .expect("enabled configuration should round-trip");
-            assert_eq!(decoded.max_events, i64::MAX);
+            assert_eq!(decoded.retention_target, i64::MAX);
             assert_eq!(decoded.include_payload, include_payload);
         }
         assert!(decode_queue_event_config(encode_queue_event_config(None)).is_none());
@@ -2897,11 +3032,11 @@ mod queue_event_tests {
         );
 
         let retained = events(&conn, None);
-        assert!(
-            retained
-                .iter()
-                .any(|event| { event["job_id"] == dead_id && event["type"] == "dead_lettered" })
-        );
+        assert!(retained.iter().any(|event| {
+            event["job_id"] == dead_id
+                && event["type"] == "dead_lettered"
+                && event["reason"] == "attempts_exhausted"
+        }));
         assert!(
             retained
                 .iter()
@@ -2939,11 +3074,13 @@ mod queue_event_tests {
         assert!(terminal.iter().any(|event| {
             event["job_id"] == expired_id
                 && event["type"] == "dead_lettered"
+                && event["reason"] == "job_expired"
                 && event["error"] == "expired"
         }));
         assert!(terminal.iter().any(|event| {
             event["job_id"] == abandoned_id
                 && event["type"] == "dead_lettered"
+                && event["reason"] == "attempts_exhausted"
                 && event["error"] == "max attempts exceeded"
         }));
     }
@@ -2998,15 +3135,67 @@ mod queue_event_tests {
                 None,
             )
             .unwrap();
+            stream_publish(
+                &conn,
+                "application-events",
+                None,
+                &json!({ "i": i }).to_string(),
+            )
+            .unwrap();
         }
 
-        let retained = events(&conn, None);
+        let status = event_status(&conn);
+        let trimmed_through = status["trimmed_through_offset"].as_i64().unwrap();
+        assert!(trimmed_through > 0);
+        assert!(queue_events_read_since(&conn, 0, None, 10_000).is_err());
+        let retained: Vec<Value> = serde_json::from_str(
+            &queue_events_read_since(&conn, trimmed_through, None, 10_000).unwrap(),
+        )
+        .unwrap();
         assert_eq!(retained.len(), 3);
         assert_eq!(retained[0]["payload"]["sequence"], 2);
         assert_eq!(retained[2]["payload"]["sequence"], 4);
 
-        let alpha = events(&conn, Some("alpha"));
+        let alpha: Vec<Value> = serde_json::from_str(
+            &queue_events_read_since(&conn, trimmed_through, Some("alpha"), 10_000).unwrap(),
+        )
+        .unwrap();
         assert_eq!(alpha.len(), 2);
         assert!(alpha.iter().all(|event| event["queue"] == "alpha"));
+    }
+
+    #[test]
+    fn production_retention_trims_in_bounded_chunks() {
+        let conn = db();
+        conn.query_row("SELECT honker_queue_events_configure(1, 100, 0)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+
+        for _ in 0..105 {
+            sql_enqueue(&conn, "chunked");
+        }
+        let before_trim: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_stream WHERE topic = ?1",
+                [QUEUE_EVENTS_TOPIC],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before_trim, 105);
+
+        for _ in 0..5 {
+            sql_enqueue(&conn, "chunked");
+        }
+        let status = event_status(&conn);
+        let after_trim: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_stream WHERE topic = ?1",
+                [QUEUE_EVENTS_TOPIC],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_trim, 100);
+        assert!(status["trimmed_through_offset"].as_i64().unwrap() > 0);
     }
 }

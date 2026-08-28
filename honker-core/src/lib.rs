@@ -431,8 +431,10 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
     CREATE TABLE IF NOT EXISTS _honker_queue_event_config (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
       enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
-      max_events INTEGER NOT NULL CHECK (max_events > 0),
-      include_payload INTEGER NOT NULL CHECK (include_payload IN (0, 1))
+      retention_target INTEGER NOT NULL CHECK (retention_target > 0),
+      include_payload INTEGER NOT NULL CHECK (include_payload IN (0, 1)),
+      trimmed_through_offset INTEGER NOT NULL DEFAULT 0
+        CHECK (trimmed_through_offset >= 0)
     );
 ";
 
@@ -481,6 +483,54 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
     if !has_max_attempts {
         match conn.execute(
             "ALTER TABLE _honker_scheduler_tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Migration: the first queue-event draft called an exact cap
+    // `max_events`. Retention is intentionally chunked and approximate, so
+    // rename the internal field before the API ships with misleading terms.
+    let queue_event_config_columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('_honker_queue_event_config')")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if queue_event_config_columns
+        .iter()
+        .any(|name| name == "max_events")
+        && !queue_event_config_columns
+            .iter()
+            .any(|name| name == "retention_target")
+    {
+        match conn.execute(
+            "ALTER TABLE _honker_queue_event_config \
+             RENAME COLUMN max_events TO retention_target",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e)
+                if e.to_string().to_lowercase().contains("duplicate column")
+                    || e.to_string().to_lowercase().contains("no such column") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Migration: queue-event consumers need a durable watermark to
+    // distinguish a fresh reader from a checkpoint that fell behind
+    // retention. Older draft schemas predate this column.
+    let has_queue_event_watermark: bool = {
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM pragma_table_info('_honker_queue_event_config') \
+             WHERE name='trimmed_through_offset'",
+        )?;
+        stmt.query_row([], |_| Ok(true)).unwrap_or(false)
+    };
+    if !has_queue_event_watermark {
+        match conn.execute(
+            "ALTER TABLE _honker_queue_event_config \
+             ADD COLUMN trimmed_through_offset INTEGER NOT NULL DEFAULT 0 \
+             CHECK (trimmed_through_offset >= 0)",
             [],
         ) {
             Ok(_) => {}
@@ -2311,6 +2361,35 @@ while True:
     }
 
     #[test]
+    fn bootstrap_draft_queue_event_config_gets_trim_watermark() {
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE _honker_queue_event_config (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+               max_events INTEGER NOT NULL CHECK (max_events > 0),
+               include_payload INTEGER NOT NULL CHECK (include_payload IN (0, 1))
+             );
+             INSERT INTO _honker_queue_event_config
+               (singleton, enabled, max_events, include_payload)
+             VALUES (1, 1, 321, 1);",
+        )
+        .unwrap();
+
+        bootstrap_honker_schema(&conn).unwrap();
+        let row: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT retention_target, include_payload, trimmed_through_offset
+                 FROM _honker_queue_event_config WHERE singleton = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (321, 1, 0));
+        bootstrap_honker_schema(&conn).unwrap();
+    }
+
+    #[test]
     fn bootstrap_honker_schema_creates_tables_and_index() {
         let conn = mem();
         bootstrap_honker_schema(&conn).unwrap();
@@ -2441,7 +2520,13 @@ while True:
             .unwrap();
         assert_eq!(
             queue_event_config_cols,
-            vec!["singleton", "enabled", "max_events", "include_payload"]
+            vec![
+                "singleton",
+                "enabled",
+                "retention_target",
+                "include_payload",
+                "trimmed_through_offset"
+            ]
         );
     }
 

@@ -22,19 +22,28 @@ from pathlib import Path
 import honker
 
 
-def configure(db, *, enabled: bool, include_payload: bool) -> None:
+def configure(
+    db, *, enabled: bool, include_payload: bool, retention_target: int
+) -> None:
     with db.transaction() as tx:
         tx.query(
-            "SELECT honker_queue_events_configure(?, 1000000, ?)",
-            [int(enabled), int(include_payload)],
+            "SELECT honker_queue_events_configure(?, ?, ?)",
+            [int(enabled), retention_target, int(include_payload)],
         )
 
 
-def run_mode(directory: Path, mode: str, jobs: int) -> dict[str, float | str]:
+def run_mode(
+    directory: Path, mode: str, jobs: int, retention_target: int
+) -> dict[str, float | str | int]:
     db_path = str(directory / f"{mode}.db")
     db = honker.open(db_path)
     enabled = mode != "disabled"
-    configure(db, enabled=enabled, include_payload=mode == "enabled-payload")
+    configure(
+        db,
+        enabled=enabled,
+        include_payload=mode == "enabled-payload",
+        retention_target=retention_target,
+    )
     # Python intentionally has no public queue-events binding yet. Reopen after
     # the raw transactional configure call so the timed writer starts with a
     # fresh core cache, matching a normal producer process.
@@ -42,6 +51,11 @@ def run_mode(directory: Path, mode: str, jobs: int) -> dict[str, float | str]:
     db = honker.open(db_path)
     queue = db.queue("bench", visibility_timeout_s=300)
     payload = {"id": 1, "kind": "queue-event-benchmark"}
+
+    if mode == "enabled-at-target":
+        with db.transaction() as tx:
+            for _ in range(retention_target):
+                queue.enqueue(payload, tx=tx)
 
     started = time.perf_counter()
     with db.transaction() as tx:
@@ -55,6 +69,10 @@ def run_mode(directory: Path, mode: str, jobs: int) -> dict[str, float | str]:
     acked = queue.ack_batch(ids, "bench-worker")
     ack_seconds = time.perf_counter() - started
     assert acked == jobs
+    retained_events = db.query(
+        "SELECT COUNT(*) AS count FROM _honker_stream "
+        "WHERE topic = '_honker:queue-events:v1'"
+    )[0]["count"]
     db.close()
 
     return {
@@ -63,23 +81,41 @@ def run_mode(directory: Path, mode: str, jobs: int) -> dict[str, float | str]:
         "enqueue_seconds": enqueue_seconds,
         "ack_jobs_per_second": jobs / ack_seconds,
         "ack_seconds": ack_seconds,
+        "retained_events": retained_events,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jobs", type=int, default=10_000)
+    parser.add_argument("--retention-target", type=int, default=10_000)
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.retention_target < 1:
+        parser.error("--retention-target must be positive")
 
     with tempfile.TemporaryDirectory(prefix="honker-queue-events-bench-") as temp:
         directory = Path(temp)
         results = [
-            run_mode(directory, mode, args.jobs)
-            for mode in ("disabled", "enabled", "enabled-payload")
+            run_mode(directory, mode, args.jobs, args.retention_target)
+            for mode in (
+                "disabled",
+                "enabled",
+                "enabled-at-target",
+                "enabled-payload",
+            )
         ]
-    print(json.dumps({"jobs": args.jobs, "results": results}, indent=2))
+    print(
+        json.dumps(
+            {
+                "jobs": args.jobs,
+                "retention_target": args.retention_target,
+                "results": results,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -129,6 +129,50 @@ def test_disabled_queue_events_do_not_multiply_ack_batch_cost(db_path):
     )
 
 
+def test_enabled_queue_events_stay_amortized_at_retention_target(db_path):
+    """Reaching retention must not add a trim query/delete per event.
+
+    Compare equal transactional enqueue batches immediately before and after
+    the feed reaches its target. This specifically exercises the steady-state
+    path that a benchmark against an empty event feed misses.
+    """
+    retention_target = 2_000
+    db = honker.open(db_path)
+    with db.transaction() as tx:
+        tx.query(
+            "SELECT honker_queue_events_configure(1, ?, 0)",
+            [retention_target],
+        )
+    # Reopen so the timed writer starts with a normal committed config cache.
+    db.close()
+    db = honker.open(db_path)
+    queue = db.queue("perf-retention")
+
+    t0 = time.perf_counter()
+    with db.transaction() as tx:
+        for i in range(retention_target):
+            queue.enqueue({"phase": "fill", "i": i}, tx=tx)
+    fill_seconds = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    with db.transaction() as tx:
+        for i in range(retention_target):
+            queue.enqueue({"phase": "steady", "i": i}, tx=tx)
+    steady_seconds = time.perf_counter() - t0
+
+    assert steady_seconds < fill_seconds * 2.0 + 0.050, (
+        f"queue events took {steady_seconds:.4f}s at the retention target "
+        f"versus {fill_seconds:.4f}s while filling it. Likely trimming on "
+        "every lifecycle event instead of in bounded chunks."
+    )
+    retained = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_stream "
+        "WHERE topic = '_honker:queue-events:v1'"
+    )[0]["c"]
+    trim_interval = min(1_000, max(1, retention_target // 10))
+    assert retention_target <= retained < retention_target + trim_interval
+
+
 async def test_notify_listener_receive_floor(db_path):
     """100 notifies delivered to a listener must be observed within
     1 second end-to-end. Measured ~4ms on M-series. A 250x slowdown
