@@ -54,6 +54,34 @@ test('queue events are opt-in and follow successful committed transitions', asyn
   }
 });
 
+test('pre-event schemas fail feed construction with the typed disabled error', () => {
+  const { path, open, cleanup } = tmpdb();
+  let db;
+  try {
+    db = open(path);
+    const legacySchema = db.transaction();
+    legacySchema.execute('DROP TABLE _honker_queue_event_config');
+    legacySchema.commit();
+
+    assert.throws(
+      () => db.queueEvents(),
+      (error) => error instanceof honker.QueueEventsDisabledError &&
+        error.code === 'HONKER_QUEUE_EVENTS_DISABLED',
+    );
+    assert.throws(
+      () => db.queueEventListener(),
+      (error) => error instanceof honker.QueueEventsDisabledError &&
+        error.code === 'HONKER_QUEUE_EVENTS_DISABLED',
+    );
+
+    // Compatibility remains symmetric: queue mutations still work without
+    // the opt-in event schema.
+    assert.ok(db.queue('legacy').enqueue({ compatible: true }) > 0);
+  } finally {
+    cleanup();
+  }
+});
+
 test('queue events cover retry, completion, cancellation, filtering, and retention', () => {
   const { path, open, cleanup } = tmpdb();
   let db;

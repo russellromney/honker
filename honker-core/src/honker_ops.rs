@@ -2160,6 +2160,7 @@ pub fn queue_events_configure(
 }
 
 pub fn queue_events_status(conn: &Connection) -> rusqlite::Result<String> {
+    let mut schema_available = true;
     let config = match conn.query_row(
         "SELECT enabled, retention_target, include_payload, trimmed_through_offset
              FROM _honker_queue_event_config WHERE singleton = 1",
@@ -2175,7 +2176,13 @@ pub fn queue_events_status(conn: &Connection) -> rusqlite::Result<String> {
     ) {
         Ok(config) => Some(config),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(error) => return Err(error),
+        Err(error) => {
+            if queue_event_config_table_exists(conn)? {
+                return Err(error);
+            }
+            schema_available = false;
+            None
+        }
     };
     let (enabled, retention_target, include_payload, trimmed_through_offset) =
         config.unwrap_or((false, 10_000, false, 0));
@@ -2185,6 +2192,7 @@ pub fn queue_events_status(conn: &Connection) -> rusqlite::Result<String> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(json!({
+        "schema_available": schema_available,
         "enabled": enabled,
         "retention_target": retention_target,
         "include_payload": include_payload,
@@ -2230,21 +2238,24 @@ fn load_queue_event_config(conn: &Connection) -> rusqlite::Result<Option<QueueEv
             // has not created the opt-in config table yet. Queue mutations
             // must remain backwards-compatible in that mixed-version case;
             // the absence of configuration means events are disabled.
-            let table_exists: i64 = conn.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM sqlite_schema
-                   WHERE type = 'table' AND name = '_honker_queue_event_config'
-                 )",
-                [],
-                |r| r.get(0),
-            )?;
-            if table_exists == 0 {
+            if !queue_event_config_table_exists(conn)? {
                 Ok(None)
             } else {
                 Err(error)
             }
         }
     }
+}
+
+fn queue_event_config_table_exists(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_schema
+           WHERE type = 'table' AND name = '_honker_queue_event_config'
+         )",
+        [],
+        |row| Ok(row.get::<_, i64>(0)? != 0),
+    )
 }
 
 impl QueueEventConfigCache {
@@ -2850,6 +2861,10 @@ mod queue_event_tests {
         let conn = db();
         conn.execute("DROP TABLE _honker_queue_event_config", [])
             .unwrap();
+
+        let status = event_status(&conn);
+        assert_eq!(status["schema_available"], false);
+        assert_eq!(status["enabled"], false);
 
         let id = enqueue(&conn, "emails", "{}", None, None, 0, 3, None).unwrap();
         claim_batch(&conn, "emails", "legacy-worker", 1, 300).unwrap();

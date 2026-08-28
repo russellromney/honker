@@ -35,6 +35,11 @@ export interface StreamEvent {
   createdAt: number | null
 }
 
+/**
+ * Queue lifecycle event names. `error` and `close` are reserved by
+ * QueueEventListener's EventEmitter contract and must not become lifecycle
+ * event types.
+ */
 export type QueueEventType =
   | 'enqueued'
   | 'claimed'

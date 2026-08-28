@@ -829,6 +829,7 @@ class QueueEvents {
     let status;
     try {
       status = db._queueEventsStatus();
+      if (!status.schemaAvailable) throw new QueueEventsDisabledError();
     } catch (error) {
       this._updates.close();
       throw error;
@@ -1195,6 +1196,7 @@ class Database {
     const raw = this._callScalar('SELECT honker_queue_events_status()');
     const row = JSON.parse(raw || '{}');
     return {
+      schemaAvailable: Boolean(row.schema_available ?? true),
       enabled: Boolean(row.enabled),
       retentionTarget: row.retention_target ?? 10_000,
       includePayload: Boolean(row.include_payload),
