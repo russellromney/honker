@@ -57,6 +57,7 @@ test('queue events are opt-in and follow successful committed transitions', asyn
 test('pre-event schemas fail feed construction with the typed disabled error', () => {
   const { path, open, cleanup } = tmpdb();
   let db;
+  let feed;
   try {
     db = open(path);
     const legacySchema = db.transaction();
@@ -77,7 +78,18 @@ test('pre-event schemas fail feed construction with the typed disabled error', (
     // Compatibility remains symmetric: queue mutations still work without
     // the opt-in event schema.
     assert.ok(db.queue('legacy').enqueue({ compatible: true }) > 0);
+
+    // Follow the typed error's recovery instruction. Configuration restores
+    // the canonical schema, and subsequent lifecycle events are observable.
+    assert.equal(db.configureQueueEvents({ enabled: true }), true);
+    feed = db.queueEvents({ fromOffset: 0 });
+    const id = db.queue('legacy').enqueue({ emits: true });
+    assert.deepEqual(
+      feed.readSince(0).map((event) => [event.type, event.jobId]),
+      [['enqueued', id]],
+    );
   } finally {
+    try { feed?.close(); } catch {}
     cleanup();
   }
 });

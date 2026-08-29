@@ -2137,6 +2137,7 @@ pub fn queue_events_configure(
             "honker: queue event retention_target must be between 1 and 1000000",
         ));
     }
+    super::bootstrap_honker_schema(conn).map_err(to_sql_err)?;
     conn.execute(
         "INSERT INTO _honker_queue_event_config
            (singleton, enabled, retention_target, include_payload, events_since_trim)
