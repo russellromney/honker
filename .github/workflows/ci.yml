@@ -700,7 +700,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-jvm-${{ hashFiles('honker-core/src/**/*.rs', 'honker-extension/src/**/*.rs') }}"
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
