@@ -37,6 +37,26 @@
   unscoped lookup could hand back a payload that did not match the queue's
   declared `TPayload`. `cancel()` is unchanged and remains not queue-scoped.
 
+## Unreleased — C++ job details
+
+- C++ `honker::Job` now carries all twelve fields core returns. It gained
+  `queue()`, `state()`, `priority()`, `run_at()`, `claim_expires_at()`,
+  `max_attempts()`, `created_at()`, and `expires_at()` alongside the
+  existing `id()`, `payload()`, `worker_id()`, and `attempts()`, and keeps
+  `ack()` / `retry()` / `fail()` / `heartbeat()`.
+- New `honker::JobSnapshot`: the same twelve fields, data only, returned by
+  `Queue::get_job(id)` as `std::optional<JobSnapshot>`. `worker_id()` and
+  `claim_expires_at()` are `std::optional` there because a pending row has
+  neither. `Queue::get_job_json(id)` is unchanged and still returns the
+  undecoded blob.
+- Payload encoding is unchanged: `payload()` is the raw JSON text on both
+  types. The binding stays dynamic — no templates, no codec — matching the
+  issue's guidance for C++.
+- Claim and snapshot decoding now fails loudly. A malformed JSON blob or a
+  missing required field throws `honker::Error` instead of the previous
+  `catch (...) {}` that returned an empty result, and required fields no
+  longer fall back to `0` / `""` / `1` defaults.
+
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
 - Node stream checkpoint calls now use the shared SQL ABI's canonical

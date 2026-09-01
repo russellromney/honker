@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
         "test/test_basic.cpp",
         "test/test_parity.cpp",
         "test/test_phase_mantle.cpp",
+        "test/test_job_details.cpp",
     };
 
     inline for (test_files) |tf| {

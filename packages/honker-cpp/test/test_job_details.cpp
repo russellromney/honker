@@ -1,0 +1,327 @@
+// Issue #136: claimed jobs and read-only snapshots must carry every
+// field honker_claim_batch() / honker_get_job() return.
+//
+// Every value asserted here is chosen to be distinguishable from the
+// others. Defaults (priority 0, max_attempts 3, a 300s visibility
+// timeout, run_at == created_at) would let a wrong field pass for the
+// right one, so the fixture uses odd constants and back-dates run_at
+// well away from created_at.
+
+#include "honker.hpp"
+
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <iostream>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <string>
+
+namespace fs = std::filesystem;
+using nlohmann::json;
+
+namespace {
+
+// Fixture constants. All distinct, none a default, none derivable
+// from another by accident.
+constexpr int64_t VISIBILITY_TIMEOUT_S = 137;
+constexpr int64_t MAX_ATTEMPTS         = 9;
+constexpr int64_t HIGH_PRIORITY        = 42;
+constexpr int64_t LOW_PRIORITY         = 7;
+constexpr int64_t RUN_AT_BACKDATE_S    = 300;
+constexpr int64_t EXPIRES_S            = 9000;
+constexpr int64_t DELAY_S              = 600;
+
+int64_t now_unix() { return static_cast<int64_t>(std::time(nullptr)); }
+
+[[noreturn]] void fail(const std::string& msg) {
+    std::cerr << "FAIL: " << msg << '\n';
+    std::abort();
+}
+
+void check_i64(int64_t got, int64_t want, const char* what) {
+    if (got != want) {
+        fail(std::string{what} + ": got " + std::to_string(got) +
+             ", want " + std::to_string(want));
+    }
+}
+
+void check_ne_i64(int64_t got, int64_t forbidden, const char* what) {
+    if (got == forbidden) {
+        fail(std::string{what} + ": got " + std::to_string(got) +
+             ", which must not equal " + std::to_string(forbidden));
+    }
+}
+
+void check_str(const std::string& got, const std::string& want, const char* what) {
+    if (got != want) {
+        fail(std::string{what} + ": got \"" + got + "\", want \"" + want + "\"");
+    }
+}
+
+void check_range(int64_t got, int64_t lo, int64_t hi, const char* what) {
+    if (got < lo || got > hi) {
+        fail(std::string{what} + ": got " + std::to_string(got) +
+             ", want within [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
+    }
+}
+
+honker::Database open_db(const fs::path& tmp, const char* ext) {
+    fs::remove(tmp);
+    fs::remove(tmp.string() + "-wal");
+    fs::remove(tmp.string() + "-shm");
+    return honker::Database{tmp.string(), ext};
+}
+
+// The C ABI's enqueue takes only delay/priority/max_attempts. The
+// fixture needs an absolute run_at and an expiry too, so it goes
+// through the SQL function directly. Nothing about the read path
+// changes — this is only how the row gets on disk.
+int64_t raw_enqueue(sqlite3* db, const char* queue, const char* payload,
+                    int64_t run_at, int64_t priority, int64_t max_attempts,
+                    std::optional<int64_t> expires) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "SELECT honker_enqueue(?1, ?2, ?3, NULL, ?4, ?5, ?6)";
+    const int prepared = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    assert(prepared == SQLITE_OK);
+    (void)prepared;
+    sqlite3_bind_text(stmt, 1, queue, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, payload, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 3, run_at);
+    sqlite3_bind_int64(stmt, 4, priority);
+    sqlite3_bind_int64(stmt, 5, max_attempts);
+    if (expires) {
+        sqlite3_bind_int64(stmt, 6, *expires);
+    } else {
+        sqlite3_bind_null(stmt, 6);
+    }
+    int64_t id = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) id = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    if (id <= 0) fail("raw_enqueue did not return a job id");
+    return id;
+}
+
+void test_claimed_job_carries_every_core_field(const char* ext) {
+    auto db = open_db(fs::temp_directory_path() / "honker-cpp-details-claim.db", ext);
+    auto q = db.queue("details", VISIBILITY_TIMEOUT_S, MAX_ATTEMPTS);
+
+    const int64_t enqueued_lo = now_unix();
+    // Back-dated run_at: claimable immediately, but far enough from
+    // created_at that swapping the two fields cannot pass.
+    const int64_t high_run_at = enqueued_lo - RUN_AT_BACKDATE_S;
+    const int64_t high_id = raw_enqueue(
+        db.raw(), "details", R"({"to":"alice@example.com","v":1})",
+        high_run_at, HIGH_PRIORITY, MAX_ATTEMPTS, EXPIRES_S);
+    const int64_t low_run_at = enqueued_lo - (RUN_AT_BACKDATE_S / 2);
+    // No expiry on this one: proves expires_at is read per-row and not
+    // filled from a constant.
+    const int64_t low_id = raw_enqueue(
+        db.raw(), "details", R"({"to":"bob@example.com","v":1})",
+        low_run_at, LOW_PRIORITY, MAX_ATTEMPTS, std::nullopt);
+    const int64_t enqueued_hi = now_unix();
+
+    const int64_t claim_lo = now_unix();
+    auto jobs = q.claim_batch("worker-parity", 2);
+    const int64_t claim_hi = now_unix();
+    check_i64(static_cast<int64_t>(jobs.size()), 2, "claimed job count");
+
+    // priority DESC decides the order, so the high-priority row is first.
+    const auto& high = jobs[0];
+    const auto& low  = jobs[1];
+
+    check_i64(high.id(), high_id, "id");
+    check_i64(low.id(), low_id, "id of the second row");
+    check_str(high.queue(), "details", "queue");
+    check_str(high.payload(), R"({"to":"alice@example.com","v":1})",
+              "payload stays the raw JSON text as enqueued");
+    check_str(json::parse(high.payload())["to"].get<std::string>(),
+              "alice@example.com", "decoded payload");
+    check_str(high.state(), "processing", "state");
+
+    check_i64(high.priority(), HIGH_PRIORITY, "priority");
+    check_i64(low.priority(), LOW_PRIORITY, "priority is per-row, not a constant");
+
+    check_i64(high.run_at(), high_run_at, "run_at");
+    check_i64(low.run_at(), low_run_at, "run_at is per-row");
+    check_ne_i64(high.run_at(), high.created_at(), "run_at must not be created_at");
+
+    check_str(high.worker_id(), "worker-parity", "worker_id");
+
+    check_range(high.claim_expires_at(), claim_lo + VISIBILITY_TIMEOUT_S,
+                claim_hi + VISIBILITY_TIMEOUT_S,
+                "claim_expires_at is the claim instant + 137s");
+
+    check_i64(high.attempts(), 1, "attempts after the first claim");
+    check_i64(high.max_attempts(), MAX_ATTEMPTS, "max_attempts");
+    check_range(high.created_at(), enqueued_lo, enqueued_hi,
+                "created_at inside the enqueue window");
+
+    if (!high.expires_at().has_value()) fail("expires_at unset on the high row");
+    check_range(*high.expires_at(), enqueued_lo + EXPIRES_S, enqueued_hi + EXPIRES_S,
+                "expires_at is the enqueue instant + 9000s");
+    if (low.expires_at().has_value()) {
+        fail("expires_at should stay null when the enqueue set no expiry");
+    }
+
+    std::cout << "claimed_job_carries_every_core_field: ok\n";
+}
+
+void test_claimed_job_attempts_count_up_across_retries(const char* ext) {
+    auto db = open_db(fs::temp_directory_path() / "honker-cpp-details-attempts.db", ext);
+    auto q = db.queue("details", VISIBILITY_TIMEOUT_S, MAX_ATTEMPTS);
+    q.enqueue(R"({"n":1})");
+
+    auto first = q.claim_one("w1");
+    if (!first.has_value()) fail("first claim came back empty");
+    check_i64(first->attempts(), 1, "attempts on the first claim");
+    assert(first->retry(0, "boom") == true);
+
+    auto second = q.claim_one("w2");
+    if (!second.has_value()) fail("second claim came back empty");
+    check_i64(second->attempts(), 2,
+              "attempts must advance with the retry, not stick at 1");
+    check_str(second->worker_id(), "w2", "worker_id follows the new holder");
+    check_i64(second->id(), first->id(), "same row, re-claimed");
+    check_i64(second->created_at(), first->created_at(),
+              "created_at is stable across claims");
+
+    std::cout << "claimed_job_attempts_count_up_across_retries: ok\n";
+}
+
+void test_snapshot_pending_then_processing_then_miss(const char* ext) {
+    const auto path = fs::temp_directory_path() / "honker-cpp-details-snapshot.db";
+    auto db = open_db(path, ext);
+    auto q = db.queue("details", VISIBILITY_TIMEOUT_S, MAX_ATTEMPTS);
+
+    const int64_t enqueued_lo = now_unix();
+    const int64_t id = raw_enqueue(
+        db.raw(), "details", R"({"to":"carol@example.com"})",
+        enqueued_lo, HIGH_PRIORITY, MAX_ATTEMPTS, EXPIRES_S);
+    const int64_t enqueued_hi = now_unix();
+
+    auto pending = q.get_job(id);
+    if (!pending.has_value()) fail("pending snapshot missed");
+    check_i64(pending->id(), id, "id");
+    check_str(pending->queue(), "details", "queue");
+    check_str(pending->payload(), R"({"to":"carol@example.com"})",
+              "snapshot payload stays raw JSON text");
+    check_str(pending->state(), "pending", "state before any claim");
+    check_i64(pending->priority(), HIGH_PRIORITY, "priority");
+    check_i64(pending->run_at(), enqueued_lo, "run_at");
+    if (pending->worker_id().has_value()) fail("no holder while pending");
+    if (pending->claim_expires_at().has_value()) fail("no claim deadline while pending");
+    check_i64(pending->attempts(), 0, "attempts before any claim");
+    check_i64(pending->max_attempts(), MAX_ATTEMPTS, "max_attempts");
+    check_range(pending->created_at(), enqueued_lo, enqueued_hi,
+                "created_at inside the enqueue window");
+    if (!pending->expires_at().has_value()) fail("expires_at unset");
+    check_range(*pending->expires_at(), enqueued_lo + EXPIRES_S,
+                enqueued_hi + EXPIRES_S, "expires_at is the enqueue instant + 9000s");
+
+    // A second reader sees the processing details of someone else's claim.
+    const int64_t claim_lo = now_unix();
+    auto job = q.claim_one("worker-reader");
+    const int64_t claim_hi = now_unix();
+    if (!job.has_value()) fail("claim came back empty");
+
+    honker::Database reader{path.string(), ext};
+    auto rq = reader.queue("details", VISIBILITY_TIMEOUT_S, MAX_ATTEMPTS);
+    auto processing = rq.get_job(id);
+    if (!processing.has_value()) fail("processing snapshot missed");
+    check_str(processing->state(), "processing", "state while claimed");
+    if (!processing->worker_id().has_value()) fail("worker_id unset while processing");
+    check_str(*processing->worker_id(), "worker-reader", "worker_id names the holder");
+    check_i64(processing->attempts(), 1, "attempts after the claim");
+    if (!processing->claim_expires_at().has_value()) {
+        fail("claim_expires_at unset while processing");
+    }
+    check_range(*processing->claim_expires_at(), claim_lo + VISIBILITY_TIMEOUT_S,
+                claim_hi + VISIBILITY_TIMEOUT_S,
+                "claim_expires_at is the claim instant + 137s");
+    // Unchanged by the claim.
+    check_i64(processing->priority(), HIGH_PRIORITY, "priority survives");
+    check_i64(processing->max_attempts(), MAX_ATTEMPTS, "max_attempts survives");
+    check_i64(processing->created_at(), pending->created_at(), "created_at survives");
+    check_i64(*processing->expires_at(), *pending->expires_at(), "expires_at survives");
+
+    assert(job->ack() == true);
+    if (rq.get_job(id).has_value()) fail("the reader still sees a job after ack");
+
+    std::cout << "snapshot_pending_then_processing_then_miss: ok\n";
+}
+
+void test_delayed_job_snapshot_reports_future_run_at(const char* ext) {
+    auto db = open_db(fs::temp_directory_path() / "honker-cpp-details-delay.db", ext);
+    auto q = db.queue("details", VISIBILITY_TIMEOUT_S, MAX_ATTEMPTS);
+
+    const int64_t lo = now_unix();
+    const int64_t id = q.enqueue(R"({"later":true})", DELAY_S);
+    const int64_t hi = now_unix();
+
+    auto row = q.get_job(id);
+    if (!row.has_value()) fail("delayed snapshot missed");
+    check_range(row->run_at(), lo + DELAY_S, hi + DELAY_S,
+                "delayed run_at is the enqueue instant + 600s");
+    check_i64(row->run_at() - row->created_at(), DELAY_S,
+              "run_at must sit exactly 600s after created_at");
+    check_str(row->state(), "pending", "a delayed job stays pending");
+    if (q.claim_one("w").has_value()) fail("a delayed job is not claimable yet");
+
+    std::cout << "delayed_job_snapshot_reports_future_run_at: ok\n";
+}
+
+void test_get_job_json_still_returns_the_raw_blob(const char* ext) {
+    // get_job() decodes; get_job_json() keeps handing back the bytes.
+    // Both must agree, and both must miss after ack.
+    auto db = open_db(fs::temp_directory_path() / "honker-cpp-details-rawjson.db", ext);
+    auto q = db.queue("details", VISIBILITY_TIMEOUT_S, MAX_ATTEMPTS);
+    const int64_t id = q.enqueue(R"({"raw":true})", 0, LOW_PRIORITY);
+
+    const auto blob = q.get_job_json(id);
+    if (blob.empty()) fail("get_job_json missed a live row");
+    auto parsed = json::parse(blob);
+    auto row = q.get_job(id);
+    if (!row.has_value()) fail("get_job missed a live row");
+    check_i64(row->id(), parsed["id"].get<int64_t>(), "id agrees with the raw blob");
+    check_str(row->payload(), parsed["payload"].get<std::string>(),
+              "payload agrees with the raw blob");
+    check_i64(row->priority(), LOW_PRIORITY, "priority agrees with the enqueue");
+
+    auto job = q.claim_one("w");
+    if (!job.has_value()) fail("claim came back empty");
+    assert(job->ack() == true);
+    if (!q.get_job_json(id).empty()) fail("get_job_json should miss after ack");
+    if (q.get_job(id).has_value()) fail("get_job should miss after ack");
+
+    std::cout << "get_job_json_still_returns_the_raw_blob: ok\n";
+}
+
+}  // anonymous namespace
+
+int main() {
+    const char* ext = std::getenv("HONKER_EXTENSION_PATH");
+    if (!ext || !*ext) {
+        std::fputs(
+            "skip: HONKER_EXTENSION_PATH not set "
+            "(export it to ./libhonker_ext.{dylib,so})\n",
+            stderr);
+        return 0;
+    }
+
+    try {
+        test_claimed_job_carries_every_core_field(ext);
+        test_claimed_job_attempts_count_up_across_retries(ext);
+        test_snapshot_pending_then_processing_then_miss(ext);
+        test_delayed_job_snapshot_reports_future_run_at(ext);
+        test_get_job_json_still_returns_the_raw_blob(ext);
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL: " << e.what() << '\n';
+        return 1;
+    }
+
+    std::cout << "all job detail tests passed\n";
+    return 0;
+}

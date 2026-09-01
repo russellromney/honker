@@ -132,6 +132,7 @@ public:
 
 class Database;
 class Transaction;
+class JobSnapshot;
 class Job;
 class Queue;
 class Outbox;
@@ -360,15 +361,133 @@ private:
 };
 
 // =====================================================================
+// Job field decoding
+// =====================================================================
+//
+// honker_claim_batch() and honker_get_job() return the same twelve
+// snake_case keys. These helpers read them without inventing values:
+// a required key that is absent or null is a bug in the core we are
+// talking to, so it throws rather than defaulting to 0 or "".
+
+namespace detail {
+
+inline const nlohmann::json& job_field(const nlohmann::json& j, const char* key) {
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) {
+        throw Error{std::string{"job row is missing required field '"} + key + "'"};
+    }
+    return *it;
+}
+
+inline int64_t job_i64(const nlohmann::json& j, const char* key) {
+    return job_field(j, key).get<int64_t>();
+}
+
+inline std::string job_str(const nlohmann::json& j, const char* key) {
+    return job_field(j, key).get<std::string>();
+}
+
+inline std::optional<int64_t> job_opt_i64(const nlohmann::json& j, const char* key) {
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return std::nullopt;
+    return it->get<int64_t>();
+}
+
+inline std::optional<std::string> job_opt_str(const nlohmann::json& j, const char* key) {
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return std::nullopt;
+    return it->get<std::string>();
+}
+
+}  // namespace detail
+
+// =====================================================================
+// JobSnapshot
+// =====================================================================
+
+/// A read-only row from Queue::get_job(). Data only — a snapshot
+/// holds no claim, so there is no ack/retry/fail/heartbeat here.
+///
+/// worker_id() and claim_expires_at() are optional because a pending
+/// row has neither. payload() is the raw JSON text exactly as stored;
+/// parse it with your preferred JSON library.
+class JobSnapshot {
+public:
+    int64_t     id()         const noexcept { return id_; }
+    std::string queue()      const noexcept { return queue_; }
+    std::string payload()    const noexcept { return payload_; }
+    /// "pending" or "processing".
+    std::string state()      const noexcept { return state_; }
+    int64_t     priority()   const noexcept { return priority_; }
+    int64_t     run_at()     const noexcept { return run_at_; }
+    std::optional<std::string> worker_id() const noexcept { return worker_id_; }
+    std::optional<int64_t> claim_expires_at() const noexcept { return claim_expires_at_; }
+    int64_t     attempts()     const noexcept { return attempts_; }
+    int64_t     max_attempts() const noexcept { return max_attempts_; }
+    int64_t     created_at()   const noexcept { return created_at_; }
+    std::optional<int64_t> expires_at() const noexcept { return expires_at_; }
+
+    /// Decode one honker_get_job() object. Throws honker::Error when a
+    /// required field is missing.
+    static JobSnapshot from_json(const nlohmann::json& j) {
+        JobSnapshot s;
+        s.id_               = detail::job_i64(j, "id");
+        s.queue_            = detail::job_str(j, "queue");
+        s.payload_          = detail::job_str(j, "payload");
+        s.state_            = detail::job_str(j, "state");
+        s.priority_         = detail::job_i64(j, "priority");
+        s.run_at_           = detail::job_i64(j, "run_at");
+        s.worker_id_        = detail::job_opt_str(j, "worker_id");
+        s.claim_expires_at_ = detail::job_opt_i64(j, "claim_expires_at");
+        s.attempts_         = detail::job_i64(j, "attempts");
+        s.max_attempts_     = detail::job_i64(j, "max_attempts");
+        s.created_at_       = detail::job_i64(j, "created_at");
+        s.expires_at_       = detail::job_opt_i64(j, "expires_at");
+        return s;
+    }
+
+private:
+    JobSnapshot() = default;
+
+    int64_t     id_ = 0;
+    std::string queue_;
+    std::string payload_;
+    std::string state_;
+    int64_t     priority_ = 0;
+    int64_t     run_at_ = 0;
+    std::optional<std::string> worker_id_;
+    std::optional<int64_t> claim_expires_at_;
+    int64_t     attempts_ = 0;
+    int64_t     max_attempts_ = 0;
+    int64_t     created_at_ = 0;
+    std::optional<int64_t> expires_at_;
+};
+
+// =====================================================================
 // Job
 // =====================================================================
 
+/// A claimed unit of work. Carries the same twelve fields as
+/// JobSnapshot plus the claim methods. state() is always "processing",
+/// and worker_id() / claim_expires_at() are never null because holding
+/// a claim is what makes this a Job.
+///
+/// payload() is the raw JSON text exactly as stored.
 class Job {
 public:
     int64_t     id()        const noexcept { return id_; }
+    std::string queue()     const noexcept { return queue_; }
     std::string payload()   const noexcept { return payload_; }
+    /// Always "processing" for a claimed job.
+    std::string state()     const noexcept { return state_; }
+    int64_t     priority()  const noexcept { return priority_; }
+    int64_t     run_at()    const noexcept { return run_at_; }
     std::string worker_id() const noexcept { return worker_id_; }
-    int64_t     attempts()  const noexcept { return attempts_; }
+    int64_t     claim_expires_at() const noexcept { return claim_expires_at_; }
+    int64_t     attempts()     const noexcept { return attempts_; }
+    int64_t     max_attempts() const noexcept { return max_attempts_; }
+    int64_t     created_at()   const noexcept { return created_at_; }
+    std::optional<int64_t> expires_at() const noexcept { return expires_at_; }
 
     bool ack() {
         const auto n = honker_cpp_ack(db_, id_, worker_id_.c_str());
@@ -396,17 +515,43 @@ public:
         return n > 0;
     }
 
-    Job(sqlite3* db, int64_t id, std::string payload,
-        std::string worker_id, int64_t attempts)
-        : db_(db), id_(id), payload_(std::move(payload)),
-          worker_id_(std::move(worker_id)), attempts_(attempts) {}
+    /// Decode one honker_claim_batch() element. Throws honker::Error
+    /// when a required field is missing — including worker_id and
+    /// claim_expires_at, which a claimed row always carries.
+    static Job from_json(sqlite3* db, const nlohmann::json& j) {
+        Job job;
+        job.db_               = db;
+        job.id_               = detail::job_i64(j, "id");
+        job.queue_            = detail::job_str(j, "queue");
+        job.payload_          = detail::job_str(j, "payload");
+        job.state_            = detail::job_str(j, "state");
+        job.priority_         = detail::job_i64(j, "priority");
+        job.run_at_           = detail::job_i64(j, "run_at");
+        job.worker_id_        = detail::job_str(j, "worker_id");
+        job.claim_expires_at_ = detail::job_i64(j, "claim_expires_at");
+        job.attempts_         = detail::job_i64(j, "attempts");
+        job.max_attempts_     = detail::job_i64(j, "max_attempts");
+        job.created_at_       = detail::job_i64(j, "created_at");
+        job.expires_at_       = detail::job_opt_i64(j, "expires_at");
+        return job;
+    }
 
 private:
-    sqlite3*    db_;
-    int64_t     id_;
+    Job() = default;
+
+    sqlite3*    db_ = nullptr;
+    int64_t     id_ = 0;
+    std::string queue_;
     std::string payload_;
+    std::string state_;
+    int64_t     priority_ = 0;
+    int64_t     run_at_ = 0;
     std::string worker_id_;
-    int64_t     attempts_;
+    int64_t     claim_expires_at_ = 0;
+    int64_t     attempts_ = 0;
+    int64_t     max_attempts_ = 0;
+    int64_t     created_at_ = 0;
+    std::optional<int64_t> expires_at_;
 };
 
 // =====================================================================
@@ -442,7 +587,11 @@ public:
         char* rows = honker_cpp_claim_one(
             db_, name_.c_str(), w.c_str(), visibility_timeout_s_);
         if (!rows) return std::nullopt;
-        return parse_jobs(rows, 1);
+        std::string json{rows};
+        honker_cpp_free(rows);
+        auto jobs = parse_claim(json);
+        if (jobs.empty()) return std::nullopt;
+        return std::move(jobs.front());
     }
 
     std::vector<Job> claim_batch(std::string_view worker_id, int64_t n) {
@@ -452,19 +601,7 @@ public:
         if (!rows) return {};
         std::string json{rows};
         honker_cpp_free(rows);
-        std::vector<Job> out;
-        try {
-            auto arr = nlohmann::json::parse(json);
-            if (!arr.is_array()) return out;
-            for (const auto& j : arr) {
-                int64_t id = j.value("id", 0);
-                std::string payload = j.value("payload", "");
-                std::string wid = j.value("worker_id", w);
-                int64_t attempts = j.value("attempts", 1);
-                out.emplace_back(db_, id, std::move(payload), std::move(wid), attempts);
-            }
-        } catch (...) {}
-        return out;
+        return parse_claim(json);
     }
 
     int64_t ack_batch(const std::vector<int64_t>& ids, std::string_view worker_id) {
@@ -502,9 +639,9 @@ public:
         return rc > 0;
     }
 
-    /// Read a single job row by id. Returns the JSON-string blob or
-    /// an empty string on miss. Caller parses with their preferred
-    /// JSON library — keeping this header dependency-free.
+    /// Read a single job row by id. Returns the raw JSON-string blob
+    /// or an empty string on miss. Use get_job() for the decoded
+    /// JobSnapshot; this stays for callers that want the bytes.
     std::string get_job_json(int64_t job_id) {
         char* raw = honker_cpp_get_job(db_, job_id);
         if (!raw) return {};
@@ -513,26 +650,43 @@ public:
         return out;
     }
 
+    /// Read a single job row by id as a decoded JobSnapshot. Returns
+    /// nullopt on miss (ack'd, dead'd, or never existed).
+    ///
+    /// NOT queue-scoped: job ids are globally unique and this lookup
+    /// hits any queue's row. Scoping is tracked in #134.
+    std::optional<JobSnapshot> get_job(int64_t job_id) {
+        const std::string json = get_job_json(job_id);
+        if (json.empty()) return std::nullopt;
+        return JobSnapshot::from_json(parse_job_json(json));
+    }
+
     Queue(sqlite3* db, std::string name, int64_t vis, int64_t max)
         : db_(db), name_(std::move(name)),
           visibility_timeout_s_(vis), max_attempts_(max) {}
 
 private:
-    std::optional<Job> parse_jobs(char* rows, int64_t) {
-        std::string json{rows};
-        honker_cpp_free(rows);
+    /// Parse one honker JSON blob. A malformed blob is a core bug, not
+    /// an empty result — surface it instead of returning nothing.
+    static nlohmann::json parse_job_json(const std::string& json) {
         try {
-            auto arr = nlohmann::json::parse(json);
-            if (!arr.is_array() || arr.empty()) return std::nullopt;
-            const auto& j = arr[0];
-            int64_t id = j.value("id", 0);
-            std::string payload = j.value("payload", "");
-            std::string wid = j.value("worker_id", "");
-            int64_t attempts = j.value("attempts", 1);
-            return Job{db_, id, std::move(payload), std::move(wid), attempts};
-        } catch (...) {
-            return std::nullopt;
+            return nlohmann::json::parse(json);
+        } catch (const std::exception& e) {
+            throw Error{std::string{"job JSON is not parseable: "} + e.what()};
         }
+    }
+
+    std::vector<Job> parse_claim(const std::string& json) {
+        auto arr = parse_job_json(json);
+        if (!arr.is_array()) {
+            throw Error{"claim result is not a JSON array"};
+        }
+        std::vector<Job> out;
+        out.reserve(arr.size());
+        for (const auto& j : arr) {
+            out.push_back(Job::from_json(db_, j));
+        }
+        return out;
     }
 
     sqlite3*    db_;
