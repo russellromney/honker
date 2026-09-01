@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## Unreleased — JSON payload contract
+
+- **Breaking:** every payload accepted by Honker core must be valid JSON. Queue
+  enqueue, stream publish, notifications, task results, and scheduler register
+  or update now reject non-JSON text with
+  `honker: payload must be valid JSON`. Objects, arrays, strings, numbers,
+  booleans, and `null` remain valid payloads. Language bindings already encode
+  payloads as JSON; callers using the SQL extension directly must pass JSON
+  text.
+
 ## 2026-08-27 — Node 0.5.1
 
 - Node `@russellthehippo/honker-node`: 0.5.1, with the four

@@ -285,6 +285,19 @@ fn set_journal_mode_wal(conn: &Connection) -> rusqlite::Result<()> {
 // notify() SQL function + notifications schema
 // ---------------------------------------------------------------------
 
+/// Payloads crossing a public Honker write boundary are JSON text.
+/// Parse into `IgnoredAny` so validation does not allocate a JSON tree
+/// that the write path would immediately discard.
+pub(crate) fn validate_json_payload(payload: &str) -> rusqlite::Result<()> {
+    if serde_json::from_str::<serde::de::IgnoredAny>(payload).is_ok() {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::UserFunctionError(Box::new(
+            std::io::Error::other("honker: payload must be valid JSON"),
+        )))
+    }
+}
+
 /// Install the `_honker_notifications` table and the
 /// `notify(channel, payload)` SQL scalar function on `conn`. Idempotent.
 ///
@@ -318,6 +331,7 @@ pub fn attach_notify(conn: &Connection) -> Result<(), Error> {
     conn.create_scalar_function("notify", 2, FunctionFlags::SQLITE_UTF8, |ctx| {
         let channel: String = ctx.get(0)?;
         let payload: String = ctx.get(1)?;
+        validate_json_payload(&payload)?;
         let db = unsafe { ctx.get_connection() }?;
         let mut ins = db.prepare_cached(
             "INSERT INTO _honker_notifications (channel, payload) VALUES (?1, ?2)",
@@ -1403,13 +1417,14 @@ mod tests {
     }
 
     #[test]
-    fn notify_inserts_row() {
+    fn notify_accepts_every_json_payload_shape() {
         let conn = mem();
         attach_notify(&conn).unwrap();
-        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        conn.query_row("SELECT notify('orders', 'new')", [], |_| Ok(()))
-            .unwrap();
-        conn.execute_batch("COMMIT;").unwrap();
+        let payloads = ["{}", "[]", "42", "\"str\"", "true", "null"];
+        for payload in payloads {
+            conn.query_row("SELECT notify('orders', ?1)", [payload], |_| Ok(()))
+                .unwrap();
+        }
 
         let n: i64 = conn
             .query_row(
@@ -1418,7 +1433,27 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, payloads.len() as i64);
+    }
+
+    #[test]
+    fn notify_rejects_non_json_payload() {
+        let conn = mem();
+        attach_notify(&conn).unwrap();
+        let err = conn
+            .query_row("SELECT notify('orders', 'not json')", [], |_| Ok(()))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("honker: payload must be valid JSON"),
+            "expected the JSON payload contract error, got: {err}"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_notifications", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "rejected payload must not be written");
     }
 
     #[test]
@@ -1426,7 +1461,7 @@ mod tests {
         let conn = mem();
         attach_notify(&conn).unwrap();
         conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        conn.query_row("SELECT notify('x', 'y')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('x', '\"y\"')", [], |_| Ok(()))
             .unwrap();
         conn.execute_batch("ROLLBACK;").unwrap();
 

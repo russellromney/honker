@@ -90,6 +90,12 @@ All three are INSERTs inside your transaction. Put `queue.enqueue(...)`,
 `stream.publish(...)`, or `notify(...)` beside the write that created the
 work. Commit lands both rows. Rollback drops both rows.
 
+Payloads are JSON. Queue enqueue, stream publish, notifications, task results,
+and scheduler register/update accept any valid JSON value: objects, arrays,
+strings, numbers, booleans, or `null`. Language bindings serialize values for
+you. When calling the SQL extension directly, pass serialized JSON text (for
+example, `'{"id":42}'`, `'[1,2]'`, or `'"ready"'`); non-JSON text is rejected.
+
 SQLite has no server-side push channel, so honker uses a shared watcher.
 The stable backend reads `PRAGMA data_version` every millisecond; when
 the counter changes, listeners re-read indexed SQLite state.

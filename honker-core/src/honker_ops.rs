@@ -782,6 +782,7 @@ pub fn enqueue(
     max_attempts: i64,
     expires: Option<i64>,
 ) -> rusqlite::Result<i64> {
+    super::validate_json_payload(payload)?;
     let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
     let run_at_val: i64 = match (delay, run_at) {
         (Some(d), _) => now + d,
@@ -1234,6 +1235,7 @@ pub fn scheduler_register(
     expires_s: Option<i64>,
     max_attempts: i64,
 ) -> rusqlite::Result<i64> {
+    super::validate_json_payload(payload)?;
     let max_attempts = if max_attempts < 1 { 1 } else { max_attempts };
     let now = now_unix(conn)?;
     let next_fire_at = super::cron::next_after_unix(cron_expr, now).map_err(to_sql_err)?;
@@ -1502,6 +1504,9 @@ pub fn scheduler_update(
     expires_s: Option<Option<i64>>,
     max_attempts: Option<Option<i64>>,
 ) -> rusqlite::Result<i64> {
+    if let Some(payload) = payload {
+        super::validate_json_payload(payload)?;
+    }
     // Verify exists first so we can return 0 cleanly without dynamic SQL gymnastics.
     let exists: bool = conn
         .query_row(
@@ -1590,6 +1595,7 @@ pub fn result_save(
     value: &str,
     ttl_s: i64,
 ) -> rusqlite::Result<i64> {
+    super::validate_json_payload(value)?;
     if ttl_s > 0 {
         conn.execute(
             "INSERT INTO _honker_results (job_id, value, expires_at)
@@ -1646,6 +1652,7 @@ pub fn stream_publish(
     key: Option<&str>,
     payload: &str,
 ) -> rusqlite::Result<i64> {
+    super::validate_json_payload(payload)?;
     // Stream row INSERT advances data_version on commit — same wake
     // path as enqueue. No synthetic notification row (see enqueue).
     let offset: i64 = conn.query_row(
@@ -1732,6 +1739,202 @@ pub fn stream_get_offset(conn: &Connection, consumer: &str, topic: &str) -> rusq
 
 fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use crate::{attach_honker_functions, bootstrap_honker_schema};
+
+    const VALID_JSON_PAYLOADS: [&str; 6] = ["{}", "[]", "42", "\"str\"", "true", "null"];
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        bootstrap_honker_schema(&conn).unwrap();
+        conn
+    }
+
+    fn assert_payload_error<T>(result: rusqlite::Result<T>) {
+        let err = result.err().expect("non-JSON payload must be rejected");
+        assert!(
+            err.to_string()
+                .contains("honker: payload must be valid JSON"),
+            "expected the JSON payload contract error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn enqueue_rejects_non_json_payload() {
+        let conn = db();
+        assert_payload_error(enqueue(&conn, "emails", "not json", None, None, 0, 3, None));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn enqueue_accepts_every_json_payload_shape() {
+        let conn = db();
+        for payload in VALID_JSON_PAYLOADS {
+            let id = enqueue(&conn, "emails", payload, None, None, 0, 3, None).unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_live WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
+    fn orm_select_enqueue_rejects_non_json_payload() {
+        let conn = db();
+        attach_honker_functions(&conn).unwrap();
+        let result = conn.query_row(
+            "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+            ["not json"],
+            |r| r.get::<_, i64>(0),
+        );
+        assert_payload_error(result);
+    }
+
+    #[test]
+    fn stream_publish_rejects_non_json_payload() {
+        let conn = db();
+        assert_payload_error(stream_publish(&conn, "orders", None, "not json"));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_stream", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn stream_publish_accepts_every_json_payload_shape() {
+        let conn = db();
+        for payload in VALID_JSON_PAYLOADS {
+            let offset = stream_publish(&conn, "orders", None, payload).unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_stream WHERE offset = ?1",
+                    [offset],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
+    fn result_save_rejects_non_json_payload() {
+        let conn = db();
+        assert_payload_error(result_save(&conn, 1, "not json", 0));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn result_save_accepts_every_json_payload_shape() {
+        let conn = db();
+        for (job_id, payload) in VALID_JSON_PAYLOADS.into_iter().enumerate() {
+            result_save(&conn, job_id as i64, payload, 0).unwrap();
+            assert_eq!(
+                result_get(&conn, job_id as i64).unwrap().as_deref(),
+                Some(payload)
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_register_rejects_non_json_payload() {
+        let conn = db();
+        assert_payload_error(scheduler_register(
+            &conn,
+            "nightly",
+            "backups",
+            "@every 1m",
+            "not json",
+            0,
+            None,
+            3,
+        ));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_scheduler_tasks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn scheduler_register_accepts_every_json_payload_shape() {
+        let conn = db();
+        for payload in VALID_JSON_PAYLOADS {
+            scheduler_register(
+                &conn,
+                "nightly",
+                "backups",
+                "@every 1m",
+                payload,
+                0,
+                None,
+                3,
+            )
+            .unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
+    fn scheduler_update_rejects_non_json_payload() {
+        let conn = db();
+        scheduler_register(&conn, "nightly", "backups", "@every 1m", "{}", 0, None, 3).unwrap();
+        assert_payload_error(scheduler_update(
+            &conn,
+            "nightly",
+            None,
+            Some("not json"),
+            None,
+            None,
+            None,
+        ));
+        let stored: String = conn
+            .query_row(
+                "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "{}", "rejected payload must not be written");
+    }
+
+    #[test]
+    fn scheduler_update_accepts_every_json_payload_shape() {
+        let conn = db();
+        scheduler_register(&conn, "nightly", "backups", "@every 1m", "{}", 0, None, 3).unwrap();
+        for payload in VALID_JSON_PAYLOADS {
+            scheduler_update(&conn, "nightly", None, Some(payload), None, None, None).unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
 }
 
 #[cfg(test)]
