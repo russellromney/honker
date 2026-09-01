@@ -5,14 +5,18 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import dev.honker.Database
 import dev.honker.HonkerInvalidOptionException
 import dev.honker.JsonCodec
 import dev.honker.WatcherBackend
 import java.nio.file.Path
 import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
@@ -103,6 +107,219 @@ class HonkerKotlinTest {
                 assertEquals("world", result.raw().await(stringCodec, Duration.ofSeconds(2)))
             }
         }
+    }
+
+    @Test
+    fun claimedJobDetailsCarryEveryCoreField() {
+        honker(tmp.resolve("job-fields.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { db ->
+            val queue = db.queue("full-fields", queueOptions {
+                visibilityTimeout(Duration.ofSeconds(300))
+                maxAttempts(5)
+            })
+            val runAt = unixNow(db) - 5
+
+            val enqueuedBefore = unixNow(db)
+            val id = queue.enqueueJson("""{"to":"alice@example.com"}""", enqueueOptions {
+                runAt(Instant.ofEpochSecond(runAt))
+                priority(7)
+                expires(Duration.ofSeconds(600))
+            })
+            val enqueuedAfter = unixNow(db)
+
+            val claimedBefore = unixNow(db)
+            val claimed = queue.claimOne("worker-1").orElseThrow()
+            val claimedAfter = unixNow(db)
+
+            val job = claimed.details()
+            assertEquals(id, job.id)
+            assertEquals("full-fields", job.queue)
+            assertEquals("""{"to":"alice@example.com"}""", job.payload)
+            assertEquals("""{"to":"alice@example.com"}""", job.payloadJson)
+            assertEquals("processing", job.state)
+            assertEquals(7, job.priority)
+            assertEquals(runAt, job.runAt)
+            assertEquals("worker-1", job.workerId)
+            assertEquals(1, job.attempts)
+            assertEquals(5, job.maxAttempts)
+            assertBetween(job.createdAt, enqueuedBefore, enqueuedAfter, "createdAt")
+            assertBetween(assertNotNull(job.expiresAt), enqueuedBefore + 600, enqueuedAfter + 600, "expiresAt")
+            assertBetween(
+                assertNotNull(job.claimExpiresAt),
+                claimedBefore + 300,
+                claimedAfter + 300,
+                "claimExpiresAt",
+            )
+
+            // Details are data only; the claim operations stay on the claimed job.
+            assertTrue(claimed.ack())
+        }
+    }
+
+    @Test
+    fun jobDetailsFollowPendingProcessingAndAckedStates() {
+        honker(tmp.resolve("snapshots.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { worker ->
+            honker(tmp.resolve("snapshots.db")) {
+                fallbackPollInterval(Duration.ofMillis(2))
+            }.use { reader ->
+                val writes = worker.queue("snapshots", queueOptions {
+                    visibilityTimeout(Duration.ofSeconds(120))
+                    maxAttempts(4)
+                })
+                val reads = reader.queue("snapshots")
+
+                val runAt = unixNow(worker) - 2
+                val enqueuedBefore = unixNow(worker)
+                val id = writes.enqueueJson("""{"n":1}""", enqueueOptions {
+                    runAt(Instant.ofEpochSecond(runAt))
+                    priority(2)
+                })
+                val enqueuedAfter = unixNow(worker)
+
+                val pending = assertNotNull(reads.jobDetails(id))
+                assertEquals(id, pending.id)
+                assertEquals("snapshots", pending.queue)
+                assertEquals("""{"n":1}""", pending.payload)
+                assertEquals("pending", pending.state)
+                assertEquals(2, pending.priority)
+                assertEquals(runAt, pending.runAt)
+                assertNull(pending.workerId, "a pending job has no worker")
+                assertNull(pending.claimExpiresAt, "a pending job has no claim deadline")
+                assertEquals(0, pending.attempts)
+                assertEquals(4, pending.maxAttempts)
+                assertBetween(pending.createdAt, enqueuedBefore, enqueuedAfter, "createdAt")
+                assertNull(pending.expiresAt, "no expires means no expiresAt")
+
+                val claimedBefore = unixNow(worker)
+                val claimed = writes.claimOne("worker-9").orElseThrow()
+                val claimedAfter = unixNow(worker)
+
+                val processing = assertNotNull(reads.jobDetails(id))
+                assertEquals(id, processing.id)
+                assertEquals("processing", processing.state)
+                assertEquals("worker-9", processing.workerId)
+                assertEquals(1, processing.attempts)
+                assertEquals(4, processing.maxAttempts)
+                assertEquals(2, processing.priority)
+                assertEquals(runAt, processing.runAt)
+                assertEquals(pending.createdAt, processing.createdAt)
+                assertBetween(
+                    assertNotNull(processing.claimExpiresAt),
+                    claimedBefore + 120,
+                    claimedAfter + 120,
+                    "claimExpiresAt",
+                )
+
+                assertTrue(claimed.ack())
+                assertNull(reads.jobDetails(id), "an ack'd job leaves no live row")
+            }
+        }
+    }
+
+    @Test
+    fun delayedJobDetailsReportItsRunAt() {
+        honker(tmp.resolve("delayed.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { db ->
+            val queue = db.queue("delayed-snapshot")
+
+            val before = unixNow(db)
+            val id = queue.enqueueJson("""{"later":true}""", enqueueOptions {
+                delay(Duration.ofSeconds(30))
+            })
+            val after = unixNow(db)
+
+            val details = assertNotNull(queue.jobDetails(id))
+            assertEquals("pending", details.state)
+            assertBetween(details.runAt, before + 30, after + 30, "runAt")
+            assertTrue(details.runAt > unixNow(db), "a delayed job runs in the future")
+            assertTrue(queue.claimOne("too-early").isEmpty, "a delayed job is not claimable yet")
+        }
+    }
+
+    @Test
+    fun typedQueueDetailsDecodePayloadAndKeepEveryField() {
+        honker(tmp.resolve("typed-fields.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { db ->
+            val typed = db.queue("typed-fields", queueOptions {
+                visibilityTimeout(Duration.ofSeconds(60))
+                maxAttempts(2)
+            }).typed(stringCodec)
+
+            val runAt = unixNow(db) - 1
+            val enqueuedBefore = unixNow(db)
+            val id = typed.enqueue("welcome", enqueueOptions {
+                runAt(Instant.ofEpochSecond(runAt))
+                priority(4)
+                expires(Duration.ofSeconds(900))
+            })
+            val enqueuedAfter = unixNow(db)
+
+            val pending = assertNotNull(typed.jobDetails(id))
+            assertEquals("welcome", pending.payload)
+            assertEquals(""""welcome"""", pending.payloadJson)
+            assertEquals("pending", pending.state)
+            assertEquals(4, pending.priority)
+            assertEquals(runAt, pending.runAt)
+            assertEquals(0, pending.attempts)
+            assertEquals(2, pending.maxAttempts)
+            assertNull(pending.workerId)
+            assertNull(pending.claimExpiresAt)
+            assertBetween(pending.createdAt, enqueuedBefore, enqueuedAfter, "createdAt")
+            assertBetween(assertNotNull(pending.expiresAt), enqueuedBefore + 900, enqueuedAfter + 900, "expiresAt")
+
+            val claimedBefore = unixNow(db)
+            val claimed = typed.claimOne("typed-worker").orElseThrow()
+            val claimedAfter = unixNow(db)
+
+            val job = claimed.details()
+            assertEquals(id, job.id)
+            assertEquals("typed-fields", job.queue)
+            assertEquals("welcome", job.payload)
+            assertEquals(""""welcome"""", job.payloadJson)
+            assertEquals("processing", job.state)
+            assertEquals(4, job.priority)
+            assertEquals(runAt, job.runAt)
+            assertEquals("typed-worker", job.workerId)
+            assertEquals(1, job.attempts)
+            assertEquals(2, job.maxAttempts)
+            assertBetween(job.createdAt, enqueuedBefore, enqueuedAfter, "createdAt")
+            assertBetween(assertNotNull(job.expiresAt), enqueuedBefore + 900, enqueuedAfter + 900, "expiresAt")
+            assertBetween(assertNotNull(job.claimExpiresAt), claimedBefore + 60, claimedAfter + 60, "claimExpiresAt")
+
+            assertTrue(claimed.ack())
+            assertNull(typed.jobDetails(id))
+        }
+    }
+
+    @Test
+    fun jobDetailsAreScopedToTheirQueueWhileDatabaseLookupIsGlobal() {
+        honker(tmp.resolve("scoped.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { db ->
+            val emails = db.queue("scoped-emails")
+            val reports = db.queue("scoped-reports")
+            val id = emails.enqueueJson("""{"to":"alice@example.com"}""")
+
+            assertNull(reports.jobDetails(id), "another queue must not see this job")
+            assertEquals("scoped-emails", assertNotNull(emails.jobDetails(id)).queue)
+            assertEquals("scoped-emails", assertNotNull(db.jobDetails(id)).queue)
+            assertNull(db.jobDetails(id + 10_000), "an unknown id has no snapshot")
+        }
+    }
+
+    private fun unixNow(db: Database): Long =
+        db.query("SELECT unixepoch() AS t").first().getLong("t")
+
+    private fun assertBetween(actual: Long, low: Long, high: Long, field: String) {
+        assertTrue(
+            actual in low..high,
+            "$field should be within [$low, $high] but was $actual",
+        )
     }
 
     @Test
