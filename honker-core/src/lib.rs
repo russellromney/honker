@@ -362,7 +362,8 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       attempts INTEGER NOT NULL DEFAULT 0,
       max_attempts INTEGER NOT NULL DEFAULT 3,
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-      expires_at INTEGER
+      expires_at INTEGER,
+      claimed_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS _honker_live_claim
       ON _honker_live(queue, priority DESC, run_at, id)
@@ -477,6 +478,29 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
             "ALTER TABLE _honker_scheduler_tasks ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3",
             [],
         ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Migration: `claimed_at` on _honker_live. When the current attempt
+    // started. `created_at` includes queue wait, `run_at` is when the
+    // job became ready, and `claim_expires_at` moves on every heartbeat
+    // — none of them answer "how long has this attempt been running".
+    //
+    // Nullable with no default: NULL until the first claim. A default
+    // would date every pre-existing row to migration time and read as a
+    // claim that never happened.
+    //
+    // CREATE TABLE IF NOT EXISTS does not add columns to a table that
+    // already exists, so an existing database only gets this here.
+    let has_claimed_at: bool = {
+        let mut stmt = conn
+            .prepare("SELECT 1 FROM pragma_table_info('_honker_live') WHERE name='claimed_at'")?;
+        stmt.query_row([], |_| Ok(true)).unwrap_or(false)
+    };
+    if !has_claimed_at {
+        match conn.execute("ALTER TABLE _honker_live ADD COLUMN claimed_at INTEGER", []) {
             Ok(_) => {}
             Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
             Err(e) => return Err(e.into()),
@@ -2305,6 +2329,78 @@ while True:
     }
 
     #[test]
+    fn bootstrap_pre_claimed_at_database_gains_the_column_and_keeps_its_rows() {
+        // A database created before `claimed_at` existed. The table is
+        // already there, so `CREATE TABLE IF NOT EXISTS` is a no-op and
+        // cannot add the column — only the ALTER TABLE migration can.
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE _honker_live (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              queue TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'pending',
+              priority INTEGER NOT NULL DEFAULT 0,
+              run_at INTEGER NOT NULL DEFAULT (unixepoch()),
+              worker_id TEXT,
+              claim_expires_at INTEGER,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              max_attempts INTEGER NOT NULL DEFAULT 3,
+              created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+              expires_at INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _honker_live (id, queue, payload, state, attempts, created_at)
+             VALUES (7, 'emails', '{\"legacy\":true}', 'processing', 2, 1000)",
+            [],
+        )
+        .unwrap();
+
+        bootstrap_honker_schema(&conn).unwrap();
+
+        let has: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('_honker_live') WHERE name='claimed_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(
+            has,
+            "claimed_at must be added to a table that already existed; \
+             CREATE TABLE IF NOT EXISTS cannot do it"
+        );
+
+        // The pre-existing row survives untouched, and its claimed_at is
+        // NULL. A default would date every legacy row to migration time
+        // and read as a claim that never happened.
+        let (payload, attempts, created_at, claimed_at): (String, i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT payload, attempts, created_at, claimed_at
+                   FROM _honker_live WHERE id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            payload, "{\"legacy\":true}",
+            "existing row data must survive"
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(created_at, 1000);
+        assert_eq!(
+            claimed_at, None,
+            "a migrated row must have claimed_at NULL, not a backfilled timestamp"
+        );
+
+        // Idempotent: the second bootstrap must not error on the column
+        // it just added.
+        bootstrap_honker_schema(&conn).unwrap();
+    }
+
+    #[test]
     fn bootstrap_honker_schema_creates_tables_and_index() {
         let conn = mem();
         bootstrap_honker_schema(&conn).unwrap();
@@ -2312,7 +2408,7 @@ while True:
         // Idempotent.
         bootstrap_honker_schema(&conn).unwrap();
 
-        // _honker_live has the 12 columns we expect (Python binding
+        // _honker_live has the 13 columns we expect (Python binding
         // and the extension have historically disagreed on _honker_dead
         // column count; this pins both).
         let live_cols: Vec<String> = conn
@@ -2322,8 +2418,9 @@ while True:
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(live_cols.len(), 12);
+        assert_eq!(live_cols.len(), 13);
         assert!(live_cols.contains(&"expires_at".to_string()));
+        assert!(live_cols.contains(&"claimed_at".to_string()));
 
         let dead_cols: Vec<String> = conn
             .prepare("SELECT name FROM pragma_table_info('_honker_dead')")

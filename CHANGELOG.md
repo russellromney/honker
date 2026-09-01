@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## Unreleased — `claimed_at` on `_honker_live`
+
+- New nullable `claimed_at INTEGER` column on `_honker_live`: when the
+  CURRENT attempt started. Nothing else could answer that.
+  `created_at` includes queue wait, `run_at` is when the job became
+  ready, and `claim_expires_at` moves on every heartbeat.
+- NULL until the first claim. Set to `unixepoch()` on every successful
+  claim and reclaim, so it tracks the current attempt and not the first
+  one. Cleared when `retry` returns the job to pending — a job waiting
+  in the queue is not running. `heartbeat()` deliberately leaves it
+  alone; refreshing it there would reintroduce exactly the blind spot
+  the column exists to fix.
+- Exposed in `claim_batch`'s RETURNING and JSON, and in `get_job`'s
+  JSON. Both are additive; no binding declares
+  `serde(deny_unknown_fields)`, so existing consumers ignore it until
+  they opt in.
+- Existing databases migrate with `ALTER TABLE ... ADD COLUMN`, matching
+  the `enabled` and `max_attempts` migrations, and tolerating the
+  "duplicate column" error when a concurrent bootstrap wins the race.
+  `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that
+  already exists, which is what the migration test pins.
+- Tests: NULL before first claim, first claim, heartbeat-does-not-move,
+  retry clears, reclaim resets, plus a migration test proving a
+  pre-column database gains the column and keeps its rows with
+  `claimed_at` NULL rather than a backfilled timestamp.
+
 ## Unreleased — Core SQLite error propagation
 
 - `honker-core` no longer discards SQLite errors in five lookups.
