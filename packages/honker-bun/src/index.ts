@@ -157,19 +157,35 @@ export interface ScheduleUpdate {
   maxAttempts?: number | null;
 }
 
-export interface JobRow {
-  id: number;
-  queue: string;
-  payload: string;
-  state: string;
-  priority: number;
-  run_at: number;
-  worker_id: string | null;
-  claim_expires_at: number | null;
-  attempts: number;
-  max_attempts: number;
-  created_at: number;
-  expires_at: number | null;
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+/** A live job is either waiting to run or held by a worker. */
+export type JobState = "pending" | "processing";
+
+/**
+ * A read-only job snapshot. Data only: no ack/retry/fail/heartbeat,
+ * because reading a row does not claim it.
+ *
+ * `TPayload` is a compile-time contract only. Honker stores payloads as
+ * opaque JSON and never validates their shape, so every process writing
+ * to the queue has to agree on the type.
+ */
+export interface JobSnapshot<TPayload = JsonValue> {
+  readonly id: number;
+  readonly queue: string;
+  readonly payload: TPayload;
+  readonly state: JobState;
+  readonly priority: number;
+  readonly runAt: number;
+  /** Null while the job is pending. */
+  readonly workerId: string | null;
+  /** Null while the job is pending. */
+  readonly claimExpiresAt: number | null;
+  readonly attempts: number;
+  readonly maxAttempts: number;
+  readonly createdAt: number;
+  readonly expiresAt: number | null;
 }
 
 export interface StreamEvent {
@@ -186,13 +202,39 @@ export interface Notification {
   payload: unknown;
 }
 
-interface RawJob {
+/** The wire shape honker_claim_batch and honker_get_job both return.
+ *  snake_case, payload still a JSON string. */
+interface RawJobRow {
   id: number;
   queue: string;
   payload: string;
-  worker_id: string;
+  state: JobState;
+  priority: number;
+  run_at: number;
+  worker_id: string | null;
+  claim_expires_at: number | null;
   attempts: number;
-  claim_expires_at: number;
+  max_attempts: number;
+  created_at: number;
+  expires_at: number | null;
+}
+
+/** Map the core's snake_case row onto the camelCase public snapshot. */
+function toSnapshot<TPayload>(row: RawJobRow): JobSnapshot<TPayload> {
+  return {
+    id: row.id,
+    queue: row.queue,
+    payload: JSON.parse(row.payload) as TPayload,
+    state: row.state,
+    priority: row.priority,
+    runAt: row.run_at,
+    workerId: row.worker_id ?? null,
+    claimExpiresAt: row.claim_expires_at ?? null,
+    attempts: row.attempts,
+    maxAttempts: row.max_attempts,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at ?? null,
+  };
 }
 
 interface RawStreamEvent {
@@ -305,21 +347,25 @@ export class Database {
     );
   }
 
-  /** Get a handle to a named queue. */
-  queue(name: string, opts: QueueOptions = {}): Queue {
-    return new Queue(this, name, {
+  /**
+   * Get a handle to a named queue. Pass a payload type to get typed
+   * claims and snapshots: `db.queue<EmailPayload>("emails")`. The type
+   * is a compile-time contract only; honker never checks payload shape.
+   */
+  queue<TPayload = JsonValue>(name: string, opts: QueueOptions = {}): Queue<TPayload> {
+    return new Queue<TPayload>(this, name, {
       visibilityTimeoutS: opts.visibilityTimeoutS ?? 300,
       maxAttempts: opts.maxAttempts ?? 3,
     });
   }
 
   /** Transactional side-effect delivery built on a reserved queue. */
-  outbox(
+  outbox<TPayload = JsonValue>(
     name: string,
-    delivery: (payload: unknown, job: Job) => unknown | Promise<unknown>,
+    delivery: (payload: TPayload, job: Job<TPayload>) => unknown | Promise<unknown>,
     opts: OutboxOptions = {},
-  ): Outbox {
-    return new Outbox(this, name, delivery, opts);
+  ): Outbox<TPayload> {
+    return new Outbox<TPayload>(this, name, delivery, opts);
   }
 
   /** Get a handle to a named stream. */
@@ -574,7 +620,13 @@ export class UpdateEvents {
   }
 }
 
-export class Queue {
+/**
+ * A named queue. `TPayload` is a compile-time contract for the JSON
+ * payload; honker never validates payload shape at runtime, in this
+ * binding or in the database, so every process writing to the queue has
+ * to agree on it.
+ */
+export class Queue<TPayload = JsonValue> {
   constructor(
     private readonly db: Database,
     public readonly name: string,
@@ -584,7 +636,7 @@ export class Queue {
   ) {}
 
   /** Enqueue a job. Payload is JSON-stringified. Returns the row id. */
-  enqueue(payload: unknown, opts: EnqueueOptions = {}): number {
+  enqueue(payload: TPayload, opts: EnqueueOptions = {}): number {
     const json = JSON.stringify(payload);
     const conn = opts.tx ? opts.tx.raw : this.db.raw;
     const row = conn
@@ -614,18 +666,18 @@ export class Queue {
   }
 
   /** Atomically claim up to n jobs. */
-  claimBatch(workerId: string, n: number): Job[] {
+  claimBatch(workerId: string, n: number): Job<TPayload>[] {
     const row = this.db.raw
       .query<{ v: string }, [string, string, number, number]>(
         "SELECT honker_claim_batch(?, ?, ?, ?) AS v",
       )
       .get(this.name, workerId, n, this.opts.visibilityTimeoutS)!;
-    const raw: RawJob[] = JSON.parse(row.v);
-    return raw.map((r) => new Job(this.db, r));
+    const raw: RawJobRow[] = JSON.parse(row.v);
+    return raw.map((r) => new Job<TPayload>(this.db, r));
   }
 
   /** Claim a single job or return null. */
-  claimOne(workerId: string): Job | null {
+  claimOne(workerId: string): Job<TPayload> | null {
     return this.claimBatch(workerId, 1)[0] ?? null;
   }
 
@@ -655,13 +707,17 @@ export class Queue {
     return row.v > 0;
   }
 
-  /** Read a single job row by id. Returns the row or null on miss. */
-  getJob(jobId: number): JobRow | null {
+  /**
+   * Read a single job row by id. Returns the snapshot or null on miss
+   * (ack'd, dead'd, or never existed). Pure read: a snapshot carries no
+   * claim methods.
+   */
+  getJob(jobId: number): JobSnapshot<TPayload> | null {
     const row = this.db.raw
       .query<{ v: string }, [number]>("SELECT honker_get_job(?) AS v")
       .get(jobId)!;
     if (!row.v) return null;
-    return JSON.parse(row.v) as JobRow;
+    return toSnapshot<TPayload>(JSON.parse(row.v) as RawJobRow);
   }
 
   /** Sweep expired claim rows back to pending. Returns rows touched. */
@@ -690,26 +746,26 @@ export class Queue {
    * Returns a ClaimWaker that waits on DB updates or the next claim
    * deadline, with a fallback poll.
    */
-  claimWaker(opts: { idlePollS?: number | null; pollMs?: number | null } = {}): ClaimWaker {
+  claimWaker(opts: { idlePollS?: number | null; pollMs?: number | null } = {}): ClaimWaker<TPayload> {
     const idlePollMs =
       opts.idlePollS === null
         ? null
         : opts.idlePollS != null
           ? Math.max(0, opts.idlePollS * 1000)
           : opts.pollMs ?? 5000;
-    return new ClaimWaker(this, idlePollMs);
+    return new ClaimWaker<TPayload>(this, idlePollMs);
   }
 }
 
-export class Outbox {
-  readonly queue: Queue;
+export class Outbox<TPayload = JsonValue> {
+  readonly queue: Queue<TPayload>;
   readonly maxAttempts: number;
   readonly baseBackoffS: number;
 
   constructor(
     private readonly db: Database,
     public readonly name: string,
-    private readonly delivery: (payload: unknown, job: Job) => unknown | Promise<unknown>,
+    private readonly delivery: (payload: TPayload, job: Job<TPayload>) => unknown | Promise<unknown>,
     opts: OutboxOptions = {},
   ) {
     if (typeof delivery !== "function") {
@@ -717,17 +773,17 @@ export class Outbox {
     }
     this.maxAttempts = opts.maxAttempts ?? 5;
     this.baseBackoffS = opts.baseBackoffS ?? 5;
-    this.queue = db.queue(`_outbox:${name}`, {
+    this.queue = db.queue<TPayload>(`_outbox:${name}`, {
       visibilityTimeoutS: opts.visibilityTimeoutS ?? 60,
       maxAttempts: this.maxAttempts,
     });
   }
 
-  enqueue(payload: unknown, opts: EnqueueOptions = {}): number {
+  enqueue(payload: TPayload, opts: EnqueueOptions = {}): number {
     return this.queue.enqueue(payload, opts);
   }
 
-  enqueueTx(tx: Transaction, payload: unknown, opts: EnqueueOptions = {}): number {
+  enqueueTx(tx: Transaction, payload: TPayload, opts: EnqueueOptions = {}): number {
     return this.queue.enqueue(payload, { ...opts, tx });
   }
 
@@ -762,23 +818,49 @@ export class Outbox {
   }
 }
 
-/** A claimed unit of work. */
-export class Job {
+/**
+ * A claimed unit of work. Carries every field the core returns, plus
+ * the claim methods ack, retry, fail, and heartbeat.
+ *
+ * `TPayload` is a compile-time contract only; honker never validates
+ * payload shape.
+ */
+export class Job<TPayload = JsonValue> {
   readonly id: number;
   readonly queue: string;
-  readonly payload: unknown;
+  readonly payload: TPayload;
+  /** Always "processing" for a claimed job. */
+  readonly state: "processing";
+  readonly priority: number;
+  readonly runAt: number;
   readonly workerId: string;
+  readonly claimExpiresAt: number;
   readonly attempts: number;
+  readonly maxAttempts: number;
+  readonly createdAt: number;
+  readonly expiresAt: number | null;
 
   constructor(
     private readonly db: Database,
-    row: RawJob,
+    row: RawJobRow,
   ) {
+    // A claimed row always carries the claim columns. A row without
+    // them is a core bug worth throwing on, not one to paper over.
+    if (row.worker_id == null || row.claim_expires_at == null) {
+      throw new Error(`claimed job ${row.id} has no worker_id/claim_expires_at`);
+    }
     this.id = row.id;
     this.queue = row.queue;
-    this.payload = JSON.parse(row.payload);
+    this.payload = JSON.parse(row.payload) as TPayload;
+    this.state = "processing";
+    this.priority = row.priority;
+    this.runAt = row.run_at;
     this.workerId = row.worker_id;
+    this.claimExpiresAt = row.claim_expires_at;
     this.attempts = row.attempts;
+    this.maxAttempts = row.max_attempts;
+    this.createdAt = row.created_at;
+    this.expiresAt = row.expires_at ?? null;
   }
 
   /** DELETE the row if the claim is still valid. */
@@ -836,19 +918,19 @@ export class Job {
  * Claim waker. Call `next(workerId)` to block on an incoming job;
  * poll-based (Pass 1).
  */
-export class ClaimWaker {
+export class ClaimWaker<TPayload = JsonValue> {
   private stopped = false;
   private readonly updates: UpdateEvents;
 
   constructor(
-    private readonly queue: Queue,
+    private readonly queue: Queue<TPayload>,
     private readonly idlePollMs: number | null,
   ) {
     this.updates = queue.dbHandle().updateEvents();
   }
 
   /** Claim one job without blocking. Null if the queue is empty. */
-  tryNext(workerId: string): Job | null {
+  tryNext(workerId: string): Job<TPayload> | null {
     return this.queue.claimOne(workerId);
   }
 
@@ -859,7 +941,7 @@ export class ClaimWaker {
   async next(
     workerId: string,
     opts: { signal?: AbortSignal } = {},
-  ): Promise<Job | null> {
+  ): Promise<Job<TPayload> | null> {
     while (!this.stopped && !opts.signal?.aborted) {
       const job = this.queue.claimOne(workerId);
       if (job) return job;
