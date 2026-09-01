@@ -19,6 +19,7 @@
 //! tested once and inherited by every consumer.
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
@@ -863,7 +864,7 @@ pub fn retry(
                 ))
             },
         )
-        .ok();
+        .optional()?;
     let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
     else {
         return Ok(0);
@@ -908,7 +909,33 @@ pub fn retry(
 
 /// Unconditionally move the claim to `_honker_dead` with the given
 /// error. Returns 1 if moved, 0 if not our claim.
+///
+/// The DELETE uses RETURNING, so the row is already gone by the time
+/// the row mapper decodes it. A decode failure there — a non-integer
+/// `attempts`, say — would otherwise leave the job in neither
+/// `_honker_live` nor `_honker_dead`: silent job loss. Verified: an
+/// error out of the mapper alone does NOT undo the DELETE. So the
+/// delete-decode-insert runs inside a SAVEPOINT and any error rolls
+/// it back before propagating. SAVEPOINT rather than BEGIN/COMMIT so
+/// we nest cleanly when the caller already holds a transaction.
 pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rusqlite::Result<i64> {
+    conn.execute_batch("SAVEPOINT honker_fail")?;
+    let result = fail_inner(conn, job_id, worker_id, error);
+    if result.is_err() {
+        let _ =
+            conn.execute_batch("ROLLBACK TO SAVEPOINT honker_fail; RELEASE SAVEPOINT honker_fail");
+        return result;
+    }
+    conn.execute_batch("RELEASE SAVEPOINT honker_fail")?;
+    result
+}
+
+fn fail_inner(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    error: &str,
+) -> rusqlite::Result<i64> {
     #[allow(clippy::type_complexity)]
     let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
         .query_row(
@@ -931,7 +958,7 @@ pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rus
                 ))
             },
         )
-        .ok();
+        .optional()?;
     let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
     else {
         return Ok(0);
@@ -1013,7 +1040,7 @@ pub fn get_job(conn: &Connection, job_id: i64) -> rusqlite::Result<String> {
                 ))
             },
         )
-        .ok();
+        .optional()?;
     let Some((
         id,
         queue,
@@ -1143,7 +1170,7 @@ pub fn lock_acquire(
             rusqlite::params![name],
             |r| r.get(0),
         )
-        .ok();
+        .optional()?;
     Ok(if current.as_deref() == Some(owner) {
         1
     } else {
@@ -1619,7 +1646,7 @@ pub fn result_get(conn: &Connection, job_id: i64) -> rusqlite::Result<Option<Str
             rusqlite::params![job_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .ok();
+        .optional()?;
     match row {
         None => Ok(None),
         Some((_, Some(exp))) if exp <= now_unix(conn)? => Ok(None),
@@ -1887,5 +1914,288 @@ mod real_arg_tests {
         assert!(probe(f64::NAN).is_err(), "NaN must reject");
         // Negative zero is whole and must coerce to 0, not error.
         assert!(probe(-0.0).is_ok(), "-0.0 must pass");
+    }
+}
+
+// Five lookups used to end in `.ok()`, which throws away every error
+// and not just QueryReturnedNoRows. A real SQLite error read as "no
+// row" turns a broken database into a silent no-op. Each site gets two
+// tests: a genuine miss must still be a miss, and a broken stored type
+// must reach the caller.
+//
+// `attempts` is declared INTEGER but SQLite is dynamically typed, so
+// writing non-numeric text into it sticks. That is the cheapest way to
+// make the row mapper fail on a row that really exists.
+#[cfg(test)]
+mod optional_error_tests {
+    use super::{fail, get_job, lock_acquire, result_get, retry};
+    use crate::{attach_honker_functions, bootstrap_honker_schema};
+    use rusqlite::Connection;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        attach_honker_functions(&conn).unwrap();
+        bootstrap_honker_schema(&conn).unwrap();
+        conn
+    }
+
+    /// Enqueue one job on `emails` and claim it for `w1`.
+    fn claimed_job(conn: &Connection) -> i64 {
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let _: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('emails', 'w1', 8, 300)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        id
+    }
+
+    fn corrupt_attempts(conn: &Connection, id: i64) {
+        conn.execute(
+            "UPDATE _honker_live SET attempts = 'not-a-number' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    }
+
+    fn live_count(conn: &Connection, id: i64) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM _honker_live WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn dead_count(conn: &Connection, id: i64) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM _honker_dead WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // ---------------- retry ----------------
+
+    #[test]
+    fn retry_on_a_missing_job_is_still_a_miss() {
+        let conn = db();
+        assert_eq!(
+            retry(&conn, 999_999, "w1", 10, "boom").unwrap(),
+            0,
+            "a job id that was never enqueued must return 0, not an error"
+        );
+    }
+
+    #[test]
+    fn retry_surfaces_a_decode_error() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        corrupt_attempts(&conn, id);
+        let err = retry(&conn, id, "w1", 10, "boom")
+            .expect_err("a non-integer attempts column must reach the caller, not read as a miss");
+        assert!(
+            err.to_string().contains("attempts"),
+            "expected the error to name the bad column, got: {err}"
+        );
+    }
+
+    // ---------------- fail ----------------
+
+    #[test]
+    fn fail_on_a_missing_job_is_still_a_miss() {
+        let conn = db();
+        assert_eq!(
+            fail(&conn, 999_999, "w1", "boom").unwrap(),
+            0,
+            "a job id that was never enqueued must return 0, not an error"
+        );
+    }
+
+    // The one that loses data. fail() DELETEs with RETURNING, so the row
+    // is already gone when the mapper decodes it. Propagating the error
+    // is not enough on its own: measured, the bare DELETE stays
+    // committed and the job ends up in neither table. The SAVEPOINT in
+    // fail() is what puts it back. Assert the row, not just the error.
+    #[test]
+    fn fail_surfaces_a_decode_error_and_rolls_the_delete_back() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        corrupt_attempts(&conn, id);
+
+        let err = fail(&conn, id, "w1", "boom")
+            .expect_err("a non-integer attempts column must reach the caller, not read as a miss");
+        assert!(
+            err.to_string().contains("attempts"),
+            "expected the error to name the bad column, got: {err}"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "the DELETE must roll back: the job has to stay in _honker_live, \
+             not vanish from both tables"
+        );
+        assert_eq!(
+            dead_count(&conn, id),
+            0,
+            "the job must not be half-moved into _honker_dead"
+        );
+    }
+
+    // The savepoint must not disturb the path that works.
+    #[test]
+    fn fail_still_moves_a_healthy_job_to_dead() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        assert_eq!(fail(&conn, id, "w1", "boom").unwrap(), 1);
+        assert_eq!(live_count(&conn, id), 0, "the live row must be gone");
+        assert_eq!(dead_count(&conn, id), 1, "the dead row must be written");
+        let last_error: String = conn
+            .query_row(
+                "SELECT last_error FROM _honker_dead WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_error, "boom");
+    }
+
+    // fail() opens a SAVEPOINT. Nesting inside a caller's transaction
+    // has to keep working, and the rollback must undo only fail()'s own
+    // work, not the caller's.
+    #[test]
+    fn fail_rolls_back_only_its_own_work_inside_an_outer_transaction() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        corrupt_attempts(&conn, id);
+
+        conn.execute_batch("BEGIN").unwrap();
+        conn.execute(
+            "INSERT INTO _honker_results (job_id, value) VALUES (4242, 'caller-work')",
+            [],
+        )
+        .unwrap();
+        let err = fail(&conn, id, "w1", "boom").expect_err("the decode error must still propagate");
+        assert!(err.to_string().contains("attempts"), "got: {err}");
+        conn.execute_batch("COMMIT").unwrap();
+
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "fail()'s DELETE must be rolled back inside an outer transaction too"
+        );
+        let caller_row: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM _honker_results WHERE job_id = 4242",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            caller_row, 1,
+            "ROLLBACK TO SAVEPOINT must not discard work the caller did before fail()"
+        );
+    }
+
+    // ---------------- get_job ----------------
+
+    #[test]
+    fn get_job_on_a_missing_job_is_still_a_miss() {
+        let conn = db();
+        assert_eq!(
+            get_job(&conn, 999_999).unwrap(),
+            "",
+            "a job id that was never enqueued must return the empty string"
+        );
+    }
+
+    #[test]
+    fn get_job_surfaces_a_decode_error() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        corrupt_attempts(&conn, id);
+        let err = get_job(&conn, id).expect_err(
+            "a non-integer attempts column must reach the caller, not read as a missing job",
+        );
+        assert!(
+            err.to_string().contains("attempts"),
+            "expected the error to name the bad column, got: {err}"
+        );
+    }
+
+    // ---------------- lock_acquire ----------------
+
+    #[test]
+    fn lock_acquire_grants_then_refuses_without_erroring() {
+        let conn = db();
+        assert_eq!(
+            lock_acquire(&conn, "leader", "a", 300).unwrap(),
+            1,
+            "an unheld lock must be granted"
+        );
+        assert_eq!(
+            lock_acquire(&conn, "leader", "b", 300).unwrap(),
+            0,
+            "a lock held by someone else must return 0, not an error"
+        );
+    }
+
+    // `owner` is declared TEXT, but a BLOB keeps its type under TEXT
+    // affinity, so this is a row that exists and cannot be decoded as a
+    // String. Under `.ok()` this returned 0 — indistinguishable from
+    // "another process holds the lock", so no leader could ever start.
+    #[test]
+    fn lock_acquire_surfaces_a_decode_error() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO _honker_locks (name, owner, expires_at)
+             VALUES ('leader', x'ff', unixepoch() + 300)",
+            [],
+        )
+        .unwrap();
+        let err = lock_acquire(&conn, "leader", "a", 300)
+            .expect_err("an undecodable owner must reach the caller, not read as 'not ours'");
+        assert!(
+            err.to_string().contains("owner"),
+            "expected the error to name the bad column, got: {err}"
+        );
+    }
+
+    // ---------------- result_get ----------------
+
+    #[test]
+    fn result_get_on_a_missing_result_is_still_a_miss() {
+        let conn = db();
+        assert_eq!(
+            result_get(&conn, 999_999).unwrap(),
+            None,
+            "a job with no stored result must return None, not an error"
+        );
+    }
+
+    #[test]
+    fn result_get_surfaces_a_decode_error() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO _honker_results (job_id, value, expires_at)
+             VALUES (7, 'ok', 'not-a-timestamp')",
+            [],
+        )
+        .unwrap();
+        let err = result_get(&conn, 7)
+            .expect_err("a non-integer expires_at must reach the caller, not read as a miss");
+        assert!(
+            err.to_string().contains("expires_at"),
+            "expected the error to name the bad column, got: {err}"
+        );
     }
 }

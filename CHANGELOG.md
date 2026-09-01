@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## Unreleased — Core SQLite error propagation
+
+- `honker-core` no longer discards SQLite errors in five lookups.
+  `retry`, `fail`, `get_job`, `lock_acquire`, and `result_get` ended in
+  `.ok()`, which mapped every error to "no row", not just
+  `QueryReturnedNoRows`. A broken stored value turned into a silent
+  no-op: `retry`/`fail` reported "not our claim", `get_job` reported a
+  missing job, `lock_acquire` reported the lock as held so no leader
+  could ever start. All five now use `OptionalExtension::optional()?`.
+- `fail()` could lose a job outright. It runs
+  `DELETE FROM _honker_live ... RETURNING`, so the row is already gone
+  when the row mapper decodes it. Measured: propagating the mapper's
+  error does **not** undo that DELETE — the job ended up in neither
+  `_honker_live` nor `_honker_dead`. The delete-decode-insert now runs
+  inside a `SAVEPOINT honker_fail` that rolls back on any error, so a
+  failed `fail()` leaves the job claimable instead of destroyed.
+  SAVEPOINT rather than BEGIN/COMMIT so it nests under a caller's
+  transaction and rolls back only its own work.
+- 12 regression tests: a genuine miss and a broken stored type at each
+  of the five sites, plus the live-row-survives assertion for `fail()`
+  standalone and inside an outer transaction.
+
 ## 2026-08-27 — Node 0.5.1
 
 - Node `@russellthehippo/honker-node`: 0.5.1, with the four
