@@ -106,6 +106,15 @@ short-lived connections and multiple worker processes. Constructing
 explicit checkpoint that fell behind retention throws
 `QueueEventOffsetExpiredError` instead of silently skipping activity.
 
+Size the feed deliberately. `retentionTarget` counts events, not bytes, and
+there is no time-based expiry: a retained event stays until `retentionTarget`
+newer ones push it out, which on a quiet feed can be a long time. With
+`includePayload` on, every retained event carries a full copy of its job
+payload, so the feed costs roughly `retentionTarget` x payload size on top of
+the queue itself — and unlike the job row, that copy outlives the job. The
+maximum is 1,000,000, which with large payloads is gigabytes in the same SQLite
+file as your hot queue. The default of 10,000 without payloads is small.
+
 For familiar live `EventEmitter` ergonomics, use a listener backed by the same
 durable, cross-process feed. It starts at the latest event unless configured
 otherwise:

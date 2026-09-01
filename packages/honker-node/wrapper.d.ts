@@ -77,7 +77,19 @@ export interface QueueEventsOptions {
 
 export interface QueueEventsConfig {
   enabled?: boolean
+  /**
+   * Approximate number of events to retain. Counts events, not bytes, and has
+   * no time-based expiry: an event stays until `retentionTarget` newer ones
+   * push it out. Budget for it — with `includePayload` on, the feed costs
+   * roughly `retentionTarget` x payload size on top of the queue, in the same
+   * SQLite file. 1 to 1,000,000; defaults to 10,000.
+   */
   retentionTarget?: number
+  /**
+   * Store a copy of each job's payload on its events. Feed-wide: enabling it
+   * to inspect one queue captures payloads for every queue. The copy outlives
+   * the job row, which is deleted on completion. Defaults to false.
+   */
   includePayload?: boolean
 }
 
