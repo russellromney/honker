@@ -73,6 +73,198 @@ class HonkerJvmTest {
     }
 
     @Test
+    void claimedJobCarriesEveryFieldCoreReturns() {
+        try (Database db = open()) {
+            Queue q = db.queue("full-fields", QueueOptions.builder()
+                .visibilityTimeout(Duration.ofSeconds(300))
+                .maxAttempts(5)
+                .build());
+            long runAt = unixNow(db) - 5;
+
+            long enqueuedBefore = unixNow(db);
+            long id = q.enqueue("{\"to\":\"alice@example.com\"}", EnqueueOptions.builder()
+                .runAt(Instant.ofEpochSecond(runAt))
+                .priority(7)
+                .expires(Duration.ofSeconds(600))
+                .build());
+            long enqueuedAfter = unixNow(db);
+
+            long claimedBefore = unixNow(db);
+            Job job = q.claimOne("worker-1").orElseThrow();
+            long claimedAfter = unixNow(db);
+
+            assertEquals(id, job.id());
+            assertEquals("full-fields", job.queue());
+            assertEquals("{\"to\":\"alice@example.com\"}", job.payloadJson());
+            assertEquals("processing", job.state());
+            assertEquals(7, job.priority());
+            assertEquals(runAt, job.runAt());
+            assertEquals("worker-1", job.workerId());
+            assertEquals(1, job.attempts());
+            assertEquals(5, job.maxAttempts());
+            assertBetween(job.createdAt(), enqueuedBefore, enqueuedAfter, "createdAt");
+            assertNotNull(job.expiresAt(), "expiresAt should be set by expires");
+            assertBetween(job.expiresAt(), enqueuedBefore + 600, enqueuedAfter + 600, "expiresAt");
+            assertBetween(job.claimExpiresAt(), claimedBefore + 300, claimedAfter + 300, "claimExpiresAt");
+
+            // The claimed Job keeps the claim operations; the snapshot is data only.
+            assertEquals(job.id(), job.snapshot().id());
+            assertEquals("processing", job.snapshot().state());
+            assertTrue(job.ack());
+        }
+    }
+
+    @Test
+    void jobSnapshotsFollowPendingProcessingAndAckedStates() {
+        try (Database worker = open(); Database reader = open()) {
+            Queue writes = worker.queue("snapshots", QueueOptions.builder()
+                .visibilityTimeout(Duration.ofSeconds(120))
+                .maxAttempts(4)
+                .build());
+            Queue reads = reader.queue("snapshots");
+
+            long runAt = unixNow(worker) - 2;
+            long enqueuedBefore = unixNow(worker);
+            long id = writes.enqueue("{\"n\":1}", EnqueueOptions.builder()
+                .runAt(Instant.ofEpochSecond(runAt))
+                .priority(2)
+                .build());
+            long enqueuedAfter = unixNow(worker);
+
+            JobSnapshot pending = reads.getJob(id).orElseThrow();
+            assertEquals(id, pending.id());
+            assertEquals("snapshots", pending.queue());
+            assertEquals("{\"n\":1}", pending.payloadJson());
+            assertEquals("pending", pending.state());
+            assertEquals(2, pending.priority());
+            assertEquals(runAt, pending.runAt());
+            assertNull(pending.workerId(), "a pending job has no worker");
+            assertNull(pending.claimExpiresAt(), "a pending job has no claim deadline");
+            assertEquals(0, pending.attempts());
+            assertEquals(4, pending.maxAttempts());
+            assertBetween(pending.createdAt(), enqueuedBefore, enqueuedAfter, "createdAt");
+            assertNull(pending.expiresAt(), "no expires means no expiresAt");
+
+            long claimedBefore = unixNow(worker);
+            Job claimed = writes.claimOne("worker-9").orElseThrow();
+            long claimedAfter = unixNow(worker);
+
+            JobSnapshot processing = reads.getJob(id).orElseThrow();
+            assertEquals(id, processing.id());
+            assertEquals("processing", processing.state());
+            assertEquals("worker-9", processing.workerId());
+            assertEquals(1, processing.attempts());
+            assertEquals(4, processing.maxAttempts());
+            assertEquals(2, processing.priority());
+            assertEquals(runAt, processing.runAt());
+            assertEquals(pending.createdAt(), processing.createdAt());
+            assertNotNull(processing.claimExpiresAt(), "a claimed job has a claim deadline");
+            assertBetween(processing.claimExpiresAt(), claimedBefore + 120, claimedAfter + 120, "claimExpiresAt");
+
+            assertTrue(claimed.ack());
+            assertTrue(reads.getJob(id).isEmpty(), "an ack'd job leaves no live row");
+        }
+    }
+
+    @Test
+    void delayedJobSnapshotReportsItsRunAt() {
+        try (Database db = open()) {
+            Queue q = db.queue("delayed-snapshot");
+
+            long before = unixNow(db);
+            long id = q.enqueue("{\"later\":true}", EnqueueOptions.builder()
+                .delay(Duration.ofSeconds(30))
+                .build());
+            long after = unixNow(db);
+
+            JobSnapshot snapshot = q.getJob(id).orElseThrow();
+            assertEquals("pending", snapshot.state());
+            assertBetween(snapshot.runAt(), before + 30, after + 30, "runAt");
+            assertTrue(snapshot.runAt() > unixNow(db), "a delayed job runs in the future");
+            assertTrue(q.claimOne("too-early").isEmpty(), "a delayed job is not claimable yet");
+        }
+    }
+
+    @Test
+    void typedQueueCarriesEveryFieldOnJobsAndSnapshots() {
+        JsonCodec<String> quoted = new JsonCodec<>() {
+            @Override
+            public String encode(String value) {
+                return "\"" + value + "\"";
+            }
+
+            @Override
+            public String decode(String json) {
+                return json.substring(1, json.length() - 1);
+            }
+        };
+
+        try (Database db = open()) {
+            Queue raw = db.queue("typed-fields", QueueOptions.builder()
+                .visibilityTimeout(Duration.ofSeconds(60))
+                .maxAttempts(2)
+                .build());
+            TypedQueue<String> typed = raw.typed(quoted);
+
+            long runAt = unixNow(db) - 1;
+            long enqueuedBefore = unixNow(db);
+            long id = typed.enqueue("welcome", EnqueueOptions.builder()
+                .runAt(Instant.ofEpochSecond(runAt))
+                .priority(4)
+                .expires(Duration.ofSeconds(900))
+                .build());
+            long enqueuedAfter = unixNow(db);
+
+            TypedJobSnapshot<String> pending = typed.getJob(id).orElseThrow();
+            assertEquals("welcome", pending.payload());
+            assertEquals("pending", pending.state());
+            assertEquals(4, pending.priority());
+            assertEquals(runAt, pending.runAt());
+            assertEquals(0, pending.attempts());
+            assertEquals(2, pending.maxAttempts());
+            assertNull(pending.workerId());
+            assertNull(pending.claimExpiresAt());
+            assertBetween(pending.createdAt(), enqueuedBefore, enqueuedAfter, "createdAt");
+            assertBetween(pending.expiresAt(), enqueuedBefore + 900, enqueuedAfter + 900, "expiresAt");
+
+            long claimedBefore = unixNow(db);
+            TypedJob<String> job = typed.claimOne("typed-worker").orElseThrow();
+            long claimedAfter = unixNow(db);
+
+            assertEquals(id, job.id());
+            assertEquals("typed-fields", job.queue());
+            assertEquals("welcome", job.payload());
+            assertEquals("\"welcome\"", job.payloadJson());
+            assertEquals("processing", job.state());
+            assertEquals(4, job.priority());
+            assertEquals(runAt, job.runAt());
+            assertEquals("typed-worker", job.workerId());
+            assertEquals(1, job.attempts());
+            assertEquals(2, job.maxAttempts());
+            assertBetween(job.createdAt(), enqueuedBefore, enqueuedAfter, "createdAt");
+            assertBetween(job.expiresAt(), enqueuedBefore + 900, enqueuedAfter + 900, "expiresAt");
+            assertBetween(job.claimExpiresAt(), claimedBefore + 60, claimedAfter + 60, "claimExpiresAt");
+
+            assertTrue(job.ack());
+            assertTrue(typed.getJob(id).isEmpty());
+        }
+    }
+
+    @Test
+    void getJobIsScopedToItsQueueWhileDatabaseLookupIsGlobal() {
+        try (Database db = open()) {
+            Queue emails = db.queue("scoped-emails");
+            Queue reports = db.queue("scoped-reports");
+            long id = emails.enqueue("{\"to\":\"alice@example.com\"}");
+
+            assertTrue(reports.getJob(id).isEmpty(), "another queue must not see this job");
+            assertEquals("scoped-emails", emails.getJob(id).orElseThrow().queue());
+            assertEquals("scoped-emails", db.getJob(id).orElseThrow().queue());
+            assertTrue(db.getJob(id + 10_000).isEmpty(), "an unknown id has no snapshot");
+        }
+    }
+
+    @Test
     void queueNegativePathsAndBatchOperations() {
         try (Database db = open()) {
             Queue q = db.queue("batch", QueueOptions.builder()
@@ -1123,6 +1315,17 @@ class HonkerJvmTest {
                 assertTrue(seen.await(3, TimeUnit.SECONDS), "worker should wake at run_at deadline");
             }
         }
+    }
+
+    private static long unixNow(Database db) {
+        return db.query("SELECT unixepoch() AS t").get(0).getLong("t");
+    }
+
+    private static void assertBetween(long actual, long low, long high, String field) {
+        assertTrue(
+            actual >= low && actual <= high,
+            () -> field + " should be within [" + low + ", " + high + "] but was " + actual
+        );
     }
 
     private Database open() {

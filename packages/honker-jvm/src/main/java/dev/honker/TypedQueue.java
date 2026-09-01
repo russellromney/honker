@@ -36,6 +36,14 @@ public final class TypedQueue<T> {
         return queue.enqueue(tx, codec.encode(payload), options);
     }
 
+    /**
+     * A read-only snapshot of one live job in this queue with its payload
+     * decoded, or empty when the job is gone or belongs to another queue.
+     */
+    public Optional<TypedJobSnapshot<T>> getJob(long jobId) {
+        return queue.getJob(jobId).map(job -> TypedJobSnapshot.of(job, codec));
+    }
+
     public Optional<TypedJob<T>> claimOne(String workerId) {
         return queue.claimOne(workerId).map(job -> new TypedJob<>(job, codec));
     }
