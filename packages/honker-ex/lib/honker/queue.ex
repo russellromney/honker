@@ -7,7 +7,7 @@ defmodule Honker.Queue do
       {:ok, job} = Honker.Queue.claim_one(db, "emails", "worker-1")
   """
 
-  alias Honker.{Database, Job, Transaction}
+  alias Honker.{Database, Job, JobSnapshot, Transaction}
 
   @doc """
   Enqueue a job. `payload` is any term — it's JSON-encoded on the way
@@ -127,13 +127,17 @@ defmodule Honker.Queue do
   end
 
   @doc """
-  Read a single job row by id. Returns `{:ok, map}` with the row
-  fields, or `{:ok, nil}` on miss.
+  Read a single job row by id. Returns `{:ok, %Honker.JobSnapshot{}}`,
+  or `{:ok, nil}` when the job has been ack'd, dead'd, cancelled, or
+  never existed.
+
+  The lookup is by id alone. Ids are globally unique but not scoped to
+  a queue, so a foreign id returns that queue's row (#134).
   """
   def get_job(%Honker.Database{conn: conn}, job_id) do
     case Honker.query_first(conn, "SELECT honker_get_job(?1)", [job_id]) do
       {:ok, [raw]} when is_binary(raw) and byte_size(raw) > 0 ->
-        {:ok, Jason.decode!(raw)}
+        {:ok, raw |> Jason.decode!() |> JobSnapshot.from_row()}
 
       {:ok, _} ->
         {:ok, nil}
@@ -148,8 +152,15 @@ defmodule Honker.Queue do
       id: row["id"],
       queue: row["queue"],
       payload: Jason.decode!(row["payload"]),
+      state: row["state"],
+      priority: row["priority"],
+      run_at: row["run_at"],
       worker_id: row["worker_id"],
-      attempts: row["attempts"]
+      claim_expires_at: row["claim_expires_at"],
+      attempts: row["attempts"],
+      max_attempts: row["max_attempts"],
+      created_at: row["created_at"],
+      expires_at: row["expires_at"]
     }
   end
 end
