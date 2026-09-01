@@ -694,7 +694,7 @@ jobs:
           python -m pytest tests/test_ruby_python_interop.py -q --tb=short
 
   jvm:
-    name: jvm · honker + documented ORM recipes
+    name: jvm · honker + kotlin + documented ORM recipes
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
@@ -732,6 +732,14 @@ jobs:
         #
         # The other 44 tests gate, and so do the ORM recipes below.
         run: mvn -B test -Dtest='!HonkerJvmTest#childJvmKernelListenerWakesWhenParentNotifies'
+      - name: Run honker-kotlin tests
+        # The Kotlin wrappers compile and run against the dev.honker:honker
+        # jar installed above, so this gates the Kotlin surface on the same
+        # extension build.
+        working-directory: packages/honker-kotlin
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+        run: mvn -B test
       - name: ORM · JVM (JDBC, Hibernate, jOOQ)
         working-directory: scripts/proof/orm/jvm
         env:
