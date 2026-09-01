@@ -28,8 +28,7 @@ name = "honker_core"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12.5"
 rusqlite = { version = "0.40.1", features = ["functions", "hooks"] }
-serde = "1"
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2.0.18"
 # Optional: kernel-watch backend.
 # macos_kqueue: on macOS, use kqueue (RecommendedWatcher = KqueueWatcher) instead of

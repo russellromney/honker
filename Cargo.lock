@@ -177,7 +177,6 @@ dependencies = [
  "notify",
  "parking_lot",
  "rusqlite",
- "serde",
  "serde_json",
  "thiserror",
 ]
