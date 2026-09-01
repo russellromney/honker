@@ -11,8 +11,8 @@
  * a small in-process poll loop.
  */
 
-import { Database as BunDB } from "bun:sqlite";
-import { dlopen, FFIType } from "bun:ffi";
+import { Database as BunDB, type SQLQueryBindings } from "bun:sqlite";
+import { dlopen, FFIType, type Pointer } from "bun:ffi";
 
 // Loading Honker onto a bun:sqlite handle you already own — see
 // ./extension.ts. Re-exported so ORM users import from one place.
@@ -203,9 +203,29 @@ interface RawStreamEvent {
   created_at: number;
 }
 
+// Declared as a function so `ReturnType` keeps the symbol map: an
+// unparameterized `ReturnType<typeof dlopen>` types every symbol as
+// `never`, which makes the calls below uncheckable.
+function openWatcherLib(extensionPath: string) {
+  return dlopen(extensionPath, {
+    honker_watcher_open_v2: {
+      args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.u64],
+      returns: FFIType.ptr,
+    },
+    honker_watcher_wait: {
+      args: [FFIType.ptr, FFIType.u64],
+      returns: FFIType.i32,
+    },
+    honker_watcher_close: {
+      args: [FFIType.ptr],
+      returns: FFIType.void,
+    },
+  });
+}
+
 class CoreWatcher {
-  private readonly lib: ReturnType<typeof dlopen>;
-  private readonly handle: unknown;
+  private readonly lib: ReturnType<typeof openWatcherLib>;
+  private readonly handle: Pointer | bigint | null;
   private closed = false;
 
   constructor(
@@ -214,20 +234,7 @@ class CoreWatcher {
     watcherBackend?: string | null,
     watcherPollIntervalMs?: number | null,
   ) {
-    this.lib = dlopen(extensionPath, {
-      honker_watcher_open_v2: {
-        args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.ptr, FFIType.u64],
-        returns: FFIType.ptr,
-      },
-      honker_watcher_wait: {
-        args: [FFIType.ptr, FFIType.u64],
-        returns: FFIType.i32,
-      },
-      honker_watcher_close: {
-        args: [FFIType.ptr],
-        returns: FFIType.void,
-      },
-    });
+    this.lib = openWatcherLib(extensionPath);
     const error = Buffer.alloc(1024);
     const dbPathBytes = cString(dbPath);
     const backendBytes = cString(watcherBackend ?? "");
@@ -508,8 +515,8 @@ export class Transaction {
     sql: string,
     params: unknown[] = [],
   ): T | null {
-    const stmt = this.raw.query<T, unknown[]>(sql);
-    return (stmt.get(...params) as T | null) ?? null;
+    const stmt = this.raw.query<T, SQLQueryBindings[]>(sql);
+    return (stmt.get(...(params as SQLQueryBindings[])) as T | null) ?? null;
   }
 
   /** Commit. Idempotent — subsequent calls are no-ops. */
