@@ -32,6 +32,10 @@
   jobs provide the same operational details as `getJob()`.
 - **Behavior change:** Node `getJob()` now returns the documented camelCase
   `JobSnapshot` shape instead of exposing the SQL ABI's raw snake_case row.
+  It also returns `null` for a job that belongs to a different queue, instead
+  of returning that queue's row. Job ids are globally unique, so the previous
+  unscoped lookup could hand back a payload that did not match the queue's
+  declared `TPayload`. `cancel()` is unchanged and remains not queue-scoped.
 
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 

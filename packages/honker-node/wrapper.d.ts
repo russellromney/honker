@@ -194,7 +194,34 @@ export class Queue<TPayload = JsonValue> {
   ackBatch(ids: number[], workerId: string): number
   sweepExpired(): number
   claimWaker(opts?: { idlePollS?: number | null }): ClaimWaker<TPayload>
+  /**
+   * Delete a pending or processing job by id. Returns true iff a row was
+   * removed. Idempotent on a missing job.
+   *
+   * NOT queue-scoped: job ids are globally unique, and `cancel` will remove a
+   * job belonging to any queue, not just this one. This is deliberately
+   * asymmetric with {@link Queue.getJob}, which does scope to its own queue.
+   * A read-then-check in JavaScript would not be atomic — a worker can claim
+   * or complete the job between the check and the delete — so correct scoping
+   * needs the filter pushed into the core. Pass only ids you know this queue
+   * owns.
+   *
+   * Cancel does NOT interrupt a worker that is currently running the handler
+   * for this job. The worker keeps executing until its handler returns. What
+   * cancel does is invalidate the worker's claim: its next `ack()` or
+   * `heartbeat()` returns false, the same shape as an expired claim. If you
+   * need the handler to actually stop, build that signal into your app;
+   * honker does not propagate cancellation to running handlers.
+   */
   cancel(jobId: number): boolean
+  /**
+   * Read a single job row by id.
+   *
+   * Returns null if the job has been ack'd, dead'd, never existed, or belongs
+   * to a different queue. The lookup is scoped to this queue: because job ids
+   * are globally unique, an unscoped lookup could return a row whose payload
+   * does not match `TPayload`.
+   */
   getJob(jobId: number): JobSnapshot<TPayload> | null
 }
 

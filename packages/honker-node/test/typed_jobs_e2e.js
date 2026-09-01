@@ -91,3 +91,28 @@ test('typed job details survive a producer-to-consumer process journey', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('getJob is scoped to its own queue', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'honker-getjob-scope-'));
+  const dbPath = path.join(dir, 'app.db');
+  let db;
+  try {
+    db = honker.open(dbPath);
+    const emails = db.queue('emails');
+    const sms = db.queue('sms');
+
+    // Two queues with incompatible payload contracts. Job ids are globally
+    // unique, so a raw id lookup would happily hand an SMS row to `emails`.
+    const smsId = sms.enqueue({ phone: '+15550100', body: 'hello' });
+
+    assert.equal(emails.getJob(smsId), null);
+
+    const owned = sms.getJob(smsId);
+    assert.deepEqual(owned.payload, { phone: '+15550100', body: 'hello' });
+    assert.equal(owned.queue, 'sms');
+    assert.equal(owned.id, smsId);
+  } finally {
+    try { db?.close(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

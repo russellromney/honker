@@ -468,11 +468,15 @@ class Queue {
   }
 
   /** Read a single job row by id. Returns the row object or null if
-   *  the job has been ack'd, dead'd, or never existed. */
+   *  the job has been ack'd, dead'd, never existed, or belongs to a
+   *  different queue. Job ids are globally unique, so the id alone
+   *  cannot say which queue owns the row; scoping the lookup to this
+   *  queue keeps the payload type honest. */
   getJob(jobId) {
     const raw = this._db._callScalar('SELECT honker_get_job(?)', [jobId]);
     if (!raw) return null;
     const row = JSON.parse(raw);
+    if (row.queue !== this.name) return null;
     return {
       id: row.id,
       queue: row.queue,
