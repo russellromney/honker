@@ -27,6 +27,52 @@ if let Some(job) = q.claim_one("worker-1")? {
 
 Delayed jobs use `run_at` / `RunAt`-style options in the binding API.
 
+## Job details
+
+`Job` (a claimed unit of work) and `JobRow` (the read-only snapshot from
+`Queue::get_job`) both carry every field the core claim/lookup returns:
+`id`, `queue`, `payload`, `state`, `priority`, `run_at`, `worker_id`,
+`claim_expires_at`, `attempts`, `max_attempts`, `created_at`, and
+`expires_at`.
+
+`Job` also holds a claim, so it has `ack`, `retry`, `fail`, and
+`heartbeat`, and its `worker_id` / `claim_expires_at` are non-optional.
+`JobRow` is data only: no claim methods, and `worker_id` /
+`claim_expires_at` are `Option` because a pending row has neither.
+
+Payload encoding is unchanged: `Job::payload` is `Vec<u8>` of raw JSON
+bytes and `JobRow::payload` is the raw JSON `String`.
+
+## Typed payloads
+
+`Queue<T>` carries the payload type. `db.queue(..)` still hands back a
+`Queue<serde_json::Value>`; `db.typed_queue::<T>(..)` (or
+`queue.typed::<T>()`) gives you your own type:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Email { to: String }
+
+let q = db.typed_queue::<Email>("emails", QueueOpts::default());
+q.enqueue(&Email { to: "alice@example.com".into() }, EnqueueOpts::default())?;
+
+if let Some(job) = q.claim_one("worker-1")? {
+    let email: Email = job.payload_typed()?;
+    job.ack()?;
+}
+```
+
+`payload_typed()` decodes into the queue's `T`; `payload_as::<U>()`
+decodes into anything you name. Both are plain `serde` deserialization.
+
+**honker never checks payload shape.** The type parameter is a
+compile-time convenience for your code only. The database stores the
+payload as opaque JSON text and nothing on the write path validates it,
+so two processes writing the same queue with different types will
+produce rows the other cannot decode. The only error you get is a
+`serde` failure at decode time. Keeping producers and consumers in
+agreement is your job.
+
 Recurring schedules use schedule expressions:
 
 ```rust

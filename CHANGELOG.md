@@ -20,6 +20,32 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — typed Rust jobs
+
+- `honker` (Rust): claimed `Job` and the `JobRow` snapshot now carry all
+  twelve fields core returns — `id`, `queue`, `payload`, `state`,
+  `priority`, `run_at`, `worker_id`, `claim_expires_at`, `attempts`,
+  `max_attempts`, `created_at`, `expires_at`. `Job` keeps `ack`, `retry`,
+  `fail`, `heartbeat`; `JobRow` stays data only.
+- `Queue`, `Job`, `JobRow`, `ClaimWaker`, and `Outbox` gained a payload
+  type parameter defaulting to `serde_json::Value`, so `db.queue(..)`
+  and `db.outbox(..)` behave exactly as before. `db.typed_queue::<T>()`,
+  `db.typed_outbox::<T>()`, and `Queue::typed::<T>()` produce typed
+  handles; `payload_typed()` decodes into the handle's `T` and the
+  existing `payload_as::<U>()` still decodes into anything you name.
+- Payload encoding is unchanged: `Job::payload` stays raw JSON bytes and
+  `JobRow::payload` stays a raw JSON string. The type parameter is
+  compile-time only — honker never validates payload shape in the
+  database, and a mismatch surfaces only as a `serde` error at decode.
+- **Breaking (source):** `Queue::enqueue` / `enqueue_tx` and
+  `Outbox::enqueue` / `enqueue_tx` now take `&T` instead of any
+  `&impl Serialize`, and `Outbox::run_once`'s delivery closure takes `T`
+  instead of `serde_json::Value`. On the default handles `T` is
+  `serde_json::Value`, so `q.enqueue(&json!(..))` is untouched; callers
+  who passed a custom struct to an untyped queue now take a typed handle.
+- A claimed row that comes back without a `worker_id` or
+  `claim_expires_at` is now an error instead of a silent default.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
