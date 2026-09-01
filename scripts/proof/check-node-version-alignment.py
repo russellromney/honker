@@ -60,6 +60,25 @@ def main() -> int:
     elif unexpected := sorted(set(loader_versions) - {version}):
         errors.append(f"index.js checks unexpected native versions: {unexpected}")
 
+    # The version the guard compares and the version its error message names
+    # are generated separately. A stale index.js can compare correctly while
+    # telling the user to install the wrong version, so check both.
+    message_versions = re.findall(
+        r"Native binding package version mismatch, expected ([^ ]+) but got", loader
+    )
+    if not message_versions:
+        errors.append("index.js has no native package version mismatch messages")
+    elif unexpected := sorted(set(message_versions) - {version}):
+        errors.append(
+            f"index.js mismatch messages name unexpected versions: {unexpected} "
+            f"(regenerate with `napi build`)"
+        )
+    elif len(message_versions) != len(loader_versions):
+        errors.append(
+            f"index.js has {len(loader_versions)} version checks but "
+            f"{len(message_versions)} mismatch messages"
+        )
+
     if errors:
         print("Node package version alignment failed:", file=sys.stderr)
         for error in errors:
