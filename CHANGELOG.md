@@ -20,6 +20,25 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — .NET job details and typed queues
+
+- .NET claimed jobs (`Job`) now carry every field the core returns:
+  `State`, `Priority`, `RunAt`, `MaxAttempts`, `CreatedAt`, and
+  `ExpiresAt` join the id, queue, payload, worker, attempts, and
+  claim-expiry fields they already had. `ClaimBatch` decodes the claim
+  ABI into the same `JobRow` shape `GetJob()` returns, so the old
+  `row.State ?? "processing"` fallback is gone — `state` is now a real
+  value from the core.
+- New `db.Queue<TPayload>(name)` returns a `TypedQueue<TPayload>` whose
+  claims yield `Job<TPayload>` and whose `GetJob()` yields the
+  data-only `JobSnapshot<TPayload>` record. Named `TypedQueue` rather
+  than `Queue<T>` so it cannot collide with
+  `System.Collections.Generic.Queue<T>` in callers' files.
+- Payload typing is compile-time only. Honker never validates payload
+  shape in the database, and this binding adds no runtime check.
+- A claimed row missing `worker_id` or `claim_expires_at` now throws
+  instead of being silently defaulted.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry

@@ -40,6 +40,44 @@ if (job is not null)
 }
 ```
 
+## Typed queues and job details
+
+`db.Queue<TPayload>(name)` gives the queue a payload contract. Claimed
+jobs and `GetJob()` snapshots keep it:
+
+```csharp
+record EmailPayload(string To, string Template);
+
+var emails = db.Queue<EmailPayload>("emails");
+var id = emails.Enqueue(new EmailPayload("alice@example.com", "welcome"));
+
+// Read-only snapshot: data, no claim methods.
+JobSnapshot<EmailPayload>? pending = emails.GetJob(id);
+Console.WriteLine($"{pending!.State} {pending.Priority} {pending.RunAt}");
+
+Job<EmailPayload>? job = emails.ClaimOne("worker-1");
+if (job is not null)
+{
+    Send(job.Payload!.To);
+    Console.WriteLine($"{job.Attempts}/{job.MaxAttempts} until {job.ClaimExpiresAt}");
+    job.Ack();
+}
+```
+
+The type parameter is a compile-time contract only. Honker stores
+payloads as opaque JSON and never validates their shape — in this
+binding or in the database — so every process writing to a queue has to
+agree on the payload type.
+
+Claimed jobs (`Job`, `Job<TPayload>`) and read-only snapshots
+(`JobRow`, `JobSnapshot<TPayload>`) carry every field the core returns:
+`Id`, queue name, payload, `State`, `Priority`, `RunAt`, `WorkerId`,
+`ClaimExpiresAt`, `Attempts`, `MaxAttempts`, `CreatedAt`, `ExpiresAt`.
+A claimed job additionally has `Ack`, `Retry`, `Fail`, and `Heartbeat`;
+a snapshot is data only, because reading a row does not claim it.
+`Untyped` on `TypedQueue<TPayload>` and `Job<TPayload>` gets you back
+to the untyped handle when an API needs one.
+
 ## Native loading
 
 `Database.Open(...)` loads the Honker extension and runs
