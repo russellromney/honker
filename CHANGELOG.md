@@ -31,10 +31,13 @@
   `expiresAt` join the id, queue, payload, worker, and attempts fields
   they already had.
 - **Behavior change:** `Queue.getJob()` returns the camelCase
-  `JobSnapshot` shape with a parsed payload, instead of the SQL ABI's
-  raw snake_case row with a JSON string payload. The old exported
-  `JobRow` interface is replaced by `JobSnapshot<TPayload>`. Same change
-  Node made in the typed-jobs work.
+  `JobSnapshot` shape instead of the SQL ABI's raw snake_case row. The
+  exported `JobRow` interface is replaced by `JobSnapshot`. The
+  snapshot's `payload` stays raw JSON text, exactly as this binding has
+  always returned it; only the field names changed. A claimed
+  `Job.payload` stays decoded, as it always was. Bindings disagree on
+  snapshot payload encoding (Node decodes; Bun, Go, and Python return
+  raw text) and one convention has not been chosen yet.
 - A claimed row without `worker_id` or `claim_expires_at` now throws
   instead of being silently accepted.
 - Payload typing is compile-time only; honker adds no runtime payload

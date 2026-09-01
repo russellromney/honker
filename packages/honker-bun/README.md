@@ -57,9 +57,11 @@ interface EmailPayload {
 const emails = db.queue<EmailPayload>("emails");
 const id = emails.enqueue({ to: "alice@example.com", template: "welcome" });
 
-// Read-only snapshot: data, no claim methods.
+// Read-only snapshot: data, no claim methods. Its payload is raw JSON
+// text — parse it yourself.
 const pending = emails.getJob(id);
 console.log(pending?.state, pending?.priority, pending?.runAt);
+const payload = pending ? (JSON.parse(pending.payload) as EmailPayload) : null;
 
 const job = emails.claimOne("worker-1");
 if (job) {
@@ -77,6 +79,13 @@ Claimed jobs and snapshots carry every field the core returns: `id`,
 `claimExpiresAt`, `attempts`, `maxAttempts`, `createdAt`, `expiresAt`.
 A claimed `Job` also has `ack`, `retry`, `fail`, and `heartbeat`; a
 `JobSnapshot` is data only, because reading a row does not claim it.
+
+Payload encoding differs between the two, and that is deliberate: a
+claimed `job.payload` is decoded (it always was), while a snapshot's
+`payload` stays raw JSON text (it always was). Bindings currently
+disagree here — Node decodes snapshot payloads, Bun, Go, and Python do
+not — and settling on one convention is a separate decision, not part of
+the job-detail work.
 
 Recurring schedules use `schedule`:
 

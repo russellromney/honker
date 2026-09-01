@@ -117,7 +117,9 @@ maybe("honker-bun job details", () => {
       expect(snapshot).not.toBeNull();
       expect(snapshot!.id).toBe(id);
       expect(snapshot!.queue).toBe("emails");
-      expect(snapshot!.payload).toEqual({
+      // Raw JSON text: this binding does not decode snapshot payloads.
+      expect(snapshot!.payload).toBe('{"recipient":"bob@example.com","template":"receipt"}');
+      expect(JSON.parse(snapshot!.payload)).toEqual({
         recipient: "bob@example.com",
         template: "receipt",
       });
@@ -157,7 +159,7 @@ maybe("honker-bun job details", () => {
       expect(processing!.attempts).toBe(1);
       expect(processing!.claimExpiresAt).toBeGreaterThanOrEqual(claimedBefore + 45);
       expect(processing!.claimExpiresAt).toBeLessThanOrEqual(claimedAfter + 45);
-      expect(processing!.payload).toEqual({
+      expect(JSON.parse(processing!.payload)).toEqual({
         recipient: "carol@example.com",
         template: "welcome",
       });

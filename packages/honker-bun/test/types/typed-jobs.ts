@@ -18,9 +18,12 @@ queue.enqueue({
   variables: { firstName: "Alice" },
 });
 
-const pending: JobSnapshot<EmailPayload> | null = queue.getJob(1);
+// A snapshot's payload is raw JSON text in this binding, not a decoded
+// TPayload — the encoding is deliberately left as it was.
+const pending: JobSnapshot | null = queue.getJob(1);
 if (pending) {
-  pending.payload.recipient.toUpperCase();
+  const decoded = JSON.parse(pending.payload) as EmailPayload;
+  decoded.recipient.toUpperCase();
   pending.state satisfies "pending" | "processing";
   pending.runAt.toFixed(0);
   pending.maxAttempts.toFixed(0);

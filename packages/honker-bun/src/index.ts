@@ -166,15 +166,18 @@ export type JobState = "pending" | "processing";
 /**
  * A read-only job snapshot. Data only: no ack/retry/fail/heartbeat,
  * because reading a row does not claim it.
- *
- * `TPayload` is a compile-time contract only. Honker stores payloads as
- * opaque JSON and never validates their shape, so every process writing
- * to the queue has to agree on the type.
  */
-export interface JobSnapshot<TPayload = JsonValue> {
+export interface JobSnapshot {
   readonly id: number;
   readonly queue: string;
-  readonly payload: TPayload;
+  /**
+   * Raw JSON text, exactly as stored — `JSON.parse` it yourself. This
+   * binding has always handed back the raw payload here and that is
+   * left alone; bindings currently disagree (Node decodes, Bun / Go /
+   * Python do not) and picking one convention is a separate decision.
+   * A claimed `Job.payload`, by contrast, is decoded, as it always was.
+   */
+  readonly payload: string;
   readonly state: JobState;
   readonly priority: number;
   readonly runAt: number;
@@ -220,11 +223,11 @@ interface RawJobRow {
 }
 
 /** Map the core's snake_case row onto the camelCase public snapshot. */
-function toSnapshot<TPayload>(row: RawJobRow): JobSnapshot<TPayload> {
+function toSnapshot(row: RawJobRow): JobSnapshot {
   return {
     id: row.id,
     queue: row.queue,
-    payload: JSON.parse(row.payload) as TPayload,
+    payload: row.payload,
     state: row.state,
     priority: row.priority,
     runAt: row.run_at,
@@ -710,14 +713,15 @@ export class Queue<TPayload = JsonValue> {
   /**
    * Read a single job row by id. Returns the snapshot or null on miss
    * (ack'd, dead'd, or never existed). Pure read: a snapshot carries no
-   * claim methods.
+   * claim methods, and its `payload` is raw JSON text, not a decoded
+   * `TPayload`.
    */
-  getJob(jobId: number): JobSnapshot<TPayload> | null {
+  getJob(jobId: number): JobSnapshot | null {
     const row = this.db.raw
       .query<{ v: string }, [number]>("SELECT honker_get_job(?) AS v")
       .get(jobId)!;
     if (!row.v) return null;
-    return toSnapshot<TPayload>(JSON.parse(row.v) as RawJobRow);
+    return toSnapshot(JSON.parse(row.v) as RawJobRow);
   }
 
   /** Sweep expired claim rows back to pending. Returns rows touched. */
