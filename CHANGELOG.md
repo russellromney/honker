@@ -20,6 +20,26 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — full job details in the Go binding
+
+- Go `Job` now carries every field `honker_claim_batch` returns: `State`,
+  `Priority`, `RunAt`, `ClaimExpiresAt`, `MaxAttempts`, `CreatedAt`, and
+  `ExpiresAt` join the existing `ID`, `Queue`, `Payload`, `WorkerID`, and
+  `Attempts`. A claimed `Job` and a `GetJob` snapshot (`JobRow`) now describe
+  the same twelve columns; `Job` keeps `Ack` / `Retry` / `Fail` / `Heartbeat`
+  and `JobRow` stays data only. Purely additive — no existing field changed
+  name, type, or meaning.
+- New `honker.DecodePayload[T]` unmarshals a payload into a caller-owned type,
+  plus `JobRow.PayloadBytes()` so a snapshot decodes through the same path as
+  a claimed job. The type parameter is a compile-time contract; Honker still
+  does not validate payload shape in the database.
+- `TestClaimedJobAndSnapshotCarryEveryField` enqueues with a priority, TTL, and
+  max-attempts, asserts each of the twelve fields on the pending snapshot, the
+  claimed job, and a second `Database` handle's processing snapshot, then
+  asserts the reader gets nothing after ack.
+  `TestDelayedJobReportsItsRunAt` asserts a delayed job's `RunAt` and that it
+  is not claimable early.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry

@@ -653,14 +653,29 @@ func (q *Queue) EnqueueTx(tx *Transaction, payload any, opts EnqueueOptions) (in
 }
 
 // Job is a claimed unit of work. Payload is raw JSON bytes — unmarshal
-// into your own struct via json.Unmarshal(job.Payload, &dst).
+// into your own struct with json.Unmarshal(job.Payload, &dst), or with
+// the DecodePayload helper.
+//
+// A claimed Job carries the same twelve fields as a JobRow snapshot,
+// plus the claim methods (Ack, Retry, Fail, Heartbeat). WorkerID and
+// ClaimExpiresAt are always set: the claim UPDATE writes both. State is
+// "processing" by construction. ExpiresAt is nil when the job was
+// enqueued without EnqueueOptions.Expires.
 type Job struct {
-	q        *Queue
-	ID       int64
-	Queue    string
-	Payload  []byte
-	WorkerID string
-	Attempts int64
+	q *Queue
+
+	ID             int64
+	Queue          string
+	Payload        []byte
+	State          string
+	Priority       int64
+	RunAt          int64
+	WorkerID       string
+	ClaimExpiresAt int64
+	Attempts       int64
+	MaxAttempts    int64
+	CreatedAt      int64
+	ExpiresAt      *int64
 }
 
 // ClaimOne atomically claims one job or returns (nil, nil) on empty.
@@ -682,13 +697,22 @@ func (q *Queue) ClaimBatch(workerID string, n int) ([]*Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	// honker_claim_batch returns the complete live-job snapshot, the
+	// same twelve columns honker_get_job returns. Keep every one of
+	// them; a claimed Job and a JobRow describe the same row.
 	var raw []struct {
 		ID             int64  `json:"id"`
 		Queue          string `json:"queue"`
 		Payload        string `json:"payload"`
+		State          string `json:"state"`
+		Priority       int64  `json:"priority"`
+		RunAt          int64  `json:"run_at"`
 		WorkerID       string `json:"worker_id"`
-		Attempts       int64  `json:"attempts"`
 		ClaimExpiresAt int64  `json:"claim_expires_at"`
+		Attempts       int64  `json:"attempts"`
+		MaxAttempts    int64  `json:"max_attempts"`
+		CreatedAt      int64  `json:"created_at"`
+		ExpiresAt      *int64 `json:"expires_at"`
 	}
 	if err := json.Unmarshal([]byte(rowsJSON), &raw); err != nil {
 		return nil, fmt.Errorf("unmarshal claim result: %w", err)
@@ -696,12 +720,19 @@ func (q *Queue) ClaimBatch(workerID string, n int) ([]*Job, error) {
 	jobs := make([]*Job, len(raw))
 	for i, r := range raw {
 		jobs[i] = &Job{
-			q:        q,
-			ID:       r.ID,
-			Queue:    r.Queue,
-			Payload:  []byte(r.Payload),
-			WorkerID: r.WorkerID,
-			Attempts: r.Attempts,
+			q:              q,
+			ID:             r.ID,
+			Queue:          r.Queue,
+			Payload:        []byte(r.Payload),
+			State:          r.State,
+			Priority:       r.Priority,
+			RunAt:          r.RunAt,
+			WorkerID:       r.WorkerID,
+			ClaimExpiresAt: r.ClaimExpiresAt,
+			Attempts:       r.Attempts,
+			MaxAttempts:    r.MaxAttempts,
+			CreatedAt:      r.CreatedAt,
+			ExpiresAt:      r.ExpiresAt,
 		}
 	}
 	return jobs, nil
@@ -764,7 +795,13 @@ func (q *Queue) AckBatch(ids []int64, workerID string) (int64, error) {
 }
 
 // JobRow is one job row read by Queue.GetJob. Pure data, no claim
-// semantics.
+// semantics — a JobRow has no Ack, Retry, Fail, or Heartbeat.
+//
+// It carries the same twelve fields as a claimed Job. Payload is the
+// raw JSON text of the job payload; use PayloadBytes with DecodePayload
+// to decode it. WorkerID and ClaimExpiresAt are nil while the job is
+// pending and set once a worker claims it. ExpiresAt is nil unless the
+// job was enqueued with EnqueueOptions.Expires.
 type JobRow struct {
 	ID             int64   `json:"id"`
 	Queue          string  `json:"queue"`
@@ -778,6 +815,39 @@ type JobRow struct {
 	MaxAttempts    int64   `json:"max_attempts"`
 	CreatedAt      int64   `json:"created_at"`
 	ExpiresAt      *int64  `json:"expires_at"`
+}
+
+// PayloadBytes returns the row's payload as raw JSON bytes, so a JobRow
+// decodes through the same path as a claimed Job.
+func (r *JobRow) PayloadBytes() []byte {
+	return []byte(r.Payload)
+}
+
+// DecodePayload unmarshals a job payload into T.
+//
+//	type Email struct {
+//	    To       string `json:"to"`
+//	    Template string `json:"template"`
+//	}
+//
+//	email, err := honker.DecodePayload[Email](job.Payload)
+//	row, _ := q.GetJob(id)
+//	email, err = honker.DecodePayload[Email](row.PayloadBytes())
+//
+// The type parameter is a compile-time contract between the producer
+// and the consumer, nothing more. Honker never inspects or validates
+// payload shape in the database, so every app writing to a queue has to
+// agree on the JSON shape on its own. A payload that does not match T
+// surfaces here as an unmarshal error, not as an enqueue failure.
+func DecodePayload[T any](payload []byte) (T, error) {
+	var out T
+	if len(payload) == 0 {
+		return out, nil
+	}
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return out, fmt.Errorf("decode payload: %w", err)
+	}
+	return out, nil
 }
 
 // Cancel removes a pending or processing row by id. Returns true iff

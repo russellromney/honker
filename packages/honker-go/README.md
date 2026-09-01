@@ -46,6 +46,43 @@ if job != nil {
 }
 ```
 
+### Job details and typed payloads
+
+A claimed `Job` and a `GetJob` snapshot (`JobRow`) both carry the full job
+shape: `ID`, `Queue`, `Payload`, `State`, `Priority`, `RunAt`, `WorkerID`,
+`ClaimExpiresAt`, `Attempts`, `MaxAttempts`, `CreatedAt`, and `ExpiresAt`.
+A `Job` also has the claim methods (`Ack`, `Retry`, `Fail`, `Heartbeat`);
+a `JobRow` is data only.
+
+Payloads stay raw JSON. `DecodePayload[T]` unmarshals one into your own type:
+
+```go
+type Email struct {
+    To       string `json:"to"`
+    Template string `json:"template"`
+}
+
+job, _ := q.ClaimOne("worker-1")
+if job != nil {
+    email, err := honker.DecodePayload[Email](job.Payload)
+    if err != nil {
+        _, _ = job.Fail(err.Error())
+    } else {
+        send(email)
+        _ = job.Ack()
+    }
+    fmt.Println(job.State, job.Priority, job.RunAt, job.CreatedAt)
+}
+
+row, _ := q.GetJob(id)
+email, err := honker.DecodePayload[Email](row.PayloadBytes())
+```
+
+The type parameter is a compile-time contract only. Honker never validates
+payload shape in the database, so every app writing to a queue has to agree on
+the JSON shape itself. A mismatch shows up as an unmarshal error at decode
+time, not at enqueue time.
+
 Delayed jobs use `RunAt`:
 
 ```go
