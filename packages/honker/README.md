@@ -57,6 +57,44 @@ async for job in q.claim("worker-1"):
     job.ack()
 ```
 
+### Job details and typed payloads
+
+A claimed `Job` and a `get_job()` snapshot both carry the full job shape:
+`id`, `queue`, `payload`, `state`, `priority`, `run_at`, `worker_id`,
+`claim_expires_at`, `attempts`, `max_attempts`, `created_at`, and
+`expires_at`. A `Job` also has the claim methods (`ack`, `retry`, `fail`,
+`heartbeat`); a snapshot is data only.
+
+```python
+job = q.claim_one("worker-1")
+print(job.state, job.priority, job.run_at, job.attempts, job.max_attempts)
+print(job.worker_id, job.claim_expires_at, job.created_at, job.expires_at)
+
+row = q.get_job(job.id)          # snake_case dict, same twelve fields
+print(row["state"], row["worker_id"])
+```
+
+`Job.payload` is decoded JSON. A snapshot's `payload` is the raw JSON text
+the core returns — decode it with `json.loads(row["payload"])`.
+
+`Queue` and `Job` take an optional payload type parameter:
+
+```python
+from typing import TypedDict
+
+class EmailPayload(TypedDict):
+    to: str
+    template: str
+
+emails: honker.Queue[EmailPayload] = db.queue("emails")
+job = emails.claim_one("worker-1")   # job.payload is EmailPayload
+```
+
+This is a type hint and nothing else. Honker does not validate payload shape
+in the database, so a payload that does not match the annotation still
+enqueues and claims fine — every app writing to a queue has to agree on the
+JSON shape itself.
+
 Delayed jobs use `run_at`:
 
 ```python

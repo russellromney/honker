@@ -20,6 +20,30 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — full job details in the Python binding
+
+- Python `Job` now carries `expires_at`, and reads `state`, `priority`,
+  `run_at`, `max_attempts`, and `created_at` straight out of the claim result
+  instead of falling back to defaults. `honker_claim_batch` returns the
+  complete live-job snapshot, so the old "narrow claim path" comment and its
+  `row.get(..., default)` fallbacks were stale — a default there would have
+  silently papered over ABI drift between the core and the binding. A claimed
+  `Job` and a `get_job()` snapshot now describe the same twelve columns.
+- `Job.last_error` is now explicitly `None` with a comment saying why: the
+  claim ABI does not return it. It was already always None; the fallback just
+  made that look accidental.
+- New `honker.JobSnapshot` TypedDict names the twelve keys `get_job()`
+  returns. `get_job()` still returns a plain dict with the core's snake_case
+  keys and raw-JSON-text `payload` — nothing about its runtime value changed.
+- `Queue` and `Job` take an optional payload type parameter (`Queue[T]`,
+  `Job[T]`), flowing through `claim_one()`, `claim_batch()`, `claim()`, and
+  `Job.payload`. Type hints only; Honker still does not validate payload shape
+  in the database, and `test_typed_payload_hints_do_not_validate_at_runtime`
+  pins that.
+- `tests/test_job_details.py` covers the pending snapshot, the claimed job, a
+  second handle's processing snapshot, the post-ack miss, a delayed job's
+  `run_at`, a job with no TTL, and a retry round trip.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
