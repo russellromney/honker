@@ -86,6 +86,43 @@ sendEmail(job.payload());
 job.ack();
 ```
 
+## Job fields and snapshots
+
+A claimed `Job` carries every field the core returns for the row:
+`id`, `queue`, `payloadJson`, `state`, `priority`, `runAt`, `workerId`,
+`claimExpiresAt`, `attempts`, `maxAttempts`, `createdAt`, and `expiresAt`.
+The core JSON is snake_case; the accessors are camelCase. Times are unix
+epoch seconds. `workerId`, `claimExpiresAt` and `expiresAt` are `null`
+when the row has no value for them.
+
+`JobSnapshot` is the same data with no claim operations. Read one with
+`Queue.getJob(id)` (scoped to that queue) or `Database.getJob(id)`
+(global). It is empty once the job is ack'd or dead-lettered.
+
+```java
+Queue emails = db.queue("emails");
+long id = emails.enqueue("{\"to\":\"alice@example.com\"}");
+
+JobSnapshot pending = emails.getJob(id).orElseThrow();
+System.out.println(pending.state());     // "pending"
+System.out.println(pending.workerId());  // null
+
+Job job = emails.claimOne("worker-1").orElseThrow();
+System.out.println(job.state());          // "processing"
+System.out.println(job.attempts() + "/" + job.maxAttempts());
+System.out.println(job.claimExpiresAt());
+job.ack();
+
+emails.getJob(id);                        // Optional.empty()
+```
+
+`TypedQueue.getJob(id)` returns a `TypedJobSnapshot<T>` with the payload
+already decoded.
+
+Payload types are a compile-time contract between the callers that share
+a queue. Honker does not validate payload shape in the database, so every
+writer must agree on the JSON it produces.
+
 Result waits can use `CompletableFuture`:
 
 ```java

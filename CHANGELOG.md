@@ -20,6 +20,25 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — JVM job parity
+
+- JVM claimed `Job` and `TypedJob<T>` now carry every field the core
+  returns: `id`, `queue`, `payloadJson`, `state`, `priority`, `runAt`,
+  `workerId`, `claimExpiresAt`, `attempts`, `maxAttempts`, `createdAt`,
+  and `expiresAt`. The core JSON stays snake_case; the accessors are
+  camelCase. Times are unix epoch seconds.
+- New `JobSnapshot` record: the same twelve fields with no claim
+  operations. `Queue.getJob(id)` returns one scoped to that queue,
+  `Database.getJob(id)` looks up by id across every queue. Both are empty
+  once the job is ack'd or dead-lettered. `TypedQueue.getJob(id)` returns
+  a `TypedJobSnapshot<T>` with the payload already decoded.
+- Payload types stay a compile-time contract. Honker does not validate
+  payload shape in the database, and no runtime validation was added.
+- Tests enqueue with an explicit `runAt`, priority, `maxAttempts` and
+  `expires`, then claim and assert each field's value — including a
+  reader on a second connection watching one job go pending, processing,
+  then gone after ack.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
