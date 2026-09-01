@@ -37,6 +37,23 @@
   unscoped lookup could hand back a payload that did not match the queue's
   declared `TPayload`. `cancel()` is unchanged and remains not queue-scoped.
 
+## Unreleased — Ruby job details
+
+- `Honker::Job` now exposes every field the claim ABI returns: `state`,
+  `priority`, `run_at`, `claim_expires_at`, `max_attempts`, `created_at`,
+  and `expires_at` join the existing `id`, `queue_name`, `payload`,
+  `worker_id`, and `attempts`.
+- `Queue#get_job` returns a `Honker::JobSnapshot` — the same twelve fields,
+  read-only, with no ack/retry/fail/heartbeat. **Behavior change:** it used
+  to return a plain `Hash` of the raw ABI row. `snapshot["state"]` still
+  works (`Struct#[]` takes member names), but `Hash` methods no longer do.
+- Snapshot `payload` stays the raw JSON text the row stores, matching the
+  Python and Go snapshots. `Job#payload` is still decoded. The bindings do
+  not yet agree on one snapshot payload encoding; Node decodes it.
+- `spec/job_fields_spec.rb` asserts every field against the value it was
+  enqueued or claimed with, across pending, delayed, processing, retried,
+  and acked jobs.
+
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
 - Node stream checkpoint calls now use the shared SQL ABI's canonical

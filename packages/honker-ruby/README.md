@@ -263,3 +263,47 @@ Supported schedule forms:
 - `@every 1s`
 
 `schedule:` is the canonical recurring name. `cron:` still works as a compatibility alias.
+
+## Job details
+
+A claimed `Honker::Job` carries the whole row as it stood at claim time:
+
+```ruby
+job = q.claim_one("worker-1")
+
+job.id                # row id
+job.queue_name        # queue this job came from
+job.payload           # decoded JSON value
+job.state             # "processing"
+job.priority          # higher runs first within the queue
+job.run_at            # unix seconds; when it became claimable
+job.worker_id         # "worker-1"
+job.claim_expires_at  # unix seconds; heartbeat before this
+job.attempts          # already incremented by this claim
+job.max_attempts      # dead-letters once attempts reaches this
+job.created_at        # unix seconds
+job.expires_at        # unix seconds, or nil when enqueued without expires:
+```
+
+`q.get_job(id)` returns a `Honker::JobSnapshot` — the same twelve fields,
+read-only, for a job you did not claim. It is data alone: no
+ack/retry/fail/heartbeat, because the reader holds no claim. `state` is
+`"pending"` or `"processing"`, and `worker_id` / `claim_expires_at` are
+`nil` until some worker claims the job. The snapshot's `payload` is the
+raw JSON *text* from the row, not a decoded value — call `JSON.parse` on
+it. `nil` means the job was ack'd, dead-lettered, cancelled, or never
+existed.
+
+Honker never inspects a payload. The shape is a contract between the app
+that enqueues and the app that claims, and both sides have to agree on it
+— including across languages, since another binding may write to the same
+queue. Version the payload if it will change:
+
+```ruby
+q.enqueue({"v" => 2, "to" => "alice@example.com"})
+
+case job.payload["v"]
+when 2 then send_email(job.payload["to"])
+else raise "unknown payload version #{job.payload["v"].inspect}"
+end
+```

@@ -809,13 +809,16 @@ module Honker
       n.positive?
     end
 
-    # Read a single job row by id. Returns a Hash with the row fields,
-    # or nil if the job has been ack'd, dead'd, or never existed.
+    # Read a single job row by id. Returns a JobSnapshot, or nil if the
+    # job has been ack'd, dead'd, or never existed.
+    #
+    # The lookup is by id alone. Ids are globally unique but not scoped
+    # to this queue, so a foreign id returns that queue's row (#134).
     def get_job(job_id)
       raw = @db.db.get_first_row("SELECT honker_get_job(?)", [job_id])[0]
       return nil if raw.nil? || raw.empty?
 
-      JSON.parse(raw)
+      JobSnapshot.from_row(JSON.parse(raw))
     end
   end
 
@@ -878,19 +881,75 @@ module Honker
     end
   end
 
+  # A read-only view of a live job row, as returned by Queue#get_job.
+  # Data only — no ack/retry/fail/heartbeat, because the reader does
+  # not hold the claim.
+  #
+  # Fields match the row: `state` is "pending" or "processing";
+  # `worker_id` and `claim_expires_at` are nil until a worker claims
+  # the job; `expires_at` is nil unless the job was enqueued with
+  # `expires:`. All times are unix epoch seconds.
+  #
+  # NOTE: `payload` is the raw JSON *text* stored in the row, not a
+  # decoded value — unlike Job#payload, which is decoded. Call
+  # JSON.parse on it. That difference is inherited from the SQL ABI
+  # and is deliberately left alone here; the bindings do not yet agree
+  # on one snapshot payload encoding.
+  JobSnapshot = Struct.new(
+    :id, :queue, :payload, :state, :priority, :run_at, :worker_id,
+    :claim_expires_at, :attempts, :max_attempts, :created_at, :expires_at
+  ) do
+    # Build a snapshot from a decoded honker_get_job() row.
+    def self.from_row(row)
+      new(
+        row["id"],
+        row["queue"],
+        row["payload"],
+        row["state"],
+        row["priority"],
+        row["run_at"],
+        row["worker_id"],
+        row["claim_expires_at"],
+        row["attempts"],
+        row["max_attempts"],
+        row["created_at"],
+        row["expires_at"],
+      )
+    end
+
+    # Job exposes the same value as #queue_name; accept both here.
+    alias_method :queue_name, :queue
+  end
+
   # A claimed unit of work. `payload` is the decoded JSON value (Hash,
-  # Array, etc.). `id`, `worker_id`, and `attempts` are metadata from
-  # the claim result.
+  # Array, etc.). Honker never inspects the payload — the shape is a
+  # contract between the producer and the consumer, so every app
+  # writing to a queue has to agree on it.
+  #
+  # The rest of the readers are the job's row as it stood at claim
+  # time: `state` ("processing"), `priority`, `run_at`, `worker_id`,
+  # `claim_expires_at`, `attempts` (already incremented by this
+  # claim), `max_attempts`, `created_at`, and `expires_at` (nil unless
+  # enqueued with `expires:`). Times are unix epoch seconds.
   class Job
-    attr_reader :id, :queue_name, :payload, :worker_id, :attempts
+    attr_reader :id, :queue_name, :payload, :state, :priority, :run_at,
+                :worker_id, :claim_expires_at, :attempts, :max_attempts,
+                :created_at, :expires_at
 
     def initialize(queue, row)
       @queue = queue
       @id = row["id"]
       @queue_name = row["queue"]
       @payload = JSON.parse(row["payload"]) unless row["payload"].nil?
+      @state = row["state"]
+      @priority = row["priority"]
+      @run_at = row["run_at"]
       @worker_id = row["worker_id"]
+      @claim_expires_at = row["claim_expires_at"]
       @attempts = row["attempts"]
+      @max_attempts = row["max_attempts"]
+      @created_at = row["created_at"]
+      @expires_at = row["expires_at"]
     end
 
     # DELETEs the row if the claim is still valid. Returns true/false.
