@@ -20,6 +20,31 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — typed Bun jobs
+
+- Bun `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` now take
+  a payload generic defaulting to `JsonValue`, matching the Node
+  binding's shape: `db.queue<EmailPayload>("emails")` types enqueue,
+  claims, and snapshots.
+- Claimed jobs carry every field the core returns. `state`, `priority`,
+  `runAt`, `claimExpiresAt`, `maxAttempts`, `createdAt`, and
+  `expiresAt` join the id, queue, payload, worker, and attempts fields
+  they already had.
+- **Behavior change:** `Queue.getJob()` returns the camelCase
+  `JobSnapshot` shape with a parsed payload, instead of the SQL ABI's
+  raw snake_case row with a JSON string payload. The old exported
+  `JobRow` interface is replaced by `JobSnapshot<TPayload>`. Same change
+  Node made in the typed-jobs work.
+- A claimed row without `worker_id` or `claim_expires_at` now throws
+  instead of being silently accepted.
+- Payload typing is compile-time only; honker adds no runtime payload
+  validation. `bun run test:types` type-checks the binding and a typed
+  usage fixture, and CI runs it.
+- The binding's own sources now type-check under strict `tsc`. The
+  `bun:ffi` watcher handle and one `bun:sqlite` query binding were
+  previously untypeable (`never` symbols), which broke any strict
+  TypeScript consumer of this package.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
