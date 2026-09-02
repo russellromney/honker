@@ -1,5 +1,22 @@
 # CHANGELOG
 
+## Unreleased — Elixir job details
+
+- `%Honker.Job{}` now carries every field the claim ABI returns: `:state`,
+  `:priority`, `:run_at`, `:claim_expires_at`, `:max_attempts`, `:created_at`,
+  and `:expires_at` join the existing `:id`, `:queue`, `:payload`,
+  `:worker_id`, and `:attempts`.
+- New `Honker.JobSnapshot` struct: the same twelve fields, read-only, with no
+  ack/retry/fail/heartbeat. **Behavior change:** `Honker.Queue.get_job/2`
+  returns `{:ok, %Honker.JobSnapshot{}}` instead of a map of the raw ABI row,
+  so `row["state"]` becomes `row.state`.
+- Snapshot `:payload` stays the raw JSON text the row stores, matching the
+  Python and Go snapshots. `Honker.Job`'s `:payload` is still decoded. The
+  bindings do not yet agree on one snapshot payload encoding; Node decodes it.
+- `test/job_fields_test.exs` asserts every field against the value it was
+  enqueued or claimed with, across pending, delayed, processing, retried, and
+  acked jobs.
+
 ## 2026-08-27 — Node 0.5.1
 
 - Node `@russellthehippo/honker-node`: 0.5.1, with the four

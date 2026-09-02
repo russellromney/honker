@@ -4,10 +4,60 @@ defmodule Honker.Job do
   (`ack/2`, `retry/4`, `fail/3`, `heartbeat/3`) to close it out.
 
   The struct itself is a plain data carrier — all state lives in the
-  database; Elixir just holds a snapshot of the row.
+  database; Elixir just holds a copy of the row as it stood at claim
+  time. To read a job you did *not* claim, use `Honker.Queue.get_job/2`,
+  which returns the read-only `Honker.JobSnapshot`.
+
+  Fields, as the row stood at claim time:
+
+    * `:id`               — row id
+    * `:queue`            — queue this job came from
+    * `:payload`          — the decoded JSON value
+    * `:state`            — `"processing"`
+    * `:priority`         — higher runs first within the queue
+    * `:run_at`           — unix seconds; when it became claimable
+    * `:worker_id`        — the claiming worker
+    * `:claim_expires_at` — unix seconds; heartbeat before this
+    * `:attempts`         — already incremented by this claim
+    * `:max_attempts`     — dead-letters once `:attempts` reaches this
+    * `:created_at`       — unix seconds
+    * `:expires_at`       — unix seconds, or nil when enqueued without
+      `:expires`
+
+  Honker never inspects a payload. Its shape is a contract between the
+  app that enqueues and the app that claims — including across
+  languages, since another binding may write to the same queue.
   """
 
-  defstruct [:id, :queue, :payload, :worker_id, :attempts]
+  defstruct [
+    :id,
+    :queue,
+    :payload,
+    :state,
+    :priority,
+    :run_at,
+    :worker_id,
+    :claim_expires_at,
+    :attempts,
+    :max_attempts,
+    :created_at,
+    :expires_at
+  ]
+
+  @type t :: %__MODULE__{
+          id: integer(),
+          queue: String.t(),
+          payload: term(),
+          state: String.t(),
+          priority: integer(),
+          run_at: integer(),
+          worker_id: String.t(),
+          claim_expires_at: integer(),
+          attempts: integer(),
+          max_attempts: integer(),
+          created_at: integer(),
+          expires_at: integer() | nil
+        }
 
   alias Honker.Database
 

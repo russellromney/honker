@@ -1,13 +1,17 @@
 defmodule Honker.Queue do
   @moduledoc """
-  Named queue operations. All methods take a `Honker.Database` and
-  the queue name as the first two args.
+  Named queue operations. The queue-addressed functions — `enqueue/4`,
+  `claim_batch/4`, `claim_one/3`, `sweep_expired/2` — take a
+  `Honker.Database` and the queue name as the first two args.
 
       {:ok, id} = Honker.Queue.enqueue(db, "emails", %{to: "alice@example.com"})
       {:ok, job} = Honker.Queue.claim_one(db, "emails", "worker-1")
+
+  `get_job/2` and `cancel/2` are the exceptions: they address a job by
+  id and take no queue name. See `get_job/2` for what that means.
   """
 
-  alias Honker.{Database, Job, Transaction}
+  alias Honker.{Database, Job, JobSnapshot, Transaction}
 
   @doc """
   Enqueue a job. `payload` is any term — it's JSON-encoded on the way
@@ -76,6 +80,8 @@ defmodule Honker.Queue do
   Atomically claim up to `n` jobs. Returns `{:ok, [%Job{}, ...]}`,
   possibly empty if the queue had no eligible rows.
   """
+  @spec claim_batch(%Database{}, String.t(), String.t(), pos_integer()) ::
+          {:ok, [Job.t()]} | {:error, term()}
   def claim_batch(%Database{conn: conn} = db, queue_name, worker_id, n) do
     {vis, _max} = Honker.queue_opts(db, queue_name)
 
@@ -98,6 +104,8 @@ defmodule Honker.Queue do
   end
 
   @doc "Claim a single job or `{:ok, nil}` if the queue is empty."
+  @spec claim_one(%Database{}, String.t(), String.t()) ::
+          {:ok, Job.t() | nil} | {:error, term()}
   def claim_one(db, queue_name, worker_id) do
     case claim_batch(db, queue_name, worker_id, 1) do
       {:ok, [job | _]} -> {:ok, job}
@@ -127,13 +135,31 @@ defmodule Honker.Queue do
   end
 
   @doc """
-  Read a single job row by id. Returns `{:ok, map}` with the row
-  fields, or `{:ok, nil}` on miss.
+  Read a single job row by id. Returns `{:ok, %Honker.JobSnapshot{}}`,
+  or `{:ok, nil}` when the job has been ack'd, dead'd, cancelled, or
+  never existed.
+
+  The lookup takes an id and no queue name. Ids are unique across the
+  whole database, so today an id belonging to another queue still
+  resolves and the snapshot's `:queue` names its real queue. Treat that
+  as an implementation detail, not a contract: check `snapshot.queue`
+  yourself if it matters, because queue-scoped lookup is planned and
+  would narrow this.
+
+  ## Upgrading
+
+  Breaking change. This used to return `{:ok, map}` holding the raw ABI
+  row keyed by strings. It now returns a struct, so `row["state"]`
+  becomes `row.state` — a struct has no `Access` behaviour, so the old
+  bracket form raises `UndefinedFunctionError` rather than returning
+  nil. Rewrite every bracket read of a `get_job/2` result.
   """
+  @spec get_job(%Database{}, integer()) ::
+          {:ok, JobSnapshot.t() | nil} | {:error, term()}
   def get_job(%Honker.Database{conn: conn}, job_id) do
     case Honker.query_first(conn, "SELECT honker_get_job(?1)", [job_id]) do
       {:ok, [raw]} when is_binary(raw) and byte_size(raw) > 0 ->
-        {:ok, Jason.decode!(raw)}
+        {:ok, raw |> Jason.decode!() |> JobSnapshot.from_row()}
 
       {:ok, _} ->
         {:ok, nil}
@@ -148,8 +174,15 @@ defmodule Honker.Queue do
       id: row["id"],
       queue: row["queue"],
       payload: Jason.decode!(row["payload"]),
+      state: row["state"],
+      priority: row["priority"],
+      run_at: row["run_at"],
       worker_id: row["worker_id"],
-      attempts: row["attempts"]
+      claim_expires_at: row["claim_expires_at"],
+      attempts: row["attempts"],
+      max_attempts: row["max_attempts"],
+      created_at: row["created_at"],
+      expires_at: row["expires_at"]
     }
   end
 end

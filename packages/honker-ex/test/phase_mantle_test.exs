@@ -124,9 +124,9 @@ defmodule PhaseMantleTest do
     {:ok, id} = Honker.Queue.enqueue(db, "emails", %{"to" => "alice@example.com"})
 
     {:ok, row} = Honker.Queue.get_job(db, id)
-    assert row["queue"] == "emails"
-    assert row["state"] == "pending"
-    assert row["id"] == id
+    assert row.queue == "emails"
+    assert row.state == "pending"
+    assert row.id == id
 
     assert {:ok, true} = Honker.Queue.cancel(db, id)
     assert {:ok, false} = Honker.Queue.cancel(db, id)
