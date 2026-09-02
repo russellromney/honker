@@ -20,7 +20,41 @@
 //! bootstraps the schema. No `.dylib` load needed at runtime.
 //! Use the loadable extension (`honker-extension`) only when mixing
 //! with other SQLite clients on the same file.
+//!
+//! # Typed payloads
+//!
+//! [`Queue`] carries a payload type parameter. `db.queue(..)` gives
+//! you a [`Queue<serde_json::Value>`]; [`Database::typed_queue`] (or
+//! [`Queue::typed`]) gives you a `Queue<T>` for your own type:
+//!
+//! ```no_run
+//! use honker::{Database, EnqueueOpts, QueueOpts};
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Email { to: String }
+//!
+//! let db = Database::open("app.db").unwrap();
+//! let q = db.typed_queue::<Email>("emails", QueueOpts::default());
+//!
+//! q.enqueue(&Email { to: "alice@example.com".into() }, EnqueueOpts::default()).unwrap();
+//!
+//! if let Some(job) = q.claim_one("worker-1").unwrap() {
+//!     let email: Email = job.payload_typed().unwrap();
+//!     println!("{}", email.to);
+//!     job.ack().unwrap();
+//! }
+//! ```
+//!
+//! The type parameter is a compile-time convenience for **your**
+//! code. honker never checks payload shape: the database stores the
+//! payload as opaque JSON text, and nothing on the write path
+//! validates it. Two processes writing the same queue with different
+//! `T` will happily produce rows the other cannot decode; the only
+//! error you get is a `serde` failure at `payload_typed()` time.
+//! Keeping producers and consumers in agreement is your job.
 
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -146,19 +180,47 @@ impl Database {
         })
     }
 
-    /// Get a named queue handle. Defaults: 300s visibility timeout,
+    /// Get a named queue handle whose payload type is
+    /// `serde_json::Value`. Defaults: 300s visibility timeout,
     /// 3 max attempts.
+    ///
+    /// **For your own payload type, use
+    /// [`typed_queue`](Database::typed_queue) — not this method.**
+    /// `queue` is deliberately non-generic so that
+    /// `let q = db.queue(..)` keeps inferring, which means
+    /// `db.queue::<Email>(..)` is a compile error ("method takes 0
+    /// generic arguments") and `let q: Queue<Email> = db.queue(..)`
+    /// is a type mismatch. Neither message will point you here.
+    /// Reach for `db.typed_queue::<Email>(..)`, or
+    /// [`Queue::typed`] on a handle you already hold.
     pub fn queue(&self, name: &str, opts: QueueOpts) -> Queue {
+        self.typed_queue(name, opts)
+    }
+
+    /// Get a named queue handle whose payloads are your own type.
+    ///
+    /// `T` only constrains this handle's `enqueue` argument and the
+    /// type `payload_typed()` decodes into. honker stores the payload
+    /// as opaque JSON and never validates its shape — see the crate
+    /// docs.
+    pub fn typed_queue<T>(&self, name: &str, opts: QueueOpts) -> Queue<T> {
         Queue {
             inner: self.inner.clone(),
             name: name.to_string(),
             opts,
+            _payload: PhantomData,
         }
     }
 
-    /// Get a named transactional outbox handle.
+    /// Get a named transactional outbox handle carrying
+    /// `serde_json::Value` payloads.
     pub fn outbox(&self, name: &str, opts: OutboxOpts) -> Outbox {
         Outbox::new(self, name, opts)
+    }
+
+    /// Get a named transactional outbox handle carrying `T` payloads.
+    pub fn typed_outbox<T>(&self, name: &str, opts: OutboxOpts) -> Outbox<T> {
+        Outbox::new_typed(self, name, opts)
     }
 
     /// Get a named stream handle.
@@ -443,11 +505,33 @@ pub struct EnqueueOpts {
     pub expires: Option<i64>,
 }
 
-#[derive(Clone)]
-pub struct Queue {
+/// A named queue handle. `T` is the payload type this handle
+/// enqueues and decodes; it defaults to `serde_json::Value`.
+///
+/// Build one with [`Database::queue`] for the `serde_json::Value`
+/// default, or [`Database::typed_queue`] / [`Queue::typed`] for your
+/// own type. A default type parameter cannot live on a function, so
+/// `Database::queue` is not generic and there is a separate
+/// constructor rather than one inferring `queue::<T>()`.
+///
+/// The parameter is compile-time only. honker does not validate
+/// payload shape in the database — see the crate docs.
+pub struct Queue<T = serde_json::Value> {
     inner: Arc<Inner>,
     name: String,
     opts: QueueOpts,
+    _payload: PhantomData<fn(T) -> T>,
+}
+
+impl<T> Clone for Queue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            name: self.name.clone(),
+            opts: self.opts.clone(),
+            _payload: PhantomData,
+        }
+    }
 }
 
 /// Transactional side-effect delivery options.
@@ -468,16 +552,40 @@ impl Default for OutboxOpts {
     }
 }
 
-#[derive(Clone)]
-pub struct Outbox {
+/// A transactional outbox handle. `T` is the payload type, and
+/// defaults to `serde_json::Value`.
+pub struct Outbox<T = serde_json::Value> {
     name: String,
-    queue: Queue,
+    queue: Queue<T>,
     base_backoff_s: i64,
 }
 
-impl Outbox {
+impl<T> Clone for Outbox<T> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            queue: self.queue.clone(),
+            base_backoff_s: self.base_backoff_s,
+        }
+    }
+}
+
+impl Outbox<serde_json::Value> {
+    /// Build an outbox handle carrying `serde_json::Value` payloads.
+    ///
+    /// Deliberately *not* generic: a generic `new` would leave `T`
+    /// uninferrable in `let ob = Outbox::new(..)`. Use
+    /// [`Outbox::new_typed`] or [`Database::typed_outbox`] for a typed
+    /// handle.
     pub fn new(db: &Database, name: &str, opts: OutboxOpts) -> Self {
-        let queue = db.queue(
+        Self::new_typed(db, name, opts)
+    }
+}
+
+impl<T> Outbox<T> {
+    /// Build an outbox handle carrying `T` payloads.
+    pub fn new_typed(db: &Database, name: &str, opts: OutboxOpts) -> Self {
+        let queue = db.typed_queue(
             &format!("_outbox:{name}"),
             QueueOpts {
                 visibility_timeout_s: opts.visibility_timeout_s,
@@ -495,33 +603,35 @@ impl Outbox {
         &self.name
     }
 
-    pub fn queue(&self) -> &Queue {
+    pub fn queue(&self) -> &Queue<T> {
         &self.queue
     }
 
-    pub fn enqueue<P: Serialize>(&self, payload: &P, opts: EnqueueOpts) -> Result<i64> {
+    pub fn enqueue(&self, payload: &T, opts: EnqueueOpts) -> Result<i64>
+    where
+        T: Serialize,
+    {
         self.queue.enqueue(payload, opts)
     }
 
-    pub fn enqueue_tx<P: Serialize>(
-        &self,
-        tx: &Transaction<'_>,
-        payload: &P,
-        opts: EnqueueOpts,
-    ) -> Result<i64> {
+    pub fn enqueue_tx(&self, tx: &Transaction<'_>, payload: &T, opts: EnqueueOpts) -> Result<i64>
+    where
+        T: Serialize,
+    {
         self.queue.enqueue_tx(tx, payload, opts)
     }
 
     /// Claim and deliver one outbox job. Returns false if no job was ready.
     pub fn run_once<F, E>(&self, worker_id: &str, mut delivery: F) -> Result<bool>
     where
-        F: FnMut(serde_json::Value) -> std::result::Result<(), E>,
+        T: DeserializeOwned,
+        F: FnMut(T) -> std::result::Result<(), E>,
         E: std::fmt::Display,
     {
         let Some(job) = self.queue.claim_one(worker_id)? else {
             return Ok(false);
         };
-        let payload: serde_json::Value = serde_json::from_slice(&job.payload)?;
+        let payload: T = job.payload_typed()?;
         match delivery(payload) {
             Ok(()) => {
                 if !job.ack()? {
@@ -549,13 +659,43 @@ impl Outbox {
     }
 }
 
-impl Queue {
+impl<T> Queue<T> {
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Reinterpret this handle's payload type. Same queue, same
+    /// options, different compile-time payload type. Nothing is
+    /// re-encoded or re-validated — rows already on disk are
+    /// untouched, and a mismatched `U` only surfaces as a `serde`
+    /// error when you call `payload_typed()`.
+    ///
+    /// This is also how a generic helper keeps taking a plain
+    /// `&Queue` after `enqueue` narrowed to `&T`: change the body,
+    /// not the signature, so the helper's own call sites are
+    /// untouched.
+    ///
+    /// ```no_run
+    /// # use honker::{EnqueueOpts, Queue};
+    /// # use serde::Serialize;
+    /// fn helper<P: Serialize>(q: &Queue, p: &P) -> honker::Result<i64> {
+    ///     q.typed::<P>().enqueue(p, EnqueueOpts::default())
+    /// }
+    /// ```
+    pub fn typed<U>(&self) -> Queue<U> {
+        Queue {
+            inner: self.inner.clone(),
+            name: self.name.clone(),
+            opts: self.opts.clone(),
+            _payload: PhantomData,
+        }
+    }
+
     /// Enqueue on a freshly acquired connection.
-    pub fn enqueue<P: Serialize>(&self, payload: &P, opts: EnqueueOpts) -> Result<i64> {
+    pub fn enqueue(&self, payload: &T, opts: EnqueueOpts) -> Result<i64>
+    where
+        T: Serialize,
+    {
         let json = serde_json::to_string(payload)?;
         Ok(self
             .inner
@@ -564,12 +704,10 @@ impl Queue {
 
     /// Enqueue inside an open transaction. Atomic with whatever else
     /// ran on the same `tx`.
-    pub fn enqueue_tx<P: Serialize>(
-        &self,
-        tx: &Transaction<'_>,
-        payload: &P,
-        opts: EnqueueOpts,
-    ) -> Result<i64> {
+    pub fn enqueue_tx(&self, tx: &Transaction<'_>, payload: &T, opts: EnqueueOpts) -> Result<i64>
+    where
+        T: Serialize,
+    {
         let json = serde_json::to_string(payload)?;
         Ok(enqueue_on(
             tx.conn(),
@@ -581,7 +719,7 @@ impl Queue {
     }
 
     /// Atomically claim up to `n` jobs.
-    pub fn claim_batch(&self, worker_id: &str, n: i64) -> Result<Vec<Job>> {
+    pub fn claim_batch(&self, worker_id: &str, n: i64) -> Result<Vec<Job<T>>> {
         let rows_json: String = self.inner.with_conn(|c| {
             c.query_row(
                 "SELECT honker_claim_batch(?1, ?2, ?3, ?4)",
@@ -590,21 +728,13 @@ impl Queue {
             )
         })?;
         let raw: Vec<RawJob> = serde_json::from_str(&rows_json)?;
-        Ok(raw
-            .into_iter()
-            .map(|r| Job {
-                inner: self.inner.clone(),
-                id: r.id,
-                queue: r.queue,
-                payload: r.payload.into_bytes(),
-                worker_id: r.worker_id,
-                attempts: r.attempts,
-            })
-            .collect())
+        raw.into_iter()
+            .map(|r| r.into_job(self.inner.clone()))
+            .collect()
     }
 
     /// Claim a single job, or `None` if the queue is empty.
-    pub fn claim_one(&self, worker_id: &str) -> Result<Option<Job>> {
+    pub fn claim_one(&self, worker_id: &str) -> Result<Option<Job<T>>> {
         Ok(self.claim_batch(worker_id, 1)?.into_iter().next())
     }
 
@@ -639,14 +769,18 @@ impl Queue {
 
     /// Read a single job row by id. Returns `Some(JobRow)` or `None`
     /// on miss (ack'd, dead'd, or never existed). Pure read.
-    pub fn get_job(&self, job_id: i64) -> Result<Option<JobRow>> {
+    ///
+    /// NOT queue-scoped: job ids are globally unique and this lookup
+    /// hits any queue's row. Scoping is tracked in #134.
+    pub fn get_job(&self, job_id: i64) -> Result<Option<JobRow<T>>> {
         let json: String = self.inner.with_conn(|c| {
             c.query_row("SELECT honker_get_job(?1)", params![job_id], |r| r.get(0))
         })?;
         if json.is_empty() {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_str(&json)?))
+        let raw: RawJob = serde_json::from_str(&json)?;
+        Ok(Some(raw.into_row()))
     }
 
     /// Sweep expired processing rows back to pending. Returns rows touched.
@@ -662,7 +796,7 @@ impl Queue {
     /// by dropping the `Database` or calling `stop()` on a shared
     /// `Arc<AtomicBool>` you thread in yourself — this helper is the
     /// minimum that actually replaces a polling loop.
-    pub fn claim_waker(&self) -> ClaimWaker {
+    pub fn claim_waker(&self) -> ClaimWaker<T> {
         let (sub_id, rx) = self.inner.updates.subscribe();
         ClaimWaker {
             inner: self.inner.clone(),
@@ -670,6 +804,7 @@ impl Queue {
             visibility_timeout_s: self.opts.visibility_timeout_s,
             sub_id,
             rx,
+            _payload: PhantomData,
         }
     }
 }
@@ -696,25 +831,89 @@ fn enqueue_on(
     )
 }
 
+/// The wire shape shared by `honker_claim_batch()` and
+/// `honker_get_job()`. Both return the same twelve snake_case keys.
 #[derive(Deserialize)]
 struct RawJob {
     id: i64,
     queue: String,
     payload: String,
-    worker_id: String,
+    state: String,
+    priority: i64,
+    run_at: i64,
+    worker_id: Option<String>,
+    claim_expires_at: Option<i64>,
     attempts: i64,
-    #[serde(rename = "claim_expires_at")]
-    #[allow(dead_code)]
-    claim_expires_at: i64,
+    max_attempts: i64,
+    created_at: i64,
+    expires_at: Option<i64>,
 }
 
-/// One row from `Queue::get_job()`. Pure data, no claim semantics.
-#[derive(Debug, Deserialize, Clone)]
-pub struct JobRow {
+impl RawJob {
+    /// A claimed row always carries a holder and a claim deadline. If
+    /// core ever hands one back without them, that is a bug worth
+    /// crashing the claim on, not defaulting past.
+    fn into_job<T>(self, inner: Arc<Inner>) -> Result<Job<T>> {
+        let id = self.id;
+        let worker_id = self.worker_id.ok_or_else(|| {
+            Error::Core(format!("claimed job {id} came back without a worker_id"))
+        })?;
+        let claim_expires_at = self.claim_expires_at.ok_or_else(|| {
+            Error::Core(format!(
+                "claimed job {id} came back without a claim_expires_at"
+            ))
+        })?;
+        Ok(Job {
+            inner,
+            id,
+            queue: self.queue,
+            payload: self.payload.into_bytes(),
+            state: self.state,
+            priority: self.priority,
+            run_at: self.run_at,
+            worker_id,
+            claim_expires_at,
+            attempts: self.attempts,
+            max_attempts: self.max_attempts,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            _payload: PhantomData,
+        })
+    }
+
+    fn into_row<T>(self) -> JobRow<T> {
+        JobRow {
+            id: self.id,
+            queue: self.queue,
+            payload: self.payload,
+            state: self.state,
+            priority: self.priority,
+            run_at: self.run_at,
+            worker_id: self.worker_id,
+            claim_expires_at: self.claim_expires_at,
+            attempts: self.attempts,
+            max_attempts: self.max_attempts,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            _payload: PhantomData,
+        }
+    }
+}
+
+/// One row from `Queue::get_job()`. Pure data, no claim semantics —
+/// there is no ack/retry/fail/heartbeat here because a snapshot does
+/// not hold a claim.
+///
+/// `payload` stays the raw JSON text exactly as stored. Use
+/// [`JobRow::payload_typed`] to decode it into the queue's `T`.
+#[derive(Deserialize)]
+#[serde(bound = "")]
+pub struct JobRow<T = serde_json::Value> {
     pub id: i64,
     pub queue: String,
     /// JSON-serialized payload string.
     pub payload: String,
+    /// `"pending"` or `"processing"`.
     pub state: String,
     pub priority: i64,
     pub run_at: i64,
@@ -724,20 +923,120 @@ pub struct JobRow {
     pub max_attempts: i64,
     pub created_at: i64,
     pub expires_at: Option<i64>,
+    #[serde(skip)]
+    _payload: PhantomData<fn(T) -> T>,
+}
+
+impl<T> JobRow<T> {
+    /// Decode `payload` into the queue's payload type. Pure `serde`
+    /// deserialization — honker performs no shape check of its own.
+    pub fn payload_typed(&self) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        Ok(serde_json::from_str(&self.payload)?)
+    }
+
+    /// Decode `payload` into any type you name.
+    pub fn payload_as<U: DeserializeOwned>(&self) -> Result<U> {
+        Ok(serde_json::from_str(&self.payload)?)
+    }
+}
+
+impl<T> Clone for JobRow<T> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            queue: self.queue.clone(),
+            payload: self.payload.clone(),
+            state: self.state.clone(),
+            priority: self.priority,
+            run_at: self.run_at,
+            worker_id: self.worker_id.clone(),
+            claim_expires_at: self.claim_expires_at,
+            attempts: self.attempts,
+            max_attempts: self.max_attempts,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            _payload: PhantomData,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for JobRow<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobRow")
+            .field("id", &self.id)
+            .field("queue", &self.queue)
+            .field("payload", &self.payload)
+            .field("state", &self.state)
+            .field("priority", &self.priority)
+            .field("run_at", &self.run_at)
+            .field("worker_id", &self.worker_id)
+            .field("claim_expires_at", &self.claim_expires_at)
+            .field("attempts", &self.attempts)
+            .field("max_attempts", &self.max_attempts)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// A claimed unit of work. `payload` is raw JSON bytes.
-pub struct Job {
+///
+/// Carries the same twelve fields as [`JobRow`] plus the claim
+/// methods: `ack`, `retry`, `fail`, `heartbeat`. `state` is always
+/// `"processing"` and `worker_id` / `claim_expires_at` are never null
+/// because holding a claim is what makes this a `Job`.
+pub struct Job<T = serde_json::Value> {
     inner: Arc<Inner>,
     pub id: i64,
     pub queue: String,
     pub payload: Vec<u8>,
+    /// Always `"processing"` for a claimed job.
+    pub state: String,
+    pub priority: i64,
+    pub run_at: i64,
     pub worker_id: String,
+    pub claim_expires_at: i64,
     pub attempts: i64,
+    pub max_attempts: i64,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    _payload: PhantomData<fn(T) -> T>,
 }
 
-impl Job {
-    pub fn payload_as<T: DeserializeOwned>(&self) -> Result<T> {
+impl<T> std::fmt::Debug for Job<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Job")
+            .field("id", &self.id)
+            .field("queue", &self.queue)
+            .field("payload", &String::from_utf8_lossy(&self.payload))
+            .field("state", &self.state)
+            .field("priority", &self.priority)
+            .field("run_at", &self.run_at)
+            .field("worker_id", &self.worker_id)
+            .field("claim_expires_at", &self.claim_expires_at)
+            .field("attempts", &self.attempts)
+            .field("max_attempts", &self.max_attempts)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl<T> Job<T> {
+    /// Decode `payload` into the queue's payload type. Pure `serde`
+    /// deserialization — honker performs no shape check of its own.
+    pub fn payload_typed(&self) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        Ok(serde_json::from_slice(&self.payload)?)
+    }
+
+    /// Decode `payload` into any type you name.
+    pub fn payload_as<U: DeserializeOwned>(&self) -> Result<U> {
         Ok(serde_json::from_slice(&self.payload)?)
     }
 
@@ -794,18 +1093,19 @@ impl Job {
 
 /// WAL-wake claim helper. Call `next(worker_id)` to claim the next
 /// available job; blocks until one arrives.
-pub struct ClaimWaker {
+pub struct ClaimWaker<T = serde_json::Value> {
     inner: Arc<Inner>,
     name: String,
     visibility_timeout_s: i64,
     sub_id: u64,
     rx: Receiver<()>,
+    _payload: PhantomData<fn(T) -> T>,
 }
 
-impl ClaimWaker {
+impl<T> ClaimWaker<T> {
     /// Block until a job is claimable, then claim and return it.
     /// Returns `None` only if the shared update watcher is dropped.
-    pub fn next(&self, worker_id: &str) -> Result<Option<Job>> {
+    pub fn next(&self, worker_id: &str) -> Result<Option<Job<T>>> {
         loop {
             let rows_json: String = self.inner.with_conn(|c| {
                 c.query_row(
@@ -816,14 +1116,7 @@ impl ClaimWaker {
             })?;
             let raw: Vec<RawJob> = serde_json::from_str(&rows_json)?;
             if let Some(r) = raw.into_iter().next() {
-                return Ok(Some(Job {
-                    inner: self.inner.clone(),
-                    id: r.id,
-                    queue: r.queue,
-                    payload: r.payload.into_bytes(),
-                    worker_id: r.worker_id,
-                    attempts: r.attempts,
-                }));
+                return Ok(Some(r.into_job(self.inner.clone())?));
             }
             let next_at: i64 = self.inner.with_conn(|c| {
                 c.query_row(
@@ -846,7 +1139,7 @@ impl ClaimWaker {
 
     /// Try to claim without blocking. Returns `None` if the queue is
     /// empty right now.
-    pub fn try_next(&self, worker_id: &str) -> Result<Option<Job>> {
+    pub fn try_next(&self, worker_id: &str) -> Result<Option<Job<T>>> {
         let rows_json: String = self.inner.with_conn(|c| {
             c.query_row(
                 "SELECT honker_claim_batch(?1, ?2, ?3, ?4)",
@@ -855,18 +1148,14 @@ impl ClaimWaker {
             )
         })?;
         let raw: Vec<RawJob> = serde_json::from_str(&rows_json)?;
-        Ok(raw.into_iter().next().map(|r| Job {
-            inner: self.inner.clone(),
-            id: r.id,
-            queue: r.queue,
-            payload: r.payload.into_bytes(),
-            worker_id: r.worker_id,
-            attempts: r.attempts,
-        }))
+        raw.into_iter()
+            .next()
+            .map(|r| r.into_job(self.inner.clone()))
+            .transpose()
     }
 }
 
-impl Drop for ClaimWaker {
+impl<T> Drop for ClaimWaker<T> {
     fn drop(&mut self) {
         self.inner.updates.unsubscribe(self.sub_id);
     }
@@ -1702,5 +1991,152 @@ impl Drop for Lock {
                 )
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_job_mapping {
+    //! `state` on a claimed job is always `"processing"` end-to-end, so
+    //! no integration test can tell a real read from a hardcoded
+    //! `"processing"`. These tests drive `RawJob`'s two conversions
+    //! directly with a synthetic wire row whose every value is
+    //! distinct, so neither a swap nor a constant survives.
+    use super::*;
+
+    fn raw(state: &str) -> RawJob {
+        serde_json::from_value(serde_json::json!({
+            "id": 11,
+            "queue": "mapping",
+            "payload": "{\"k\":1}",
+            "state": state,
+            "priority": 13,
+            "run_at": 17,
+            "worker_id": "w-19",
+            "claim_expires_at": 23,
+            "attempts": 29,
+            "max_attempts": 31,
+            "created_at": 37,
+            "expires_at": 41
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn into_job_reads_every_field_from_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path().join("m.db")).unwrap();
+        let job: Job = raw("sentinel-state").into_job(db.inner.clone()).unwrap();
+
+        assert_eq!(job.state, "sentinel-state", "state, not a constant");
+        assert_eq!(job.id, 11, "id");
+        assert_eq!(job.queue, "mapping", "queue");
+        assert_eq!(job.payload, br#"{"k":1}"#.to_vec(), "payload");
+        assert_eq!(job.priority, 13, "priority");
+        assert_eq!(job.run_at, 17, "run_at");
+        assert_eq!(job.worker_id, "w-19", "worker_id");
+        assert_eq!(job.claim_expires_at, 23, "claim_expires_at");
+        assert_eq!(job.attempts, 29, "attempts");
+        assert_eq!(job.max_attempts, 31, "max_attempts");
+        assert_eq!(job.created_at, 37, "created_at");
+        assert_eq!(job.expires_at, Some(41), "expires_at");
+    }
+
+    #[test]
+    fn into_row_reads_every_field_from_the_row() {
+        let row: JobRow = raw("sentinel-state").into_row();
+
+        assert_eq!(row.state, "sentinel-state", "state, not a constant");
+        assert_eq!(row.id, 11, "id");
+        assert_eq!(row.queue, "mapping", "queue, not a constant");
+        assert_eq!(row.payload, r#"{"k":1}"#, "payload");
+        assert_eq!(row.priority, 13, "priority, not a constant");
+        assert_eq!(row.run_at, 17, "run_at");
+        assert_eq!(row.worker_id.as_deref(), Some("w-19"), "worker_id");
+        assert_eq!(row.claim_expires_at, Some(23), "claim_expires_at");
+        assert_eq!(row.attempts, 29, "attempts");
+        assert_eq!(row.max_attempts, 31, "max_attempts, not a constant");
+        assert_eq!(row.created_at, 37, "created_at");
+        assert_eq!(row.expires_at, Some(41), "expires_at");
+    }
+
+    /// The wire row minus one key, so the null cases can be built
+    /// without repeating the whole blob.
+    fn raw_without(key: &str) -> RawJob {
+        let mut v = serde_json::json!({
+            "id": 11,
+            "queue": "mapping",
+            "payload": "{\"k\":1}",
+            "state": "processing",
+            "priority": 13,
+            "run_at": 17,
+            "worker_id": "w-19",
+            "claim_expires_at": 23,
+            "attempts": 29,
+            "max_attempts": 31,
+            "created_at": 37,
+            "expires_at": 41
+        });
+        v[key] = serde_json::Value::Null;
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn into_job_errors_on_a_claim_with_no_worker_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path().join("m.db")).unwrap();
+        let err = raw_without("worker_id")
+            .into_job::<serde_json::Value>(db.inner.clone())
+            .expect_err("a claimed row without a holder must not default past");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worker_id") && msg.contains("11"),
+            "the error should name the field and the job id, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn into_job_errors_on_a_claim_with_no_claim_expires_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path().join("m.db")).unwrap();
+        let err = raw_without("claim_expires_at")
+            .into_job::<serde_json::Value>(db.inner.clone())
+            .expect_err("a claimed row without a deadline must not default past");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claim_expires_at") && msg.contains("11"),
+            "the error should name the field and the job id, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn into_row_keeps_the_same_nulls_as_none() {
+        // The snapshot path is the mirror image: a pending row
+        // legitimately has neither, and they must arrive as `None` —
+        // never `Some("")` or `Some(0)`.
+        let row: JobRow = raw_without("worker_id").into_row();
+        assert_eq!(row.worker_id, None, "worker_id null stays None");
+        let row: JobRow = raw_without("claim_expires_at").into_row();
+        assert_eq!(
+            row.claim_expires_at, None,
+            "claim_expires_at null stays None"
+        );
+        let row: JobRow = raw_without("expires_at").into_row();
+        assert_eq!(row.expires_at, None, "expires_at null stays None");
+    }
+
+    #[test]
+    fn job_row_still_deserializes_from_a_raw_get_job_blob() {
+        // Regression guard for the restored `Deserialize` derive: this
+        // is the documented way to build a `JobRow` outside the crate.
+        let row: JobRow = serde_json::from_str(
+            r#"{"id":11,"queue":"mapping","payload":"{}","state":"pending",
+                "priority":13,"run_at":17,"worker_id":null,
+                "claim_expires_at":null,"attempts":0,"max_attempts":31,
+                "created_at":37,"expires_at":null}"#,
+        )
+        .unwrap();
+        assert_eq!(row.id, 11);
+        assert_eq!(row.priority, 13);
+        assert_eq!(row.worker_id, None);
     }
 }

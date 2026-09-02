@@ -20,6 +20,89 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — typed Rust jobs
+
+- `honker` (Rust): claimed `Job` and the `JobRow` snapshot now carry all
+  twelve fields core returns — `id`, `queue`, `payload`, `state`,
+  `priority`, `run_at`, `worker_id`, `claim_expires_at`, `attempts`,
+  `max_attempts`, `created_at`, `expires_at`. `Job` keeps `ack`, `retry`,
+  `fail`, `heartbeat`; `JobRow` stays data only.
+- `Queue`, `Job`, `JobRow`, `ClaimWaker`, and `Outbox` gained a payload
+  type parameter defaulting to `serde_json::Value`, so `db.queue(..)`
+  and `db.outbox(..)` behave exactly as before. `db.typed_queue::<T>()`,
+  `db.typed_outbox::<T>()`, and `Queue::typed::<T>()` produce typed
+  handles; `payload_typed()` decodes into the handle's `T` and the
+  existing `payload_as::<U>()` still decodes into anything you name.
+  A default type parameter cannot go on a function, so `Database::queue`
+  stays non-generic (otherwise `let q = db.queue(..)` would stop
+  inferring) and `typed_queue` is a separate constructor. The cost is
+  that `db.queue::<Email>(..)` is `error[E0107]: method takes 0 generic
+  arguments` — with a "remove the unnecessary generics" hint pointing
+  the wrong way — and `let q: Queue<Email> = db.queue(..)` is an E0308.
+  Neither message mentions `typed_queue`, so `Database::queue`'s and
+  `Queue`'s rustdoc now say where to go.
+- Payload encoding is unchanged: `Job::payload` stays raw JSON bytes and
+  `JobRow::payload` stays a raw JSON string. The type parameter is
+  compile-time only — honker never validates payload shape in the
+  database, and a mismatch surfaces only as a `serde` error at decode.
+- **Breaking (source), 1 of 2 — `enqueue` takes `&T`.**
+  `Queue::enqueue` / `enqueue_tx` and `Outbox::enqueue` / `enqueue_tx`
+  now take `&T` instead of any `&impl Serialize`, and
+  `Outbox::run_once`'s delivery closure takes `T` instead of
+  `serde_json::Value`. On the default handles `T` is `serde_json::Value`,
+  so `q.enqueue(&json!(..))` is untouched. Everything else is
+  `error[E0308]: mismatched types / expected &Value, found &X`:
+  - `q.enqueue(&MyStruct { .. })`, `q.enqueue(&"hello")`,
+    `q.enqueue(&vec![1u8, 2, 3])` — migrate the handle:
+    `db.typed_queue::<MyStruct>(..)` or `q.typed::<MyStruct>()`.
+  - Two different payload types through one handle — you now need one
+    typed handle per type, or keep the handle at `serde_json::Value` and
+    `serde_json::to_value(..)` at the call site.
+  - A generic helper, `fn helper<P: Serialize>(q: &Queue, p: &P)`, no
+    longer compiles as written, but the migration is body-only —
+    `Queue::typed` reinterprets the handle in place, so the signature
+    and every call site stay as they are:
+    ```rust
+    fn helper<P: Serialize>(q: &Queue, p: &P) -> honker::Result<i64> {
+        q.typed::<P>().enqueue(p, EnqueueOpts::default())
+    }
+    ```
+    `typed()` clones the handle (an `Arc` and the queue name); it does
+    not touch the database. Widening the signature to
+    `fn helper<P: Serialize>(q: &Queue<P>, p: &P)` also works but
+    changes the helper's call sites too, and
+    `q.enqueue(&serde_json::to_value(p)?, ..)` works at the cost of an
+    intermediate `Value`. Prefer `typed::<P>()`.
+- **Breaking (source), 2 of 2 — `JobRow` is no longer constructible with
+  struct literal syntax.** `JobRow<T>` needs a private `PhantomData`
+  field to carry `T`, and a private field disables struct literals
+  outside the crate:
+  ```
+  error: cannot construct `JobRow<_>` with struct literal syntax due to private fields
+    = note: ...and other private field `_payload` that was not provided
+  ```
+  There is no form of the type parameter that keeps struct literals
+  working, so this one is kept, not fixed. Build the row through
+  `Deserialize` instead — `serde_json::from_value(json!({ .. }))` or
+  `serde_json::from_str(..)` with the twelve snake_case keys — which is
+  what a fake in your own tests should do anyway.
+- **Not breaking after all:** `JobRow` keeps `Debug`, `Clone`, and
+  `Deserialize`. The generic briefly dropped all three; `Debug` and
+  `Clone` are hand-written (so they no longer require `T: Debug` /
+  `T: Clone`), and `Deserialize` is re-derived with `#[serde(bound = "")]`
+  plus `#[serde(skip)]` on the phantom field. Deserializing a raw
+  `honker_get_job()` blob straight into `JobRow` still compiles and is
+  covered by a test.
+- **Not breaking after all:** `Outbox::new(&db, name, opts)` still infers
+  its payload type. Making `Outbox` generic had moved `new` onto
+  `impl<T>`, which broke a bare `let ob = Outbox::new(..)` with
+  `error[E0282]: type annotations needed for Outbox<_>`. `new` is back on
+  an inherent `impl Outbox<serde_json::Value>`; the generic constructor
+  is the new `Outbox::new_typed`, which is what `Database::typed_outbox`
+  calls.
+- A claimed row that comes back without a `worker_id` or
+  `claim_expires_at` is now an error instead of a silent default.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
