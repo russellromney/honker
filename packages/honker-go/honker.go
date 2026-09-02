@@ -661,7 +661,14 @@ func (q *Queue) EnqueueTx(tx *Transaction, payload any, opts EnqueueOptions) (in
 // plus the claim methods (Ack, Retry, Fail, Heartbeat). WorkerID and
 // ClaimExpiresAt are always set: the claim UPDATE writes both. State is
 // "processing" by construction. ExpiresAt is nil when the job was
-// enqueued without EnqueueOptions.Expires.
+// enqueued without EnqueueOptions.Expires — never 0.
+//
+// Every field is a snapshot taken at claim time. Ack, Retry, Fail, and
+// Heartbeat change the row in the database; they do not write back to
+// this struct. In particular Heartbeat extends the claim in the
+// database but leaves ClaimExpiresAt at its claim-time value, so do not
+// compute remaining claim time from ClaimExpiresAt after a heartbeat —
+// track your own deadline, or re-read with Queue.GetJob.
 type Job struct {
 	q *Queue
 
@@ -771,6 +778,10 @@ func (j *Job) Fail(errMsg string) (bool, error) {
 
 // Heartbeat extends the claim's visibility timeout. Useful for
 // long-running jobs that might exceed the default visibility window.
+//
+// Heartbeat does not refresh j.ClaimExpiresAt — that field stays at its
+// claim-time value. Re-read the row with Queue.GetJob if you need the
+// new deadline.
 func (j *Job) Heartbeat(extendSec int64) (bool, error) {
 	var n int64
 	err := j.q.db.db.QueryRow(
@@ -799,10 +810,12 @@ func (q *Queue) AckBatch(ids []int64, workerID string) (int64, error) {
 // semantics — a JobRow has no Ack, Retry, Fail, or Heartbeat.
 //
 // It carries the same twelve fields as a claimed Job. Payload is the
-// raw JSON text of the job payload; use PayloadBytes with DecodePayload
-// to decode it. WorkerID and ClaimExpiresAt are nil while the job is
-// pending and set once a worker claims it. ExpiresAt is nil unless the
-// job was enqueued with EnqueueOptions.Expires.
+// raw JSON text of the job payload — a string rather than []byte
+// because encoding/json would base64 a []byte field; use PayloadBytes
+// with DecodePayload to decode it. WorkerID and ClaimExpiresAt are nil
+// while the job is pending and set once a worker claims it. ExpiresAt
+// is nil unless the job was enqueued with EnqueueOptions.Expires. All
+// three are nil, never 0 or "", when the column is NULL.
 type JobRow struct {
 	ID             int64   `json:"id"`
 	Queue          string  `json:"queue"`
@@ -819,7 +832,8 @@ type JobRow struct {
 }
 
 // PayloadBytes returns the row's payload as raw JSON bytes, so a JobRow
-// decodes through the same path as a claimed Job.
+// decodes through the same path as a claimed Job. Queue.GetJob returns
+// a nil row on a miss; check for nil before calling this.
 func (r *JobRow) PayloadBytes() []byte {
 	return []byte(r.Payload)
 }
@@ -837,7 +851,14 @@ var ErrEmptyPayload = errors.New("empty payload")
 //	}
 //
 //	email, err := honker.DecodePayload[Email](job.Payload)
-//	row, _ := q.GetJob(id)
+//
+//	row, err := q.GetJob(id)
+//	if err != nil {
+//	    return err
+//	}
+//	if row == nil {
+//	    return fmt.Errorf("job %d is gone", id)
+//	}
 //	email, err = honker.DecodePayload[Email](row.PayloadBytes())
 //
 // The type parameter is a compile-time contract between the producer
@@ -879,7 +900,15 @@ func (q *Queue) Cancel(jobID int64) (bool, error) {
 }
 
 // GetJob reads a single job row by id. Returns (*JobRow, nil) on hit
-// or (nil, nil) on miss (ack'd, dead'd, or never existed).
+// or (nil, nil) on miss (ack'd, dead'd, or never existed). Always check
+// the row for nil before using it — a miss is not an error.
+//
+// NOT queue-scoped: job ids are globally unique and this lookup does
+// not filter on the queue, so it can return a row belonging to another
+// queue. That matters for DecodePayload — another queue's payload will
+// happily decode into your type with zero-valued fields and no error.
+// Pass only ids you know this queue owns. Scoping the lookup in the
+// core is tracked separately.
 func (q *Queue) GetJob(jobID int64) (*JobRow, error) {
 	var raw string
 	err := q.db.db.QueryRow("SELECT honker_get_job(?)", jobID).Scan(&raw)
