@@ -1,6 +1,7 @@
 package honker
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -307,10 +308,24 @@ func TestDecodePayloadRejectsEmptyInput(t *testing.T) {
 			if err == nil {
 				t.Fatalf("DecodePayload(%s) = %+v, nil — want an error", tc.name, got)
 			}
+			// The caller has to be able to tell "the bytes never
+			// arrived" from "the bytes did not match T" without
+			// matching on the message text.
+			if !errors.Is(err, ErrEmptyPayload) {
+				t.Errorf("DecodePayload(%s) err = %v, want errors.Is(err, ErrEmptyPayload)", tc.name, err)
+			}
 			if got != (emailPayload{}) {
 				t.Errorf("DecodePayload(%s) value = %+v, want the zero value", tc.name, got)
 			}
 		})
+	}
+
+	// A shape mismatch is a different failure and must not match the
+	// sentinel, or errors.Is(err, ErrEmptyPayload) would be useless.
+	if _, err := DecodePayload[emailPayload]([]byte(`{"version":"not-a-number"}`)); err == nil {
+		t.Error("DecodePayload(wrong shape) = nil error, want an unmarshal error")
+	} else if errors.Is(err, ErrEmptyPayload) {
+		t.Errorf("DecodePayload(wrong shape) err = %v, want it NOT to match ErrEmptyPayload", err)
 	}
 
 	// A real payload still decodes.

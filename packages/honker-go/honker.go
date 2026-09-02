@@ -824,6 +824,11 @@ func (r *JobRow) PayloadBytes() []byte {
 	return []byte(r.Payload)
 }
 
+// ErrEmptyPayload is returned by DecodePayload when the payload has no
+// bytes. Match it with errors.Is to tell "the payload never arrived"
+// apart from "the payload did not match T".
+var ErrEmptyPayload = errors.New("empty payload")
+
 // DecodePayload unmarshals a job payload into T.
 //
 //	type Email struct {
@@ -841,14 +846,16 @@ func (r *JobRow) PayloadBytes() []byte {
 // agree on the JSON shape on its own. A payload that does not match T
 // surfaces here as an unmarshal error, not as an enqueue failure.
 //
-// An empty payload is an error, not a zero value. The core never emits
-// one, so empty means the bytes never arrived — a caller must not be
-// handed a zero-valued T that is indistinguishable from a successful
-// decode.
+// An empty payload is an error (ErrEmptyPayload), not a zero value. The
+// core never emits one, so empty means the bytes never arrived — a
+// caller must not be handed a zero-valued T that is indistinguishable
+// from a successful decode. A payload of JSON null is a different case:
+// it decodes to the zero value of T with a nil error, the same as
+// json.Unmarshal, because enqueueing nil is a legitimate choice.
 func DecodePayload[T any](payload []byte) (T, error) {
 	var out T
 	if len(payload) == 0 {
-		return out, errors.New("decode payload: empty payload")
+		return out, fmt.Errorf("decode payload: %w", ErrEmptyPayload)
 	}
 	if err := json.Unmarshal(payload, &out); err != nil {
 		return out, fmt.Errorf("decode payload: %w", err)
