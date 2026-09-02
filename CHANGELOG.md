@@ -20,6 +20,63 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — full job details in the Go binding
+
+- Go `Job` now carries every field `honker_claim_batch` returns: `State`,
+  `Priority`, `RunAt`, `ClaimExpiresAt`, `MaxAttempts`, `CreatedAt`, and
+  `ExpiresAt` join the existing `ID`, `Queue`, `Payload`, `WorkerID`, and
+  `Attempts`. A claimed `Job` and a `GetJob` snapshot (`JobRow`) now describe
+  the same twelve columns; `Job` keeps `Ack` / `Retry` / `Fail` / `Heartbeat`
+  and `JobRow` stays data only. Purely additive — no existing field changed
+  name, type, or meaning.
+- New `honker.DecodePayload[T]` unmarshals a payload into a caller-owned type,
+  plus `JobRow.PayloadBytes()` so a snapshot decodes through the same path as
+  a claimed job. The type parameter is a compile-time contract; Honker still
+  does not validate payload shape in the database.
+- `DecodePayload` now returns an error on an empty payload instead of the zero
+  value with a nil error. The core never emits an empty payload, so empty means
+  the bytes never arrived, and a caller could not tell that apart from a clean
+  decode. That error is the exported sentinel `honker.ErrEmptyPayload`, wrapped
+  with `%w`, so a caller can tell "the bytes never arrived" from "the bytes did
+  not match `T`" with `errors.Is` instead of matching message text.
+- Documented the claim-time snapshot semantics of `Job`: `Ack` / `Retry` /
+  `Fail` / `Heartbeat` change the row in the database and do not write back to
+  the struct, so `job.ClaimExpiresAt` stays at its claim-time value after a
+  heartbeat. Also documented that `Queue.GetJob` is not queue-scoped, which
+  matters now that the README points it at `DecodePayload`: another queue's
+  payload decodes into your type with zero-valued fields and no error.
+- Go README: the quick start, the delayed-job example, and the scheduler
+  example did not compile (`db.Queue("emails")`, `q.Enqueue(payload)`,
+  `honker.RunAt(...)` — which does not exist — and the old positional
+  `Scheduler.Add`). Rewritten against the real signatures. The new typed-payload
+  example also called `row.PayloadBytes()` on the result of `q.GetJob(id)`
+  without checking for `nil`, which panics on a miss; it now checks the error
+  and the nil row.
+- `TestClaimBatchKeepsEachRowsOwnFields` claims two jobs in one `ClaimBatch`
+  call and pins each returned `Job` to its own row — id, priority, payload,
+  `ExpiresAt` set vs nil — then acks each job through its own handle. Every
+  other test claims a single job, so a mapping that reads the same element for
+  every job was invisible: `ClaimBatch` could hand every job in a batch the
+  first row's fields and the whole suite stayed green.
+- `TestClaimedJobReportsBackDatedRunAt` and `TestClaimBatchKeepsEachRowsOwnFields`
+  assert `ExpiresAt` is `nil`, not `0`, on a job enqueued without a TTL — on
+  both the claimed `Job` and the `JobRow`. No test covered the null case before,
+  so decoding `expires_at: null` as `0` (a job that "expired in 1970") passed
+  the whole suite.
+- `TestClaimedJobAndSnapshotCarryEveryField` enqueues with a priority, TTL, and
+  max-attempts, asserts each of the twelve fields on the pending snapshot, the
+  claimed job, and a second `Database` handle's processing snapshot, then
+  asserts the reader gets nothing after ack.
+  `TestDelayedJobReportsItsRunAt` asserts a delayed job's `RunAt` and that it
+  is not claimable early.
+  `TestClaimedJobReportsBackDatedRunAt` enqueues with a back-dated absolute
+  `RunAt` (`now - 100`) so the job stays claimable while `RunAt` and `CreatedAt`
+  differ, then pins both on the claimed job. Without it the two `json:` tags in
+  the claim decode can be transposed and the suite stays green.
+  `TestDecodePayloadRejectsEmptyInput` covers the empty-payload error, checks
+  it with `errors.Is(err, ErrEmptyPayload)`, and checks that a shape mismatch
+  does *not* match the sentinel.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
