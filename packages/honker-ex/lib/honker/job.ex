@@ -4,7 +4,9 @@ defmodule Honker.Job do
   (`ack/2`, `retry/4`, `fail/3`, `heartbeat/3`) to close it out.
 
   The struct itself is a plain data carrier — all state lives in the
-  database; Elixir just holds a snapshot of the row.
+  database; Elixir just holds a copy of the row as it stood at claim
+  time. To read a job you did *not* claim, use `Honker.Queue.get_job/2`,
+  which returns the read-only `Honker.JobSnapshot`.
 
   Fields, as the row stood at claim time:
 

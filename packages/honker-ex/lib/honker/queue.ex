@@ -1,10 +1,14 @@
 defmodule Honker.Queue do
   @moduledoc """
-  Named queue operations. All methods take a `Honker.Database` and
-  the queue name as the first two args.
+  Named queue operations. The queue-addressed functions — `enqueue/4`,
+  `claim_batch/4`, `claim_one/3`, `sweep_expired/2` — take a
+  `Honker.Database` and the queue name as the first two args.
 
       {:ok, id} = Honker.Queue.enqueue(db, "emails", %{to: "alice@example.com"})
       {:ok, job} = Honker.Queue.claim_one(db, "emails", "worker-1")
+
+  `get_job/2` and `cancel/2` are the exceptions: they address a job by
+  id and take no queue name. See `get_job/2` for what that means.
   """
 
   alias Honker.{Database, Job, JobSnapshot, Transaction}
@@ -131,8 +135,20 @@ defmodule Honker.Queue do
   or `{:ok, nil}` when the job has been ack'd, dead'd, cancelled, or
   never existed.
 
-  The lookup is by id alone. Ids are globally unique but not scoped to
-  a queue, so a foreign id returns that queue's row (#134).
+  The lookup takes an id and no queue name. Ids are unique across the
+  whole database, so today an id belonging to another queue still
+  resolves and the snapshot's `:queue` names its real queue. Treat that
+  as an implementation detail, not a contract: check `snapshot.queue`
+  yourself if it matters, because queue-scoped lookup is planned and
+  would narrow this.
+
+  ## Upgrading
+
+  Breaking change. This used to return `{:ok, map}` holding the raw ABI
+  row keyed by strings. It now returns a struct, so `row["state"]`
+  becomes `row.state` — a struct has no `Access` behaviour, so the old
+  bracket form raises `UndefinedFunctionError` rather than returning
+  nil. Rewrite every bracket read of a `get_job/2` result.
   """
   def get_job(%Honker.Database{conn: conn}, job_id) do
     case Honker.query_first(conn, "SELECT honker_get_job(?1)", [job_id]) do

@@ -111,6 +111,17 @@ until some worker claims the job. The snapshot's `payload` is the raw JSON
 `{:ok, nil}` means the job was ack'd, dead-lettered, cancelled, or never
 existed.
 
+`get_job/2` looks a job up by id and takes no queue name, so an id from
+another queue still resolves today; the snapshot's `queue` names the real
+one. Do not build on that — queue-scoped lookup is planned and would
+narrow it. Check `snapshot.queue` yourself if it matters.
+
+**Breaking change.** `get_job/2` used to return `{:ok, map}` — the raw ABI
+row keyed by strings. It now returns a struct, so `row["state"]` becomes
+`row.state`. A struct has no `Access` behaviour, so the old bracket form
+raises `UndefinedFunctionError` instead of quietly returning nil; the
+compiler will not catch it for you, so grep your callers.
+
 Honker never inspects a payload. The shape is a contract between the app that
 enqueues and the app that claims, and both sides have to agree on it —
 including across languages, since another binding may write to the same queue.
