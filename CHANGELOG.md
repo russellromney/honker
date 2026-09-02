@@ -37,12 +37,52 @@
   `JobRow::payload` stays a raw JSON string. The type parameter is
   compile-time only — honker never validates payload shape in the
   database, and a mismatch surfaces only as a `serde` error at decode.
-- **Breaking (source):** `Queue::enqueue` / `enqueue_tx` and
-  `Outbox::enqueue` / `enqueue_tx` now take `&T` instead of any
-  `&impl Serialize`, and `Outbox::run_once`'s delivery closure takes `T`
-  instead of `serde_json::Value`. On the default handles `T` is
-  `serde_json::Value`, so `q.enqueue(&json!(..))` is untouched; callers
-  who passed a custom struct to an untyped queue now take a typed handle.
+- **Breaking (source), 1 of 2 — `enqueue` takes `&T`.**
+  `Queue::enqueue` / `enqueue_tx` and `Outbox::enqueue` / `enqueue_tx`
+  now take `&T` instead of any `&impl Serialize`, and
+  `Outbox::run_once`'s delivery closure takes `T` instead of
+  `serde_json::Value`. On the default handles `T` is `serde_json::Value`,
+  so `q.enqueue(&json!(..))` is untouched. Everything else is
+  `error[E0308]: mismatched types / expected &Value, found &X`:
+  - `q.enqueue(&MyStruct { .. })`, `q.enqueue(&"hello")`,
+    `q.enqueue(&vec![1u8, 2, 3])` — migrate the handle:
+    `db.typed_queue::<MyStruct>(..)` or `q.typed::<MyStruct>()`.
+  - Two different payload types through one handle — you now need one
+    typed handle per type, or keep the handle at `serde_json::Value` and
+    `serde_json::to_value(..)` at the call site.
+  - **A generic helper has no drop-in migration.**
+    `fn helper<P: Serialize>(q: &Queue, p: &P)` no longer compiles; the
+    signature must become `fn helper<P: Serialize>(q: &Queue<P>, p: &P)`,
+    which changes every call site of the helper too, not just the body.
+    If you cannot change the call sites, keep `q: &Queue` and pass
+    `&serde_json::to_value(p)?` instead.
+- **Breaking (source), 2 of 2 — `JobRow` is no longer constructible with
+  struct literal syntax.** `JobRow<T>` needs a private `PhantomData`
+  field to carry `T`, and a private field disables struct literals
+  outside the crate:
+  ```
+  error: cannot construct `JobRow<_>` with struct literal syntax due to private fields
+    = note: ...and other private field `_payload` that was not provided
+  ```
+  There is no form of the type parameter that keeps struct literals
+  working, so this one is kept, not fixed. Build the row through
+  `Deserialize` instead — `serde_json::from_value(json!({ .. }))` or
+  `serde_json::from_str(..)` with the twelve snake_case keys — which is
+  what a fake in your own tests should do anyway.
+- **Not breaking after all:** `JobRow` keeps `Debug`, `Clone`, and
+  `Deserialize`. The generic briefly dropped all three; `Debug` and
+  `Clone` are hand-written (so they no longer require `T: Debug` /
+  `T: Clone`), and `Deserialize` is re-derived with `#[serde(bound = "")]`
+  plus `#[serde(skip)]` on the phantom field. Deserializing a raw
+  `honker_get_job()` blob straight into `JobRow` still compiles and is
+  covered by a test.
+- **Not breaking after all:** `Outbox::new(&db, name, opts)` still infers
+  its payload type. Making `Outbox` generic had moved `new` onto
+  `impl<T>`, which broke a bare `let ob = Outbox::new(..)` with
+  `error[E0282]: type annotations needed for Outbox<_>`. `new` is back on
+  an inherent `impl Outbox<serde_json::Value>`; the generic constructor
+  is the new `Outbox::new_typed`, which is what `Database::typed_outbox`
+  calls.
 - A claimed row that comes back without a `worker_id` or
   `claim_expires_at` is now an error instead of a silent default.
 
