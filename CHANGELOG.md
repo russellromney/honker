@@ -40,6 +40,10 @@
   raw text) and one convention has not been chosen yet.
 - A claimed row without `worker_id` or `claim_expires_at` now throws
   instead of being silently accepted.
+- A job enqueued without `expires` now has its `expiresAt` asserted to be
+  `null` on both the snapshot and the claimed job. Nothing pinned it
+  before, so an `expires_at ?? 0` fallback would have handed callers 0 —
+  a valid unix timestamp meaning 1970 — with the suite still green.
 - Payload typing is compile-time only; honker adds no runtime payload
   validation. `bun run test:types` type-checks the binding and a typed
   usage fixture, and CI runs it.

@@ -190,6 +190,9 @@ maybe("honker-bun job details", () => {
       expect(snapshot!.state).toBe("pending");
       expect(snapshot!.runAt).toBeGreaterThanOrEqual(before + 60);
       expect(snapshot!.runAt).toBeLessThanOrEqual(after + 60);
+      // Enqueued without `expires`: null, not 0. A `?? 0` fallback would
+      // hand the caller a valid unix timestamp meaning 1970.
+      expect(snapshot!.expiresAt).toBeNull();
       expect(queue.claimOne("early-worker")).toBeNull();
     }),
   );
@@ -203,6 +206,8 @@ maybe("honker-bun job details", () => {
       const first = queue.claimOne("worker-1");
       expect(first!.attempts).toBe(1);
       expect(first!.maxAttempts).toBe(3);
+      // Same gap on the claimed-Job side: no `expires` means null.
+      expect(first!.expiresAt).toBeNull();
 
       const retriedAt = now(db);
       expect(first!.retry(30, "boom")).toBe(true);
@@ -213,6 +218,7 @@ maybe("honker-bun job details", () => {
       expect(snapshot!.workerId).toBeNull();
       expect(snapshot!.runAt).toBeGreaterThanOrEqual(retriedAt + 30);
       expect(snapshot!.runAt).toBeLessThanOrEqual(now(db) + 30);
+      expect(snapshot!.expiresAt).toBeNull();
     }),
   );
 
