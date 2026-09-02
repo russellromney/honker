@@ -98,11 +98,12 @@ public sealed class ScheduleUpdate
 ///
 /// Every member is required, so a core that omits one fails the decode
 /// with a JsonException naming the field. That matters most for a
-/// binding running against an older extension: honker_claim_batch before
-/// 0.6 returned six columns and no `state`, and a defaulted <c>""</c>
-/// would have travelled all the way to <see cref="Job.State"/> as a
-/// silently wrong value. The nullable members still have to be present
-/// in the JSON — the core emits them as null, never omits them.
+/// binding running against an older extension: honker_claim_batch in
+/// 0.5.x and earlier returns six columns and no `state`, and a defaulted
+/// <c>""</c> would have travelled all the way to
+/// <see cref="Job.State"/> as a silently wrong value. The nullable
+/// members still have to be present in the JSON — the core emits them
+/// as null, it never omits them.
 /// </summary>
 public sealed record JobRow
 {

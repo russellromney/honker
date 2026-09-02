@@ -345,7 +345,7 @@ public sealed class JobDetailTests
     [Fact]
     public void AClaimRowFromAnOlderCoreIsRejectedRatherThanDefaulted()
     {
-        // honker_claim_batch before 0.6 returned six columns and no
+        // honker_claim_batch in 0.5.x and earlier returns six columns, no
         // "state". This is that payload, key for key. ClaimBatch now
         // decodes it into JobRow like every other row, and JobRow's
         // defaults would have made State "" and carried it to
