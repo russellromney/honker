@@ -71,6 +71,51 @@ int main() {
 }
 ```
 
+## Job details
+
+`honker::Job` (a claimed unit of work) and `honker::JobSnapshot` (the
+read-only row from `Queue::get_job`) both carry every field the core
+claim/lookup returns:
+
+```cpp
+auto job = q.claim_one("worker-1");
+job->id(); job->queue(); job->payload(); job->state();
+job->priority(); job->run_at(); job->worker_id(); job->claim_expires_at();
+job->attempts(); job->max_attempts(); job->created_at(); job->expires_at();
+```
+
+`Job` also holds a claim, so it has `ack()`, `retry()`, `fail()`, and
+`heartbeat()`. `JobSnapshot` is data only.
+
+On `Job`, `worker_id()` and `claim_expires_at()` are plain values
+because holding a claim is what makes it a `Job`. On `JobSnapshot` they
+are `std::optional` because a pending row has neither. `expires_at()`
+is `std::optional<int64_t>` on both.
+
+`payload()` is the raw JSON text exactly as stored — parse it with your
+preferred JSON library. honker never checks the payload's shape; every
+process writing a queue must agree on it.
+
+The string accessors (`queue()`, `payload()`, `state()`, `worker_id()`)
+return a `const&` into the `Job` or `JobSnapshot`, so reading a payload
+costs nothing. Copy it if you need it to outlive the job.
+
+```cpp
+if (auto row = q.get_job(id)) {
+    row->state();                       // "pending" or "processing"
+    nlohmann::json::parse(row->payload());
+}
+```
+
+`Queue::get_job_json(id)` still returns the undecoded JSON blob for
+callers that want the bytes.
+
+A claim or lookup whose JSON is malformed, that is missing a required
+field, or that carries a field of the wrong type throws `honker::Error`
+rather than returning a default-filled job. That is the only exception
+type honker's decoders let out — nlohmann's `type_error` is wrapped, so
+`catch (const honker::Error&)` is enough.
+
 Delayed jobs use `run_at` options on enqueue. Recurring schedules use schedule expressions:
 
 ```cpp

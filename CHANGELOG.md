@@ -50,6 +50,49 @@
   `SELECT honker_get_job(?)` on their own connection, which still returns the
   raw snake_case row. `cancel()` is unchanged and remains not queue-scoped.
 
+## Unreleased — C++ job details
+
+- C++ `honker::Job` now carries all twelve fields core returns. It gained
+  `queue()`, `state()`, `priority()`, `run_at()`, `claim_expires_at()`,
+  `max_attempts()`, `created_at()`, and `expires_at()` alongside the
+  existing `id()`, `payload()`, `worker_id()`, and `attempts()`, and keeps
+  `ack()` / `retry()` / `fail()` / `heartbeat()`.
+- New `honker::JobSnapshot`: the same twelve fields, data only, returned by
+  `Queue::get_job(id)` as `std::optional<JobSnapshot>`. `worker_id()` and
+  `claim_expires_at()` are `std::optional` there because a pending row has
+  neither. `Queue::get_job_json(id)` is unchanged and still returns the
+  undecoded blob.
+- Payload encoding is unchanged: `payload()` is the raw JSON text on both
+  types. The binding stays dynamic — no templates, no codec — matching the
+  issue's guidance for C++.
+- Claim and snapshot decoding now fails loudly. A malformed JSON blob, a
+  missing required field, or a field of the wrong type throws
+  `honker::Error` instead of the previous `catch (...) {}` that returned an
+  empty result, and required fields no longer fall back to `0` / `""` / `1`
+  defaults. `nlohmann::json::type_error` is wrapped, so `honker::Error` is
+  the only exception type the decoders let out.
+- Stream and scheduler decoding fails loudly the same way. A malformed
+  `stream_read_since` row used to become `offset = 0`, which made a consumer
+  that saved that offset replay the whole topic; a malformed
+  `scheduler_tick` row used to become a fire with an empty name and
+  `job_id = 0`. Both now throw `honker::Error`.
+- `StreamSubscription`'s checkpoint write now fails loudly too. It discarded
+  the return of `honker_cpp_stream_save_offset` and cleared its pending
+  counter regardless, so a checkpoint that failed — read-only volume, full
+  disk, `SQLITE_BUSY` — looked identical to one that succeeded, and the
+  consumer replayed the topic with nothing reporting why. `save_offset()`
+  and `next()` now throw `honker::Error`, and a failed write leaves the
+  position pending so the destructor and a manual retry try again. `next()`
+  rolls its in-memory position back on that throw, so the event is
+  redelivered rather than skipped.
+- `Queue::get_job_json()` and `Scheduler::list_json()` free the shim's
+  string with `honker_cpp_free()` instead of `std::free()`, matching every
+  other call that takes ownership of a `char*` from the shim.
+- `Job` and `JobSnapshot` string accessors return `const std::string&`
+  instead of a copy. They were marked `noexcept` while returning by value,
+  which allocates — a `std::bad_alloc` there would have called
+  `std::terminate` rather than propagating.
+
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
 - Node stream checkpoint calls now use the shared SQL ABI's canonical
