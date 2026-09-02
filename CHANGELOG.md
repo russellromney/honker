@@ -63,6 +63,15 @@
   that saved that offset replay the whole topic; a malformed
   `scheduler_tick` row used to become a fire with an empty name and
   `job_id = 0`. Both now throw `honker::Error`.
+- `StreamSubscription`'s checkpoint write now fails loudly too. It discarded
+  the return of `honker_cpp_stream_save_offset` and cleared its pending
+  counter regardless, so a checkpoint that failed — read-only volume, full
+  disk, `SQLITE_BUSY` — looked identical to one that succeeded, and the
+  consumer replayed the topic with nothing reporting why. `save_offset()`
+  and `next()` now throw `honker::Error`, and a failed write leaves the
+  position pending so the destructor and a manual retry try again. `next()`
+  rolls its in-memory position back on that throw, so the event is
+  redelivered rather than skipped.
 
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 

@@ -953,16 +953,27 @@ public:
         }
     }
 
+    /// Blocks until the next event. Throws honker::Error if the
+    /// every-save_every_n checkpoint write fails. The event is not
+    /// consumed in that case: the in-memory position rolls back so a
+    /// later next() hands out the same event rather than skipping it.
     std::optional<StreamEvent> next() {
         while (true) {
             if (idx_ < buffer_.size()) {
+                const int64_t prev_offset = last_offset_;
+                last_offset_ = buffer_[idx_].offset();
+                ++pending_;
+                if (pending_ >= save_every_n_) {
+                    try {
+                        flush_offset();
+                    } catch (...) {
+                        --pending_;
+                        last_offset_ = prev_offset;
+                        throw;
+                    }
+                }
                 auto ev = std::move(buffer_[idx_]);
                 ++idx_;
-                ++pending_;
-                last_offset_ = ev.offset();
-                if (pending_ >= save_every_n_) {
-                    flush_offset();
-                }
                 return ev;
             }
             buffer_ = read_batch();
@@ -973,6 +984,11 @@ public:
         }
     }
 
+    /// Persist the consumer's position now. Throws honker::Error if the
+    /// checkpoint write fails — a silently dropped checkpoint replays
+    /// the topic, so call this before the subscription goes out of
+    /// scope when you need the failure reported; the destructor cannot
+    /// throw and has to swallow it.
     void save_offset() {
         flush_offset();
     }
@@ -988,9 +1004,14 @@ private:
         return detail::parse_stream_events(json);
     }
 
+    /// Persist the checkpoint. A failed write must not clear pending_:
+    /// the offset is still unsaved, so the destructor gets another try
+    /// and offset() keeps reporting the uncommitted position.
     void flush_offset() {
         if (pending_ == 0) return;
-        honker_cpp_stream_save_offset(db_, consumer_.c_str(), topic_.c_str(), last_offset_);
+        const auto n = honker_cpp_stream_save_offset(
+            db_, consumer_.c_str(), topic_.c_str(), last_offset_);
+        if (n < 0) throw Error{"save_offset failed: SQL error"};
         pending_ = 0;
     }
 

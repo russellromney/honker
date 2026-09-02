@@ -300,6 +300,57 @@ void test_get_job_json_still_returns_the_raw_blob(const char* ext) {
     std::cout << "get_job_json_still_returns_the_raw_blob: ok\n";
 }
 
+void exec_raw(sqlite3* db, const char* sql) {
+    char* err = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+        const std::string msg = err ? err : "unknown error";
+        sqlite3_free(err);
+        fail(std::string{"exec_raw failed for "} + sql + ": " + msg);
+    }
+}
+
+// The decoders throw on a malformed stream row so a bad row cannot
+// become offset 0. That only closes the read half. The write half is
+// StreamSubscription's checkpoint: if it drops a failed save on the
+// floor, the consumer replays the topic just the same, and nothing —
+// not the destructor's catch (...), not save_offset() — ever says so.
+void test_stream_subscription_reports_a_failed_checkpoint(const char* ext) {
+    const auto path = fs::temp_directory_path() / "honker-cpp-details-checkpoint.db";
+    auto db = open_db(path, ext);
+    auto stream = db.stream("checkpoints");
+    const int64_t first_offset = stream.publish(R"({"n":1})");
+    stream.publish(R"({"n":2})");
+
+    // save_every_n is far above the event count, so the only checkpoint
+    // in this test is the one it asks for explicitly.
+    auto sub = stream.subscribe("consumer-a", 1000, std::chrono::milliseconds(20));
+    auto first = sub.next();
+    if (!first.has_value()) fail("the subscription produced no event");
+    check_i64(first->offset(), first_offset, "first event offset");
+
+    // query_only makes every write on this connection fail the way a
+    // read-only volume or a full disk would.
+    exec_raw(db.raw(), "PRAGMA query_only = 1");
+    bool reported = false;
+    try {
+        sub.save_offset();
+    } catch (const honker::Error&) {
+        reported = true;
+    }
+    exec_raw(db.raw(), "PRAGMA query_only = 0");
+    if (!reported) fail("save_offset swallowed a failed checkpoint write");
+
+    // The failure did not fake a checkpoint either.
+    check_i64(stream.get_offset("consumer-a"), 0,
+              "a failed checkpoint must leave the saved offset untouched");
+
+    // And the position is still pending, so a retry commits it.
+    sub.save_offset();
+    check_i64(stream.get_offset("consumer-a"), first_offset,
+              "the retry saved the offset the failed write did not");
+
+    std::cout << "stream_subscription_reports_a_failed_checkpoint: ok\n";
+}
 
 // ---------------------------------------------------------------------
 // Decode failures. These are the tests that defend the "fails loudly"
@@ -574,6 +625,7 @@ int main() {
         test_snapshot_pending_then_processing_then_miss(ext);
         test_delayed_job_snapshot_reports_future_run_at(ext);
         test_get_job_json_still_returns_the_raw_blob(ext);
+        test_stream_subscription_reports_a_failed_checkpoint(ext);
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;
