@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -299,9 +300,197 @@ void test_get_job_json_still_returns_the_raw_blob(const char* ext) {
     std::cout << "get_job_json_still_returns_the_raw_blob: ok\n";
 }
 
+
+// ---------------------------------------------------------------------
+// Decode failures. These are the tests that defend the "fails loudly"
+// promise: a malformed blob, an absent or null required field, and a
+// wrong-typed field must each raise honker::Error instead of producing
+// a plausible-looking default.
+//
+// They need no extension and no database. They call exactly the
+// functions Queue::get_job() and Queue::claim_batch() call —
+// detail::parse_row_blob / detail::parse_row_array / from_json — so
+// reverting the guard in honker.hpp fails them.
+// ---------------------------------------------------------------------
+
+// A complete, well-formed claimed-job row. Every failure case below is
+// this object with one thing wrong.
+json good_row() {
+    return json{
+        {"id", 101},
+        {"queue", "details"},
+        {"payload", R"({"n":1})"},
+        {"state", "processing"},
+        {"priority", HIGH_PRIORITY},
+        {"run_at", 1700000000},
+        {"worker_id", "w1"},
+        {"claim_expires_at", 1700000137},
+        {"attempts", 1},
+        {"max_attempts", MAX_ATTEMPTS},
+        {"created_at", 1700000300},
+        {"expires_at", 1700009000},
+    };
+}
+
+// Runs fn and demands it throw honker::Error whose message contains
+// needle. Returning normally, or throwing anything else, is a failure —
+// a caller told to write catch (const honker::Error&) must not have a
+// JSON library's exception escape past it.
+template <typename Fn>
+void expect_honker_error(Fn&& fn, const std::string& needle, const std::string& label) {
+    try {
+        fn();
+    } catch (const honker::Error& e) {
+        const std::string msg = e.what();
+        if (msg.find(needle) == std::string::npos) {
+            fail(label + ": honker::Error said \"" + msg +
+                 "\", which does not mention \"" + needle + "\"");
+        }
+        return;
+    } catch (const json::exception& e) {
+        fail(label + ": leaked nlohmann::json::exception \"" +
+             std::string{e.what()} + "\" instead of honker::Error");
+    } catch (const std::exception& e) {
+        fail(label + ": threw \"" + std::string{e.what()} +
+             "\" instead of honker::Error");
+    }
+    fail(label + ": returned normally — no error was raised");
+}
+
+void test_decode_rejects_unparseable_json() {
+    expect_honker_error(
+        [] { (void)honker::detail::parse_row_blob(R"({"id": 1,)", "job row"); },
+        "not parseable", "get_job blob with truncated JSON");
+    expect_honker_error(
+        [] { (void)honker::detail::parse_row_blob("", "job row"); },
+        "not parseable", "get_job blob that is empty text");
+    expect_honker_error(
+        [] { (void)honker::detail::parse_row_array("<html>nope</html>", "claim"); },
+        "not parseable", "claim blob that is not JSON at all");
+
+    std::cout << "decode_rejects_unparseable_json: ok\n";
+}
+
+void test_decode_rejects_a_non_array_claim_result() {
+    // A claim that comes back as a bare object or null is a core bug.
+    // Returning {} here would read as "nothing to claim" while the
+    // claim UPDATE has already burned an attempt on every row.
+    expect_honker_error(
+        [] { (void)honker::detail::parse_row_array(good_row().dump(), "claim"); },
+        "not a JSON array", "claim result that is a single object");
+    expect_honker_error(
+        [] { (void)honker::detail::parse_row_array("null", "claim"); },
+        "not a JSON array", "claim result that is null");
+    expect_honker_error(
+        [] { (void)honker::detail::parse_row_array("17", "claim"); },
+        "not a JSON array", "claim result that is a number");
+
+    std::cout << "decode_rejects_a_non_array_claim_result: ok\n";
+}
+
+void test_decode_rejects_a_missing_required_field() {
+    // The fixture itself must decode, so a failure below is the removed
+    // field and not a broken fixture.
+    const auto ok = honker::JobSnapshot::from_json(good_row());
+    check_i64(ok.id(), 101, "the fixture row decodes cleanly");
+    check_i64(ok.attempts(), 1, "the fixture row decodes cleanly");
+
+    // Every non-nullable field on a snapshot, absent and explicitly
+    // null. This loop is what catches a thirteenth field added later
+    // with a tolerant lookup.
+    const std::vector<std::string> required = {
+        "id", "queue", "payload", "state", "priority",
+        "run_at", "attempts", "max_attempts", "created_at",
+    };
+    for (const auto& key : required) {
+        auto absent = good_row();
+        absent.erase(key);
+        expect_honker_error(
+            [&] { (void)honker::JobSnapshot::from_json(absent); },
+            "missing required field '" + key + "'",
+            "snapshot with no " + key);
+
+        auto nulled = good_row();
+        nulled[key] = nullptr;
+        expect_honker_error(
+            [&] { (void)honker::JobSnapshot::from_json(nulled); },
+            "missing required field '" + key + "'",
+            "snapshot with a null " + key);
+    }
+
+    // A claimed row always carries the claim fields, so Job requires
+    // the two that JobSnapshot leaves optional.
+    for (const auto& key : std::vector<std::string>{"worker_id", "claim_expires_at"}) {
+        auto absent = good_row();
+        absent.erase(key);
+        expect_honker_error(
+            [&] { (void)honker::Job::from_json(nullptr, absent); },
+            "missing required field '" + key + "'",
+            "claimed job with no " + key);
+    }
+
+    // A row that is not an object at all.
+    expect_honker_error(
+        [] { (void)honker::JobSnapshot::from_json(json::array({1, 2})); },
+        "not a JSON object", "snapshot from a JSON array");
+
+    std::cout << "decode_rejects_a_missing_required_field: ok\n";
+}
+
+void test_decode_reports_a_wrong_typed_field_as_honker_error() {
+    // README promises honker::Error, so nlohmann's type_error must not
+    // escape. expect_honker_error fails loudly if it does.
+    struct Case {
+        std::string key;
+        json        value;
+        std::string want;
+    };
+    const std::vector<Case> cases = {
+        {"id",               json("101"),                  "an integer"},
+        {"attempts",         json(true),                   "an integer"},
+        {"claim_expires_at", json("1700000137"),           "an integer"},
+        {"payload",          json::object({{"n", 1}}),     "a string"},
+        {"queue",            json::array({"details"}),     "a string"},
+        {"state",            json(3),                      "a string"},
+        // Nullable fields decode through the same helper.
+        {"expires_at",       json("1700009000"),           "an integer"},
+        {"worker_id",        json(7),                      "a string"},
+    };
+    for (const auto& c : cases) {
+        auto bad = good_row();
+        bad[c.key] = c.value;
+        expect_honker_error(
+            [&] { (void)honker::JobSnapshot::from_json(bad); },
+            "field '" + c.key + "' is not " + c.want,
+            "snapshot with a wrong-typed " + c.key);
+    }
+
+    // Same guarantee on the claim path.
+    auto bad_claim = good_row();
+    bad_claim["worker_id"] = 7;
+    expect_honker_error(
+        [&] { (void)honker::Job::from_json(nullptr, bad_claim); },
+        "field 'worker_id' is not a string",
+        "claimed job with a wrong-typed worker_id");
+
+    std::cout << "decode_reports_a_wrong_typed_field_as_honker_error: ok\n";
+}
+
 }  // anonymous namespace
 
 int main() {
+    // Decode-failure tests first: they need no extension, so they run
+    // even where the DB-backed tests below would skip.
+    try {
+        test_decode_rejects_unparseable_json();
+        test_decode_rejects_a_non_array_claim_result();
+        test_decode_rejects_a_missing_required_field();
+        test_decode_reports_a_wrong_typed_field_as_honker_error();
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL: " << e.what() << '\n';
+        return 1;
+    }
+
     const char* ext = std::getenv("HONKER_EXTENSION_PATH");
     if (!ext || !*ext) {
         std::fputs(

@@ -52,10 +52,17 @@
 - Payload encoding is unchanged: `payload()` is the raw JSON text on both
   types. The binding stays dynamic — no templates, no codec — matching the
   issue's guidance for C++.
-- Claim and snapshot decoding now fails loudly. A malformed JSON blob or a
-  missing required field throws `honker::Error` instead of the previous
-  `catch (...) {}` that returned an empty result, and required fields no
-  longer fall back to `0` / `""` / `1` defaults.
+- Claim and snapshot decoding now fails loudly. A malformed JSON blob, a
+  missing required field, or a field of the wrong type throws
+  `honker::Error` instead of the previous `catch (...) {}` that returned an
+  empty result, and required fields no longer fall back to `0` / `""` / `1`
+  defaults. `nlohmann::json::type_error` is wrapped, so `honker::Error` is
+  the only exception type the decoders let out.
+- Stream and scheduler decoding fails loudly the same way. A malformed
+  `stream_read_since` row used to become `offset = 0`, which made a consumer
+  that saved that offset replay the whole topic; a malformed
+  `scheduler_tick` row used to become a fire with an empty name and
+  `job_id = 0`. Both now throw `honker::Error`.
 
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 

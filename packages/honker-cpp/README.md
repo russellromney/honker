@@ -106,9 +106,11 @@ if (auto row = q.get_job(id)) {
 `Queue::get_job_json(id)` still returns the undecoded JSON blob for
 callers that want the bytes.
 
-A claim or lookup whose JSON is malformed, or that is missing a
-required field, throws `honker::Error` rather than returning a
-default-filled job.
+A claim or lookup whose JSON is malformed, that is missing a required
+field, or that carries a field of the wrong type throws `honker::Error`
+rather than returning a default-filled job. That is the only exception
+type honker's decoders let out — nlohmann's `type_error` is wrapped, so
+`catch (const honker::Error&)` is enough.
 
 Delayed jobs use `run_at` options on enqueue. Recurring schedules use schedule expressions:
 

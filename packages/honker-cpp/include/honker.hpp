@@ -178,6 +178,8 @@ public:
         try {
             open_core_watcher();
         } catch (...) {
+            // Not a swallow: close() releases the handle we just opened,
+            // then the original failure is rethrown to the caller.
             close();
             throw;
         }
@@ -371,32 +373,92 @@ private:
 
 namespace detail {
 
-inline const nlohmann::json& job_field(const nlohmann::json& j, const char* key) {
+/// Look up a required key on one decoded row. `what` names the row
+/// kind so the message says which decoder failed ("job row",
+/// "stream event", "scheduler fire").
+inline const nlohmann::json& row_field(
+    const nlohmann::json& j, const char* key, const char* what) {
+    if (!j.is_object()) {
+        throw Error{std::string{what} + " is not a JSON object"};
+    }
     const auto it = j.find(key);
     if (it == j.end() || it->is_null()) {
-        throw Error{std::string{"job row is missing required field '"} + key + "'"};
+        throw Error{std::string{what} + " is missing required field '" + key + "'"};
     }
     return *it;
 }
 
+/// nlohmann throws its own nlohmann::json::type_error when a present
+/// value has the wrong type. Callers are told to catch honker::Error,
+/// so translate here rather than leaking the JSON library's exception
+/// type out of honker's API.
+template <typename T>
+T row_get(const nlohmann::json& v, const char* key, const char* what, const char* want) {
+    try {
+        return v.get<T>();
+    } catch (const nlohmann::json::exception& e) {
+        throw Error{std::string{what} + " field '" + key + "' is not " + want +
+                    ": " + e.what()};
+    }
+}
+
+inline int64_t row_i64(const nlohmann::json& j, const char* key, const char* what) {
+    return row_get<int64_t>(row_field(j, key, what), key, what, "an integer");
+}
+
+inline std::string row_str(const nlohmann::json& j, const char* key, const char* what) {
+    return row_get<std::string>(row_field(j, key, what), key, what, "a string");
+}
+
+inline std::optional<int64_t> row_opt_i64(
+    const nlohmann::json& j, const char* key, const char* what) {
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return std::nullopt;
+    return row_get<int64_t>(*it, key, what, "an integer");
+}
+
+inline std::optional<std::string> row_opt_str(
+    const nlohmann::json& j, const char* key, const char* what) {
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return std::nullopt;
+    return row_get<std::string>(*it, key, what, "a string");
+}
+
+constexpr const char* kJobRow = "job row";
+
 inline int64_t job_i64(const nlohmann::json& j, const char* key) {
-    return job_field(j, key).get<int64_t>();
+    return row_i64(j, key, kJobRow);
 }
 
 inline std::string job_str(const nlohmann::json& j, const char* key) {
-    return job_field(j, key).get<std::string>();
+    return row_str(j, key, kJobRow);
 }
 
 inline std::optional<int64_t> job_opt_i64(const nlohmann::json& j, const char* key) {
-    const auto it = j.find(key);
-    if (it == j.end() || it->is_null()) return std::nullopt;
-    return it->get<int64_t>();
+    return row_opt_i64(j, key, kJobRow);
 }
 
 inline std::optional<std::string> job_opt_str(const nlohmann::json& j, const char* key) {
-    const auto it = j.find(key);
-    if (it == j.end() || it->is_null()) return std::nullopt;
-    return it->get<std::string>();
+    return row_opt_str(j, key, kJobRow);
+}
+
+/// Parse one honker JSON blob. A malformed blob is a bug in the core
+/// we are talking to, not an empty result — surface it instead of
+/// quietly handing back nothing.
+inline nlohmann::json parse_row_blob(const std::string& json, const char* what) {
+    try {
+        return nlohmann::json::parse(json);
+    } catch (const nlohmann::json::exception& e) {
+        throw Error{std::string{what} + " JSON is not parseable: " + e.what()};
+    }
+}
+
+inline nlohmann::json parse_row_array(const std::string& json, const char* what) {
+    auto arr = parse_row_blob(json, what);
+    if (!arr.is_array()) {
+        throw Error{std::string{what} + " result is not a JSON array"};
+    }
+    return arr;
 }
 
 }  // namespace detail
@@ -658,7 +720,7 @@ public:
     std::optional<JobSnapshot> get_job(int64_t job_id) {
         const std::string json = get_job_json(job_id);
         if (json.empty()) return std::nullopt;
-        return JobSnapshot::from_json(parse_job_json(json));
+        return JobSnapshot::from_json(detail::parse_row_blob(json, "job row"));
     }
 
     Queue(sqlite3* db, std::string name, int64_t vis, int64_t max)
@@ -666,21 +728,8 @@ public:
           visibility_timeout_s_(vis), max_attempts_(max) {}
 
 private:
-    /// Parse one honker JSON blob. A malformed blob is a core bug, not
-    /// an empty result — surface it instead of returning nothing.
-    static nlohmann::json parse_job_json(const std::string& json) {
-        try {
-            return nlohmann::json::parse(json);
-        } catch (const std::exception& e) {
-            throw Error{std::string{"job JSON is not parseable: "} + e.what()};
-        }
-    }
-
     std::vector<Job> parse_claim(const std::string& json) {
-        auto arr = parse_job_json(json);
-        if (!arr.is_array()) {
-            throw Error{"claim result is not a JSON array"};
-        }
+        auto arr = detail::parse_row_array(json, "claim");
         std::vector<Job> out;
         out.reserve(arr.size());
         for (const auto& j : arr) {
@@ -780,6 +829,32 @@ private:
     int64_t     created_at_;
 };
 
+namespace detail {
+
+/// Decode one honker_stream_read_since() blob. Shared by Stream::read*
+/// and StreamSubscription::read_batch so both fail the same way.
+///
+/// A malformed row used to be swallowed, which turned a bad row into
+/// offset 0 — and a consumer that saved that offset replayed the whole
+/// topic. Throw instead. `key` stays optional because the core writes
+/// NULL for an unkeyed event.
+inline std::vector<StreamEvent> parse_stream_events(const std::string& json) {
+    auto arr = parse_row_array(json, "stream read");
+    std::vector<StreamEvent> out;
+    out.reserve(arr.size());
+    for (const auto& j : arr) {
+        out.emplace_back(
+            row_i64(j, "offset", "stream event"),
+            row_str(j, "topic", "stream event"),
+            row_opt_str(j, "key", "stream event").value_or(std::string{}),
+            row_str(j, "payload", "stream event"),
+            row_i64(j, "created_at", "stream event"));
+    }
+    return out;
+}
+
+}  // namespace detail
+
 // =====================================================================
 // Stream
 // =====================================================================
@@ -846,23 +921,7 @@ private:
     std::vector<StreamEvent> parse_events(char* rows) {
         std::string json{rows};
         honker_cpp_free(rows);
-        std::vector<StreamEvent> out;
-        try {
-            auto arr = nlohmann::json::parse(json);
-            if (!arr.is_array()) return out;
-            for (const auto& j : arr) {
-                std::string key = (j.contains("key") && !j["key"].is_null())
-                    ? j["key"].get<std::string>() : "";
-                out.emplace_back(
-                    j.value("offset", 0),
-                    j.value("topic", ""),
-                    key,
-                    j.value("payload", ""),
-                    j.value("created_at", 0)
-                );
-            }
-        } catch (...) {}
-        return out;
+        return detail::parse_stream_events(json);
     }
 
     Database*   owner_;
@@ -886,6 +945,10 @@ public:
 
     ~StreamSubscription() {
         if (pending_ > 0) {
+            // A destructor may not throw. The lost checkpoint is
+            // survivable — the consumer replays from the last saved
+            // offset. Call save_offset() before the subscription goes
+            // out of scope if you need the failure reported.
             try { flush_offset(); } catch (...) {}
         }
     }
@@ -922,23 +985,7 @@ private:
         if (!rows) return {};
         std::string json{rows};
         honker_cpp_free(rows);
-        std::vector<StreamEvent> out;
-        try {
-            auto arr = nlohmann::json::parse(json);
-            if (!arr.is_array()) return out;
-            for (const auto& j : arr) {
-                std::string key = (j.contains("key") && !j["key"].is_null())
-                    ? j["key"].get<std::string>() : "";
-                out.emplace_back(
-                    j.value("offset", 0),
-                    j.value("topic", ""),
-                    key,
-                    j.value("payload", ""),
-                    j.value("created_at", 0)
-                );
-            }
-        } catch (...) {}
-        return out;
+        return detail::parse_stream_events(json);
     }
 
     void flush_offset() {
@@ -1146,22 +1193,22 @@ public:
     Scheduler(Database* db) : db_(db) {}
 
 private:
+    /// Decode one honker_scheduler_tick() blob. Every field is required:
+    /// a fire with name "" or job_id 0 is not a plausible default, it is
+    /// a row we failed to read.
     std::vector<ScheduledFire> parse_fires(char* rows) {
         std::string json{rows};
         honker_cpp_free(rows);
+        auto arr = detail::parse_row_array(json, "scheduler tick");
         std::vector<ScheduledFire> out;
-        try {
-            auto arr = nlohmann::json::parse(json);
-            if (!arr.is_array()) return out;
-            for (const auto& j : arr) {
-                out.emplace_back(
-                    j.value("name", ""),
-                    j.value("queue", ""),
-                    j.value("fire_at", 0),
-                    j.value("job_id", 0)
-                );
-            }
-        } catch (...) {}
+        out.reserve(arr.size());
+        for (const auto& j : arr) {
+            out.emplace_back(
+                detail::row_str(j, "name", "scheduler fire"),
+                detail::row_str(j, "queue", "scheduler fire"),
+                detail::row_i64(j, "fire_at", "scheduler fire"),
+                detail::row_i64(j, "job_id", "scheduler fire"));
+        }
         return out;
     }
 
@@ -1194,6 +1241,9 @@ public:
 
     ~Lock() {
         if (!released_) {
+            // A destructor may not throw. An unreleased lock still
+            // expires on its TTL. Call release() explicitly if you need
+            // the failure reported.
             try { release(); } catch (...) {}
         }
     }
@@ -1207,6 +1257,7 @@ public:
     }
     Lock& operator=(Lock&& other) noexcept {
         if (this != &other) {
+            // noexcept move-assign: same reasoning as the destructor.
             if (!released_) { try { release(); } catch (...) {} }
             db_ = other.db_;
             name_ = std::move(other.name_);
