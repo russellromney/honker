@@ -41,6 +41,11 @@
 - A claimed row without `worker_id` or `claim_expires_at` now throws
   instead of being silently accepted, and a test builds both a complete
   and a truncated row to prove the guard fires only on the bad one.
+- `Queue.getJob()` is documented as NOT queue-scoped: job ids are
+  globally unique, so it returns a row from any queue. The Node binding
+  scopes its lookup; #134 tracks making the bindings agree. Behavior is
+  unchanged here, only the README and the JSDoc, which previously said
+  nothing about it.
 - A job enqueued without `expires` now has its `expiresAt` asserted to be
   `null` on both the snapshot and the claimed job. Nothing pinned it
   before, so an `expires_at ?? 0` fallback would have handed callers 0 —

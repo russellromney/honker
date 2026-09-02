@@ -45,8 +45,9 @@ Delayed jobs use `runAt`:
 q.enqueue({ to: "later@example.com" }, { runAt: Math.floor(Date.now() / 1000) + 10 });
 ```
 
-Give a queue a payload contract and claimed jobs plus `getJob()`
-snapshots keep it:
+Give a queue a payload contract and claimed jobs keep it. A `getJob()`
+snapshot carries every field but hands the payload back as raw JSON
+text, so you parse it yourself:
 
 ```ts
 interface EmailPayload {
@@ -79,6 +80,11 @@ Claimed jobs and snapshots carry every field the core returns: `id`,
 `claimExpiresAt`, `attempts`, `maxAttempts`, `createdAt`, `expiresAt`.
 A claimed `Job` also has `ack`, `retry`, `fail`, and `heartbeat`; a
 `JobSnapshot` is data only, because reading a row does not claim it.
+
+`getJob()` looks a job up by id across every queue, not just the one you
+called it on — job ids are globally unique. Check `snapshot.queue` if
+that matters to you. (The Node binding scopes its `getJob`; #134 tracks
+making the rest of the bindings agree.)
 
 Payload encoding differs between the two, and that is deliberate: a
 claimed `job.payload` is decoded (it always was), while a snapshot's

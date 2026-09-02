@@ -715,6 +715,11 @@ export class Queue<TPayload = JsonValue> {
    * (ack'd, dead'd, or never existed). Pure read: a snapshot carries no
    * claim methods, and its `payload` is raw JSON text, not a decoded
    * `TPayload`.
+   *
+   * NOT queue-scoped: job ids are globally unique, and this returns a
+   * row belonging to any queue, not just this one. `snapshot.queue`
+   * tells you which queue actually owns it. The Node binding scopes its
+   * `getJob` to the queue; Bun does not yet. Tracked in #134.
    */
   getJob(jobId: number): JobSnapshot | null {
     const row = this.db.raw
