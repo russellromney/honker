@@ -12,6 +12,76 @@ new work without renumbering. Names are unique. Each phase header
 should include adjacency links (`After: ... · Before: ...`) when the
 ordering matters.
 
+## Phase Clemente — Job API Correctness
+
+> Active. Five breaking changes that ship as one release.
+
+Issue #119 asked for typed job payloads. Delivering it exposed that the
+job API was never sound: queue handles reached outside their queue, the
+payload contract was undocumented and unenforced, and decode failures
+came back as plausible-looking values. This phase fixes the contract
+rather than the symptom, while alpha still makes that cheap.
+
+### What ships
+
+- **#124** — Node typed payloads, full job details, `getJob` reshaped to a
+  camelCase decoded `JobSnapshot`. Closes #119. *Breaking.*
+- **#136** — the same job details and typed payloads in the other ten
+  bindings. Nine PRs, additive.
+- **#133 / #138** — five core lookups stop swallowing SQLite errors.
+  `fail()` gets a SAVEPOINT: propagating the error alone deleted the job
+  from both tables. *Silent job loss under schema damage.*
+- **#135 / #140** — `claimed_at`, so "how long has this been running" is
+  answerable. Nullable, set on every claim and reclaim, cleared by retry,
+  untouched by heartbeat.
+- **#152 / #153** — payload must be valid JSON, enforced at the five core
+  entry points rather than by a table CHECK. Bare scalars stay legal: the
+  contract is valid JSON, nothing more. *Breaking.*
+- **#134** — `Queue.getJob` and `Queue.cancel` scope to their queue in
+  every binding; `Database.getJob` and `Database.cancel` are the global
+  forms. Core gains `honker_cancel(queue, job_id)`. *Breaking.*
+- **#152 read side** — a decode failure throws instead of returning the
+  raw string. Once writes are validated it can only mean legacy data or
+  corruption. *Breaking.*
+- **#149** — Elixir `get_job` returns a struct, so `row["state"]` becomes
+  `row.state`. *Breaking.*
+
+### Sequence
+
+1. Independent adversarial review of every open PR. Not merged before this.
+2. Merge `#124` → the nine #136 binding PRs → `#138` → `#140` → `#153`.
+3. Second pass, one PR per binding: #134 scoping, `Database.*` globals, and
+   the #152 loud decode together. They touch the same files, so splitting
+   them manufactures conflicts. `honker-jvm` already has the target shape
+   (`db.getJob(id).filter(job -> name.equals(job.queue()))`) — use it as the
+   reference.
+4. One release PR. One migration guide covering all five breaks.
+
+### Migration reality
+
+Every binding already JSON-encodes on enqueue, so the JSON contract breaks
+almost nobody. The exceptions are C++, whose `honker_cpp_enqueue` takes a
+bare `const char* payload_json` with nothing validating it, and anyone
+writing raw `honker_enqueue` SQL through the extension path. No table
+rebuild — detection only:
+
+    SELECT id FROM _honker_live WHERE NOT json_valid(payload);
+
+### Deliberately not in this phase
+
+- **#137** queue-event APIs for the other bindings. Blocked until the
+  queue-event core reaches `main`; `feat/node-queue-events` still has no PR.
+- **#146** closes when #153 lands. Validated JSON makes decoded always safe.
+- Codec / non-JSON payloads. Considered and rejected: nothing reads into
+  the payload, and the roadmap's dedup work puts structured keys in their
+  own column. Revisit only if someone arrives with a real use case.
+
+### Open question
+
+Whether this is *the* break, after which the surface holds stable. Six
+registries publish honker and there is an external user building against
+it. If it is, the release notes should say so.
+
 ## Phase Kernel-JVM — Kernel Watcher Fails On Linux
 
 > Known broken, excluded by name in CI
