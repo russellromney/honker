@@ -20,6 +20,32 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — Kotlin job parity
+
+- New `JobDetails<T>` data class in `dev.honker.kotlin`: every field the
+  core returns for a job row, restated with Kotlin nullability so the
+  compiler knows a pending job has no `workerId` or `claimExpiresAt` and
+  an unexpiring job has no `expiresAt`. Data only — the claim operations
+  stay on the claimed `Job`.
+- `Job.details()`, `TypedJob<T>.details()`, `JobSnapshot.details()` and
+  `TypedJobSnapshot<T>.details()` build one. `Queue.jobDetails(id)`,
+  `TypedQueue<T>.jobDetails(id)` and `Database.jobDetails(id)` look one
+  up and return Kotlin `null` instead of `Optional.empty()`. The queue
+  lookups are scoped to their queue; the database lookup is global.
+- Payload typing is the JVM generic, so it stays a compile-time contract.
+  No runtime payload validation was added.
+- The `jvm` CI job now runs `packages/honker-kotlin` tests too, against
+  the same extension build and the `dev.honker:honker` jar it installs.
+  The Kotlin binding previously had no CI job at all.
+- Fix: `Queue.asFlow` and `Listener.asFlow` closed their channel only
+  when the collector cancelled. If the producer thread died on anything
+  other than `HonkerClosedException` it printed a stack trace and left
+  every collector parked on the flow forever. Both now end the flow, and
+  hand a real failure to the collector instead of swallowing it.
+- `HonkerKotlinTest` carries a 60-second per-test timeout so a wrapper
+  that stops producing fails by name instead of burning the CI job's
+  20-minute budget with no diagnosis.
+
 ## Unreleased — JVM job parity
 
 - JVM claimed `Job` and `TypedJob<T>` now carry every field the core

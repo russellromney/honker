@@ -182,9 +182,8 @@ updates:
     commit-message:
       prefix: "deps"
 
-  # honker-jvm and honker-kotlin have no CI job yet, so Dependabot is the
-  # only thing watching them. Keep the PRs coming even though nothing
-  # gates them — they at least surface CVEs.
+  # The `jvm` CI job now runs both binding test suites, so Dependabot PRs
+  # here are gated. Keep them coming: they also surface CVEs.
   - package-ecosystem: maven
     directories:
       - "/packages/honker-jvm"

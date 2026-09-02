@@ -80,7 +80,15 @@ fun Listener.asFlow(timeout: Duration = Duration.ofSeconds(15)): Flow<Notificati
             while (!Thread.currentThread().isInterrupted) {
                 next(timeout).ifPresent { trySend(it).isSuccess }
             }
+            close()
         } catch (ignored: HonkerClosedException) {
+            // The database went away under us: the flow simply ends.
+            close()
+        } catch (failure: Throwable) {
+            // Anything else is a real failure. Hand it to the collector.
+            // Without this the producer thread dies and every collector
+            // parks on this flow forever.
+            close(failure)
         }
     }
     thread.isDaemon = true
@@ -115,7 +123,15 @@ fun Queue.asFlow(
                 }
                 updates.awaitUpdate(wait)
             }
+            close()
         } catch (ignored: HonkerClosedException) {
+            // The database went away under us: the flow simply ends.
+            close()
+        } catch (failure: Throwable) {
+            // Anything else is a real failure. Hand it to the collector.
+            // Without this the producer thread dies and every collector
+            // parks on this flow forever.
+            close(failure)
         } finally {
             updates.close()
         }
