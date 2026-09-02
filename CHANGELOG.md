@@ -34,10 +34,29 @@
   a `TypedJobSnapshot<T>` with the payload already decoded.
 - Payload types stay a compile-time contract. Honker does not validate
   payload shape in the database, and no runtime validation was added.
+- `TypedJob.snapshot()` returns a `TypedJobSnapshot<T>`, so the typed
+  path stays typed end to end. `raw()` steps down a layer:
+  `TypedJob.raw()` is the `Job`, `TypedJobSnapshot.raw()` is the
+  `JobSnapshot`.
+- The three nullable accessors (`workerId`, `claimExpiresAt`,
+  `expiresAt`) carry `org.jspecify.annotations.@Nullable`. The dependency
+  was already declared and unused. Kotlin callers see `String?` / `Long?`
+  instead of a platform type.
+- Building a claimed `Job` from a row with no `worker_id` or
+  `claim_expires_at` throws instead of unboxing `null` at
+  `claimExpiresAt()`.
 - Tests enqueue with an explicit `runAt`, priority, `maxAttempts` and
   `expires`, then claim and assert each field's value — including a
   reader on a second connection watching one job go pending, processing,
-  then gone after ack.
+  then gone after ack, a retry clearing `workerId` and `claimExpiresAt`
+  back to null while `attempts` survives, a `fail()` dead-letter leaving
+  no snapshot, and a narrow row from an older extension throwing rather
+  than filling in zeros.
+- `packages/honker-jvm/pom.xml` packages the extension from
+  `target/release`, falling back to `target/debug`, and fails the build
+  when neither exists. It copied `target/debug` only, with
+  `failonerror="false"`, so a release build produced a green
+  `mvn install` and a jar whose `runtimes/` directory was empty.
 
 ## Unreleased — typed Node jobs
 
