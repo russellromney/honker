@@ -648,7 +648,7 @@ fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::
     Ok(count)
 }
 
-/// Returns JSON text: `[{"id":1,"queue":"...","payload":"...","worker_id":"...","attempts":N,"claim_expires_at":T}, ...]`
+/// Returns JSON text containing the complete claimed-job snapshot.
 pub fn claim_batch(
     conn: &Connection,
     queue: &str,
@@ -679,8 +679,10 @@ pub fn claim_batch(
            ORDER BY priority DESC, run_at ASC, id ASC
            LIMIT ?3
          )
-         RETURNING id, queue, payload, worker_id, attempts, claim_expires_at",
+         RETURNING id, queue, payload, state, priority, run_at, worker_id,
+                   claim_expires_at, attempts, max_attempts, created_at, expires_at",
     )?;
+    #[allow(clippy::type_complexity)]
     let rows = stmt.query_map(rusqlite::params![worker_id, queue, n, timeout_s], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -689,20 +691,45 @@ pub fn claim_batch(
             row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, Option<i64>>(11)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, q, payload, w, attempts, claim_expires_at) = row?;
+        let (
+            id,
+            q,
+            payload,
+            state,
+            priority,
+            run_at,
+            w,
+            claim_expires_at,
+            attempts,
+            max_attempts,
+            created_at,
+            expires_at,
+        ) = row?;
         // payload stays a JSON string (double-encoded on the wire) so
         // every binding's existing parse path keeps working.
         out.push(json!({
             "id": id,
             "queue": q,
             "payload": payload,
+            "state": state,
+            "priority": priority,
+            "run_at": run_at,
             "worker_id": w,
             "attempts": attempts,
             "claim_expires_at": claim_expires_at,
+            "max_attempts": max_attempts,
+            "created_at": created_at,
+            "expires_at": expires_at,
         }));
     }
     Ok(Value::Array(out).to_string())
@@ -1738,6 +1765,7 @@ fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
 mod real_arg_tests {
     use crate::{attach_honker_functions, bootstrap_honker_schema};
     use rusqlite::Connection;
+    use serde_json::Value;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1761,6 +1789,42 @@ mod real_arg_tests {
             )
             .unwrap();
         assert!(id > 0);
+    }
+
+    #[test]
+    fn claim_batch_returns_the_complete_job_snapshot() {
+        let conn = db();
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{\"to\":\"alice@example.com\"}',
+                                       NULL, NULL, 7, 5, 600)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let claimed: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('emails', 'worker-1', 1, 300)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rows: Value = serde_json::from_str(&claimed).unwrap();
+        let job = &rows[0];
+
+        assert_eq!(job["id"], id);
+        assert_eq!(job["queue"], "emails");
+        assert_eq!(job["payload"], r#"{"to":"alice@example.com"}"#);
+        assert_eq!(job["state"], "processing");
+        assert_eq!(job["priority"], 7);
+        assert_eq!(job["worker_id"], "worker-1");
+        assert_eq!(job["attempts"], 1);
+        assert_eq!(job["max_attempts"], 5);
+        assert!(job["run_at"].as_i64().unwrap() > 0);
+        assert!(job["claim_expires_at"].as_i64().unwrap() > 0);
+        assert!(job["created_at"].as_i64().unwrap() > 0);
+        assert!(job["expires_at"].as_i64().unwrap() > 0);
     }
 
     #[test]

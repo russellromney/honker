@@ -20,6 +20,36 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — typed Node jobs
+
+- Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
+  a payload generic that defaults to `JsonValue`, preserving existing callers
+  while allowing application-specific payload contracts.
+- `Queue.getJob()` and `Queue.cancel()` are included in the public TypeScript
+  declarations. Claimed jobs and job snapshots expose state, priority,
+  scheduling, attempt, worker, creation, claim-expiry, and job-expiry details.
+- The Rust claim ABI now returns the complete live-job snapshot, so claimed
+  jobs provide the same operational details as `getJob()`.
+- Every job field carries TSDoc. All four timestamps (`runAt`, `createdAt`,
+  `claimExpiresAt`, `expiresAt`) are Unix epoch seconds, not milliseconds, and
+  now say so on hover. `Job` declares `implements JobSnapshot<TPayload>`, so a
+  field added to one shape and not the other fails the type test.
+- `Job.claimExpiresAt` is `number`, not `number | null`. A claimed job always
+  holds a lease, so that null branch could never be taken. `JobSnapshot` keeps
+  `number | null` for pending jobs.
+- **Behavior change:** Node `getJob()` now returns the documented camelCase
+  `JobSnapshot` shape instead of exposing the SQL ABI's raw snake_case row.
+  `row.run_at` becomes `job.runAt` and reads back as `undefined` under the old
+  name, and `payload` arrives already JSON-decoded, so an existing
+  `JSON.parse(row.payload)` must be dropped.
+- **Behavior change:** Node `getJob()` returns `null` for a job that belongs to
+  a different queue, instead of returning that queue's row. Job ids are globally
+  unique, so the previous unscoped lookup could hand back a payload that did not
+  match the queue's declared `TPayload`. There is no unscoped replacement yet
+  (#134); callers that relied on the global lookup can run
+  `SELECT honker_get_job(?)` on their own connection, which still returns the
+  raw snake_case row. `cancel()` is unchanged and remains not queue-scoped.
+
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
 - Node stream checkpoint calls now use the shared SQL ABI's canonical
