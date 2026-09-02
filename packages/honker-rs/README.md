@@ -9,21 +9,31 @@ Full docs:
 
 ## Install
 
-Add the crate, and make sure the Honker SQLite extension is available at runtime.
+Add the crate. `honker-core` is linked in and bootstraps the schema, so
+there is no `.dylib` to load at runtime. Use the loadable extension
+(`honker-extension`) only when other SQLite clients share the file.
 
 ## Quick start
 
 ```rust
-let db = honker::Database::open("app.db", "./libhonker_ext.dylib")?;
-let q = db.queue("emails");
+use honker::{Database, EnqueueOpts, QueueOpts};
+use serde_json::json;
 
-q.enqueue(serde_json::json!({ "to": "alice@example.com" }))?;
+let db = Database::open("app.db")?;
+let q = db.queue("emails", QueueOpts::default());
+
+q.enqueue(&json!({ "to": "alice@example.com" }), EnqueueOpts::default())?;
 
 if let Some(job) = q.claim_one("worker-1")? {
-    send_email(&job.payload);
+    let body: serde_json::Value = job.payload_as()?;
+    send_email(&body);
     job.ack()?;
 }
 ```
+
+Runnable versions of this live in
+[`examples/basic.rs`](examples/basic.rs) and
+[`examples/atomic.rs`](examples/atomic.rs), which CI compiles.
 
 Delayed jobs use `run_at` / `RunAt`-style options in the binding API.
 
@@ -93,8 +103,17 @@ agreement is your job.
 Recurring schedules use schedule expressions:
 
 ```rust
+use honker::ScheduledTask;
+
 let sched = db.scheduler();
-sched.add("fast", "emails", "@every 1s", serde_json::json!({ "kind": "tick" }))?;
+sched.add(ScheduledTask {
+    name: "fast".into(),
+    queue: "emails".into(),
+    schedule: "@every 1s".into(),
+    payload: json!({ "kind": "tick" }),
+    priority: 0,
+    expires_s: None,
+})?;
 ```
 
 Supported schedule forms:
