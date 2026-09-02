@@ -264,6 +264,12 @@ func TestClaimedJobReportsBackDatedRunAt(t *testing.T) {
 	if row.RunAt == row.CreatedAt {
 		t.Fatalf("row.RunAt == row.CreatedAt == %d, fixture no longer separates them", row.RunAt)
 	}
+	// No EnqueueOptions.Expires, so expires_at is SQL NULL. It has to
+	// arrive as nil, not as a pointer to 0 — a zero here reads as "this
+	// job expired in 1970".
+	if row.ExpiresAt != nil {
+		t.Errorf("row.ExpiresAt = %d, want nil (no TTL was set)", *row.ExpiresAt)
+	}
 
 	// ---- claimed job keeps the two apart -----------------------------
 	job, err := wq.ClaimOne("worker-backdated")
@@ -288,6 +294,119 @@ func TestClaimedJobReportsBackDatedRunAt(t *testing.T) {
 			"claimed gap CreatedAt-RunAt = %d, snapshot gap = %d, want equal",
 			job.CreatedAt-job.RunAt, row.CreatedAt-row.RunAt,
 		)
+	}
+	// Same NULL check on the claim path. The claim decode has its own
+	// struct, so a *int64 that became an int64 there would report 0 on
+	// every job enqueued without a TTL and nothing else would notice.
+	if job.ExpiresAt != nil {
+		t.Errorf("job.ExpiresAt = %d, want nil (no TTL was set)", *job.ExpiresAt)
+	}
+}
+
+// TestClaimBatchKeepsEachRowsOwnFields claims two jobs in one call and
+// pins each returned Job to its own row. ClaimBatch maps the twelve
+// fields in a loop; every other test in this file claims exactly one
+// job, so a mapping that reads the same element for every job — or a
+// per-row field taken from the wrong index — is invisible to them. The
+// user-visible damage is Ack: job.Ack() uses the Job's own ID, so a job
+// carrying its neighbour's id acks the wrong row and leaves its own
+// claim to expire.
+func TestClaimBatchKeepsEachRowsOwnFields(t *testing.T) {
+	worker, reader := openTypedJobs(t)
+	wq := worker.Queue("batchfields", QueueOptions{MaxAttempts: 4, VisibilityTimeoutS: 90})
+	rq := reader.Queue("batchfields", QueueOptions{MaxAttempts: 4, VisibilityTimeoutS: 90})
+
+	// Priority orders the claim (priority DESC), so "high" comes back
+	// first and "low" second — deterministic, no timing race.
+	ttl := int64(900)
+	highWant := emailPayload{Recipient: "high@example.com", Template: "urgent", Version: 11}
+	lowWant := emailPayload{Recipient: "low@example.com", Template: "bulk", Version: 22}
+
+	highID, err := wq.Enqueue(highWant, EnqueueOptions{Priority: 9, Expires: &ttl})
+	if err != nil {
+		t.Fatalf("enqueue high: %v", err)
+	}
+	lowID, err := wq.Enqueue(lowWant, EnqueueOptions{Priority: 1})
+	if err != nil {
+		t.Fatalf("enqueue low: %v", err)
+	}
+	if highID == lowID {
+		t.Fatalf("enqueue returned the same id twice: %d", highID)
+	}
+
+	jobs, err := wq.ClaimBatch("worker-batch", 2)
+	if err != nil {
+		t.Fatalf("ClaimBatch: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("ClaimBatch returned %d jobs, want 2", len(jobs))
+	}
+	if jobs[0].ID == jobs[1].ID {
+		t.Fatalf("both claimed jobs carry id %d — the batch mapping collapsed the rows", jobs[0].ID)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		job         *Job
+		wantID      int64
+		wantPayload emailPayload
+		wantPrio    int64
+		wantExpires *int64
+	}{
+		{"high", jobs[0], highID, highWant, 9, &ttl},
+		{"low", jobs[1], lowID, lowWant, 1, nil},
+	} {
+		if tc.job.ID != tc.wantID {
+			t.Errorf("%s: job.ID = %d, want %d", tc.name, tc.job.ID, tc.wantID)
+		}
+		if tc.job.Priority != tc.wantPrio {
+			t.Errorf("%s: job.Priority = %d, want %d", tc.name, tc.job.Priority, tc.wantPrio)
+		}
+		got, err := DecodePayload[emailPayload](tc.job.Payload)
+		if err != nil {
+			t.Errorf("%s: decode payload: %v", tc.name, err)
+		} else if got != tc.wantPayload {
+			t.Errorf("%s: payload = %+v, want %+v", tc.name, got, tc.wantPayload)
+		}
+		switch {
+		case tc.wantExpires == nil && tc.job.ExpiresAt != nil:
+			t.Errorf("%s: job.ExpiresAt = %d, want nil (no TTL)", tc.name, *tc.job.ExpiresAt)
+		case tc.wantExpires != nil && tc.job.ExpiresAt == nil:
+			t.Errorf("%s: job.ExpiresAt = nil, want run_at + %d", tc.name, *tc.wantExpires)
+		case tc.wantExpires != nil && *tc.job.ExpiresAt-tc.job.RunAt != *tc.wantExpires:
+			t.Errorf("%s: job.ExpiresAt - RunAt = %d, want %d",
+				tc.name, *tc.job.ExpiresAt-tc.job.RunAt, *tc.wantExpires)
+		}
+		if tc.job.WorkerID != "worker-batch" {
+			t.Errorf("%s: job.WorkerID = %q, want %q", tc.name, tc.job.WorkerID, "worker-batch")
+		}
+		if tc.job.Attempts != 1 {
+			t.Errorf("%s: job.Attempts = %d, want 1", tc.name, tc.job.Attempts)
+		}
+		if tc.job.MaxAttempts != 4 {
+			t.Errorf("%s: job.MaxAttempts = %d, want 4", tc.name, tc.job.MaxAttempts)
+		}
+	}
+
+	// Each Job's own Ack has to land on its own row. A job carrying the
+	// wrong id acks a row that is already gone and returns false.
+	for i, job := range jobs {
+		acked, err := job.Ack()
+		if err != nil {
+			t.Fatalf("jobs[%d].Ack: %v", i, err)
+		}
+		if !acked {
+			t.Errorf("jobs[%d].Ack() = false for id %d, want true", i, job.ID)
+		}
+	}
+	for _, id := range []int64{highID, lowID} {
+		row, err := rq.GetJob(id)
+		if err != nil {
+			t.Fatalf("GetJob(%d): %v", id, err)
+		}
+		if row != nil {
+			t.Errorf("GetJob(%d) = %+v after ack, want nil", id, row)
+		}
 	}
 }
 
