@@ -210,7 +210,7 @@ impl Database {
 
     /// Get a named transactional outbox handle carrying `T` payloads.
     pub fn typed_outbox<T>(&self, name: &str, opts: OutboxOpts) -> Outbox<T> {
-        Outbox::new(self, name, opts)
+        Outbox::new_typed(self, name, opts)
     }
 
     /// Get a named stream handle.
@@ -554,8 +554,21 @@ impl<T> Clone for Outbox<T> {
     }
 }
 
-impl<T> Outbox<T> {
+impl Outbox<serde_json::Value> {
+    /// Build an outbox handle carrying `serde_json::Value` payloads.
+    ///
+    /// Deliberately *not* generic: a generic `new` would leave `T`
+    /// uninferrable in `let ob = Outbox::new(..)`. Use
+    /// [`Outbox::new_typed`] or [`Database::typed_outbox`] for a typed
+    /// handle.
     pub fn new(db: &Database, name: &str, opts: OutboxOpts) -> Self {
+        Self::new_typed(db, name, opts)
+    }
+}
+
+impl<T> Outbox<T> {
+    /// Build an outbox handle carrying `T` payloads.
+    pub fn new_typed(db: &Database, name: &str, opts: OutboxOpts) -> Self {
         let queue = db.typed_queue(
             &format!("_outbox:{name}"),
             QueueOpts {
