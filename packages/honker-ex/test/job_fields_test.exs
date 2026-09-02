@@ -26,38 +26,37 @@ defmodule HonkerJobFieldsTest do
 
   @repo_root Path.expand("../../..", __DIR__)
 
-  defp find_extension do
-    Enum.find_value(@candidates, fn rel ->
-      p = Path.join(@repo_root, rel)
-      if File.exists?(p), do: p, else: nil
-    end)
-  end
+  @extension_path Enum.find_value(@candidates, fn rel ->
+                    p = Path.join(@repo_root, rel)
+                    if File.exists?(p), do: p, else: nil
+                  end)
+
+  # A real ExUnit skip. `setup` used to return `{:skip, reason}`, which
+  # ExUnit rejects outright — "expected ExUnit setup callback in
+  # HonkerJobFieldsTest to return the atom :ok, a keyword, or a map" — so
+  # the intended graceful skip was dead code and a missing extension
+  # produced six confusing failures instead of one clear message.
+  # `skip: false` is not a skip, so this only fires when the extension is
+  # genuinely absent; in CI the build step runs first, so it never does.
+  @moduletag skip: @extension_path == nil && "honker extension not built"
 
   setup do
-    case find_extension() do
-      nil ->
-        {:skip, "honker extension not built"}
+    dir = Path.join(System.tmp_dir!(), "honker-job-fields-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    {:ok, db} = Honker.open(Path.join(dir, "t.db"), extension_path: @extension_path)
 
-      ext ->
-        dir =
-          Path.join(System.tmp_dir!(), "honker-job-fields-#{System.unique_integer([:positive])}")
+    db =
+      Honker.configure_queue(db, "details",
+        visibility_timeout_s: @visibility_s,
+        max_attempts: @max_attempts
+      )
 
-        File.mkdir_p!(dir)
-        {:ok, db} = Honker.open(Path.join(dir, "t.db"), extension_path: ext)
+    on_exit(fn ->
+      Honker.close(db)
+      File.rm_rf!(dir)
+    end)
 
-        db =
-          Honker.configure_queue(db, "details",
-            visibility_timeout_s: @visibility_s,
-            max_attempts: @max_attempts
-          )
-
-        on_exit(fn ->
-          Honker.close(db)
-          File.rm_rf!(dir)
-        end)
-
-        {:ok, %{db: db}}
-    end
+    {:ok, %{db: db}}
   end
 
   defp db_now(db) do
