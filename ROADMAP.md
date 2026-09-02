@@ -39,6 +39,14 @@ rather than the symptom, while alpha still makes that cheap.
 - **#152 / #153** — payload must be valid JSON, enforced at the five core
   entry points rather than by a table CHECK. Bare scalars stay legal: the
   contract is valid JSON, nothing more. *Breaking.*
+  Validation parses into `serde_json::Value`, matching the read side, not
+  the cheaper `IgnoredAny` — a validator more permissive than the decoder
+  would leave the guarantee false. Measured cost: +0.6 us per enqueue
+  against ~24 us, so the perf objection did not survive checking. Three
+  break classes, all previously accepted silently and now rejected at the
+  producer: lone surrogates (`"\ud800"`, which Python and Node both emit),
+  out-of-range numbers (`1e999`), and nesting past serde_json's 128-level
+  limit. Closes #146 — decoded is now genuinely always safe.
 - **#134** — `Queue.getJob` and `Queue.cancel` scope to their queue in
   every binding; `Database.getJob` and `Database.cancel` are the global
   forms. Core gains `honker_cancel(queue, job_id)`. *Breaking.*
@@ -51,6 +59,12 @@ rather than the symptom, while alpha still makes that cheap.
 ### Sequence
 
 1. Independent adversarial review of every open PR. Not merged before this.
+   Round one is complete: every PR reviewed, every finding fixed. It found a
+   defect shared by six bindings — a `run_at`/`created_at` transposition that
+   passed every test, because the claimed-job assertion compared against an
+   undelayed enqueue where the two fields are equal to the second. Round two
+   is in flight, one agent per binding, asking a different question: is this
+   complete, well designed, and does it make sense to a user of that language.
 2. Merge `#124` → the nine #136 binding PRs → `#138` → `#140` → `#153`.
 3. Second pass, one PR per binding: #134 scoping, `Database.*` globals, and
    the #152 loud decode together. They touch the same files, so splitting
