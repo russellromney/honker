@@ -35,4 +35,11 @@ Documentation = "https://honker.dev/docs/"
 python-source = "python"
 module-name = "honker._honker_native"
 features = ["pyo3/extension-module"]
-include = [{ path = "python/honker/_lib/*", format = "wheel" }]
+# `py.typed` is the PEP 561 marker. Without it in the wheel, mypy and
+# pyright skip honker entirely and every annotation in this package —
+# `Queue[T]`, `Job[T]`, `JobSnapshot` — resolves to `Any` in user code.
+# scripts/proof/check-python-wheel.py asserts it shipped.
+include = [
+  { path = "python/honker/_lib/*", format = "wheel" },
+  { path = "python/honker/py.typed", format = "wheel" },
+]
