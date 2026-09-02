@@ -16,7 +16,8 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "test": "bun test",
+    "test": "bun run test:types && bun test",
+    "test:types": "tsc -p test/types/tsconfig.json",
     "example": "bun run examples/basic.ts"
   },
   "peerDependencies": {
@@ -30,5 +31,9 @@
     "@russellthehippo/honker-ext-darwin-x64": "0.4.6",
     "@russellthehippo/honker-ext-linux-x64-gnu": "0.4.6",
     "@russellthehippo/honker-ext-linux-arm64-gnu": "0.4.6"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^5.9.3"
   }
 }

@@ -20,6 +20,47 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — typed Bun jobs
+
+- Bun `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` now take
+  a payload generic defaulting to `JsonValue`, matching the Node
+  binding's shape: `db.queue<EmailPayload>("emails")` types enqueue,
+  claims, and snapshots.
+- Claimed jobs carry every field the core returns. `state`, `priority`,
+  `runAt`, `claimExpiresAt`, `maxAttempts`, `createdAt`, and
+  `expiresAt` join the id, queue, payload, worker, and attempts fields
+  they already had.
+- **Behavior change:** `Queue.getJob()` returns the camelCase
+  `JobSnapshot` shape instead of the SQL ABI's raw snake_case row. The
+  exported `JobRow` interface is replaced by `JobSnapshot`. The
+  snapshot's `payload` stays raw JSON text, exactly as this binding has
+  always returned it; only the field names changed. A claimed
+  `Job.payload` stays decoded, as it always was. Bindings disagree on
+  snapshot payload encoding (Node decodes; Bun, Go, and Python return
+  raw text) and one convention has not been chosen yet.
+- A claimed row without `worker_id` or `claim_expires_at` now throws
+  instead of being silently accepted, and a test builds both a complete
+  and a truncated row to prove the guard fires only on the bad one.
+- `Queue.getJob()` is documented as NOT queue-scoped: job ids are
+  globally unique, so it returns a row from any queue. The Node binding
+  scopes its lookup; #134 tracks making the bindings agree. Behavior is
+  unchanged here, only the README and the JSDoc, which previously said
+  nothing about it.
+- A job enqueued without `expires` now has its `expiresAt` asserted to be
+  `null` on both the snapshot and the claimed job. Nothing pinned it
+  before, so an `expires_at ?? 0` fallback would have handed callers 0 —
+  a valid unix timestamp meaning 1970 — with the suite still green.
+- Payload typing is compile-time only; honker adds no runtime payload
+  validation. `bun run test:types` type-checks the binding and a typed
+  usage fixture, and CI runs it. The fixture carries two negative checks
+  (`@ts-expect-error`) so the gate fails if the generics go loose in
+  either direction — a missing required field, or `payload` decaying to
+  `any`, which every positive assertion would otherwise accept.
+- The binding's own sources now type-check under strict `tsc`. The
+  `bun:ffi` watcher handle and one `bun:sqlite` query binding were
+  previously untypeable (`never` symbols), which broke any strict
+  TypeScript consumer of this package.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry
