@@ -203,6 +203,12 @@ public sealed class Queue
     /// <summary>
     /// Read a single job row by id. Returns the row or null on miss
     /// (ack'd, dead'd, or never existed). Pure read.
+    ///
+    /// NOT queue-scoped: job ids are globally unique and this lookup
+    /// spans every queue, so it can return a row belonging to a
+    /// different queue than this handle. Check
+    /// <see cref="JobRow.Queue"/> if that matters. Node's equivalent is
+    /// already scoped; aligning .NET is tracked in #134.
     /// </summary>
     public JobRow? GetJob(long jobId)
     {

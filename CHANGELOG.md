@@ -46,6 +46,27 @@
   two assignments) could be transposed and the suite stayed green.
 - `Job<TPayload>.PayloadRaw` is now asserted against the enqueued JSON.
   Only `JobSnapshot<T>.PayloadRaw` was covered before.
+- `Job<TPayload>.Payload` decodes on first read instead of inside the
+  constructor. It used to decode during the claim, so a payload that did
+  not match `TPayload` threw from inside `ClaimBatch`/`ClaimOne`/
+  `ClaimAsync` — after the rows were already claimed in the database.
+  The caller got an exception and no handle, so it could not `Ack`,
+  `Retry`, or `Fail` any job in that batch; they stayed invisible until
+  the visibility timeout and then poisoned the next claim. Honker never
+  validates payload shape, so one disagreeing producer was enough. A
+  claim now never decodes and never throws; the `JsonException` arrives
+  when you read `Payload`, with the job in hand to `Fail`.
+- `TypedQueue<T>.GetJob` still decodes eagerly and still throws on a
+  mismatched payload — a read holds no claim, so nothing is stranded.
+  `Untyped.GetJob` reads the row whatever shape it is. Both behaviours
+  are documented on the members and in the README.
+- Tests for the previously uncovered typed surface: `ClaimBatch`,
+  `AckBatch`, `ClaimAsync`, `Cancel`, `Name`, `Job<T>.Untyped`,
+  `Job<T>.Retry`, and `Job<T>.Heartbeat`.
+- The README now names the `TypedQueue<T>` vs `Queue<T>` collision, shows
+  the poison-payload worker loop, separates the four spellings of
+  "payload" across the typed and untyped pairs, and says `GetJob` is not
+  queue-scoped. `Queue.GetJob` says so in its XML doc too (#134).
 
 ## Unreleased — typed Node jobs
 

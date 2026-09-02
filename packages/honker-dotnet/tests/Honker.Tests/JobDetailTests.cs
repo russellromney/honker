@@ -233,6 +233,115 @@ public sealed class JobDetailTests
         Assert.Same(untyped, typed.Untyped);
     }
 
+    [Fact]
+    public void TypedClaimHandsBackAJobWhosePayloadDoesNotDecode()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var typed = db.Queue<OrderPayload>("orders");
+        var untyped = db.Queue("orders");
+
+        // A producer that disagrees about the payload shape. Honker never
+        // validates it, so the row lands in the queue either way.
+        var id = untyped.Enqueue(new { Sku = "SKU-BAD", Quantity = "three" });
+
+        var job = typed.ClaimOne("typed-worker");
+
+        // The claim already happened in the database before the binding saw
+        // the payload. If decoding threw inside ClaimOne, the row would be
+        // held invisible with no handle to ack, fail, or retry it, and it
+        // would poison every claim after the visibility timeout.
+        Assert.NotNull(job);
+        Assert.Equal(id, job!.Id);
+        Assert.Equal("{\"Sku\":\"SKU-BAD\",\"Quantity\":\"three\"}", job.PayloadRaw);
+        Assert.Throws<JsonException>(() => _ = job.Payload);
+
+        // The worker can still dead-letter it, which is the whole point.
+        Assert.True(job.Fail("payload does not match OrderPayload"));
+        Assert.Null(typed.GetJob(id));
+    }
+
+    [Fact]
+    public void TypedClaimBatchDecodesEveryJobAndOneBadPayloadDoesNotSinkTheRest()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var typed = db.Queue<OrderPayload>("orders");
+        var untyped = db.Queue("orders");
+
+        var good = typed.Enqueue(new OrderPayload("SKU-A", 1));
+        var bad = untyped.Enqueue(new { Sku = "SKU-B", Quantity = "two" });
+        var alsoGood = typed.Enqueue(new OrderPayload("SKU-C", 3));
+
+        var claimed = typed.ClaimBatch("batch-worker", 10).ToDictionary(job => job.Id);
+
+        Assert.Equal(3, claimed.Count);
+        Assert.Equal(new OrderPayload("SKU-A", 1), claimed[good].Payload);
+        Assert.Equal(new OrderPayload("SKU-C", 3), claimed[alsoGood].Payload);
+        Assert.Throws<JsonException>(() => _ = claimed[bad].Payload);
+        Assert.All(claimed.Values, job => Assert.Equal("batch-worker", job.WorkerId));
+
+        Assert.Equal(3, typed.AckBatch(claimed.Keys, "batch-worker"));
+    }
+
+    [Fact]
+    public async Task TypedClaimAsyncYieldsDecodedJobs()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var queue = db.Queue<OrderPayload>("orders");
+        var id = queue.Enqueue(new OrderPayload("SKU-ASYNC", 5));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var jobs = queue
+            .ClaimAsync("async-worker", TimeSpan.FromSeconds(30), cts.Token)
+            .GetAsyncEnumerator(cts.Token);
+
+        Assert.True(await jobs.MoveNextAsync());
+        var job = jobs.Current;
+        Assert.Equal(id, job.Id);
+        Assert.Equal(new OrderPayload("SKU-ASYNC", 5), job.Payload);
+        Assert.Equal("async-worker", job.WorkerId);
+        Assert.True(job.Ack());
+    }
+
+    [Fact]
+    public void TypedJobHeartbeatsRetriesAndCancels()
+    {
+        using var harness = TestHarness.Create();
+        using var db = harness.Open();
+        var queue = db.Queue<OrderPayload>("orders", new QueueOptions(VisibilityTimeoutSeconds: 30, MaxAttempts: 3));
+        Assert.Equal("orders", queue.Name);
+
+        var id = queue.Enqueue(new OrderPayload("SKU-R", 2));
+        var job = queue.ClaimOne("w1");
+        Assert.NotNull(job);
+        // Untyped is the documented escape hatch: same claim, same worker.
+        Assert.Equal(id, job!.Untyped.Id);
+        Assert.Equal("w1", job.Untyped.WorkerId);
+
+        var beatBefore = Now(db);
+        Assert.True(job.Heartbeat(90));
+        var beatAfter = Now(db);
+        Assert.InRange(queue.GetJob(id)!.ClaimExpiresAt!.Value, beatBefore + 90, beatAfter + 90);
+
+        var retriedBefore = Now(db);
+        Assert.True(job.Retry(delaySeconds: 45, error: "boom"));
+        var retriedAfter = Now(db);
+
+        var back = queue.GetJob(id);
+        Assert.NotNull(back);
+        Assert.Equal("pending", back!.State);
+        Assert.Null(back.WorkerId);
+        Assert.Null(back.ClaimExpiresAt);
+        Assert.Equal(1, back.Attempts);
+        Assert.InRange(back.RunAt, retriedBefore + 45, retriedAfter + 45);
+        Assert.Equal(new OrderPayload("SKU-R", 2), back.Payload);
+
+        Assert.True(queue.Cancel(id));
+        Assert.Null(queue.GetJob(id));
+    }
+
     private static long Now(Database db)
     {
         return Convert.ToInt64(db.Query("SELECT unixepoch() AS v").Single()["v"]);

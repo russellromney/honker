@@ -222,8 +222,8 @@ public sealed class Job
 /// <summary>
 /// A claimed unit of work with a decoded payload of type
 /// <typeparamref name="TPayload"/>. Same fields and claim methods as
-/// <see cref="Job"/>; the payload is decoded once, when the job is
-/// claimed.
+/// <see cref="Job"/>, plus <see cref="Payload"/> decoded as
+/// <typeparamref name="TPayload"/>.
 ///
 /// The type parameter is a compile-time contract only. Honker stores
 /// payloads as opaque JSON and never validates their shape, so every
@@ -232,11 +232,12 @@ public sealed class Job
 public sealed class Job<TPayload>
 {
     private readonly Job _job;
+    private TPayload? _payload;
+    private bool _decoded;
 
     internal Job(Job job)
     {
         _job = job;
-        Payload = job.GetPayload<TPayload>();
     }
 
     /// <summary>The untyped job, for APIs that take one.</summary>
@@ -244,7 +245,36 @@ public sealed class Job<TPayload>
 
     public long Id => _job.Id;
     public string QueueName => _job.QueueName;
-    public TPayload? Payload { get; }
+
+    /// <summary>
+    /// The payload decoded as <typeparamref name="TPayload"/>, decoded
+    /// on first read and cached. Throws
+    /// <see cref="JsonException"/> when the stored JSON does not match
+    /// <typeparamref name="TPayload"/> — honker never checks payload
+    /// shape, so a producer that disagrees puts a row here anyway.
+    ///
+    /// Decoding deliberately does NOT happen during the claim. By the
+    /// time the binding sees the payload the row is already held in the
+    /// database, so throwing inside ClaimBatch/ClaimOne/ClaimAsync would
+    /// strand it: invisible until the visibility timeout, with no handle
+    /// to Ack, Retry, or Fail it, poisoning every later claim. Catch the
+    /// exception here and <see cref="Fail"/> the job, or read
+    /// <see cref="PayloadRaw"/> instead.
+    /// </summary>
+    public TPayload? Payload
+    {
+        get
+        {
+            if (!_decoded)
+            {
+                _payload = _job.GetPayload<TPayload>();
+                _decoded = true;
+            }
+
+            return _payload;
+        }
+    }
+
     public string PayloadRaw => _job.PayloadRaw;
     /// <summary>Always "processing" for a claimed job.</summary>
     public string State => _job.State;
@@ -270,12 +300,24 @@ public sealed class Job<TPayload>
 ///
 /// The type parameter is a compile-time contract only; honker never
 /// validates payload shape.
+///
+/// Unlike <see cref="Job{TPayload}"/>, the payload here is decoded
+/// eagerly, so <see cref="TypedQueue{TPayload}.GetJob"/> throws
+/// <see cref="JsonException"/> on a payload that does not match
+/// <typeparamref name="TPayload"/>. A read holds nothing, so nothing is
+/// stranded by that throw — use <see cref="TypedQueue{TPayload}.Untyped"/>'s
+/// <see cref="Queue.GetJob"/> to read the row regardless of its shape.
 /// </summary>
 public sealed record JobSnapshot<TPayload>
 {
     public required long Id { get; init; }
     public required string QueueName { get; init; }
+    /// <summary>
+    /// The payload decoded as <typeparamref name="TPayload"/>. Null only
+    /// when the stored JSON is literally <c>null</c>.
+    /// </summary>
     public required TPayload? Payload { get; init; }
+    /// <summary>The payload exactly as stored, before decoding.</summary>
     public required string PayloadRaw { get; init; }
     /// <summary>"pending" or "processing".</summary>
     public required string State { get; init; }

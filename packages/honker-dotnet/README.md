@@ -64,10 +64,42 @@ if (job is not null)
 }
 ```
 
+The handle `db.Queue<TPayload>(name)` returns is called
+`TypedQueue<TPayload>`, not `Queue<TPayload>`. A `Honker.Queue<T>` would
+shadow `System.Collections.Generic.Queue<T>` in any file that uses both,
+so `var` or `TypedQueue<EmailPayload>` is the name to write down.
+
 The type parameter is a compile-time contract only. Honker stores
 payloads as opaque JSON and never validates their shape — in this
 binding or in the database — so every process writing to a queue has to
-agree on the payload type.
+agree on the payload type. When a producer disagrees, the row still
+lands in the queue and the decode is what fails:
+
+```csharp
+foreach (var job in emails.ClaimBatch("worker-1", 10))
+{
+    EmailPayload payload;
+    try
+    {
+        // Claiming never decodes, so the claim itself cannot throw and
+        // you always hold a handle. Payload decodes on first read.
+        payload = job.Payload!;
+    }
+    catch (JsonException e)
+    {
+        job.Fail(e.Message);   // dead-letter it; job.PayloadRaw has the text
+        continue;
+    }
+
+    Send(payload.To);
+    job.Ack();
+}
+```
+
+`GetJob()` is the one exception: it decodes eagerly and throws on a
+payload that does not match, because a read holds no claim and so
+strands nothing. `emails.Untyped.GetJob(id)` reads the row whatever
+shape it is.
 
 Claimed jobs (`Job`, `Job<TPayload>`) and read-only snapshots
 (`JobRow`, `JobSnapshot<TPayload>`) carry every field the core returns:
@@ -76,7 +108,19 @@ Claimed jobs (`Job`, `Job<TPayload>`) and read-only snapshots
 A claimed job additionally has `Ack`, `Retry`, `Fail`, and `Heartbeat`;
 a snapshot is data only, because reading a row does not claim it.
 `Untyped` on `TypedQueue<TPayload>` and `Job<TPayload>` gets you back
-to the untyped handle when an API needs one.
+to the untyped handle when an API needs one — results (`SaveResult`,
+`GetResult`, `WaitResult`) live there, since a result's type has
+nothing to do with `TPayload`.
+
+Two spellings of "payload" sit side by side, so watch which type you
+hold. On the typed pair (`Job<T>`, `JobSnapshot<T>`) `Payload` is the
+decoded `T` and `PayloadRaw` is the JSON text. On the untyped pair,
+`Job.Payload` is a `JsonElement` (`Job.GetPayload<T>()` decodes) and
+`JobRow.Payload` is the JSON text with no `PayloadRaw` beside it.
+
+`GetJob` is not scoped to the queue you called it on: job ids are
+globally unique and the lookup spans every queue, so pass only ids you
+know this queue owns.
 
 ## Native loading
 

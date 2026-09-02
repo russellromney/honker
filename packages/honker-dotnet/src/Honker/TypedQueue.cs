@@ -14,6 +14,23 @@ namespace Honker;
 /// payloads as opaque JSON and never validates their shape, in this
 /// binding or in the database. Every process writing to the queue has
 /// to agree on the payload type; nothing enforces it at runtime.
+///
+/// It is named TypedQueue rather than Queue&lt;TPayload&gt; because a
+/// <c>Honker.Queue&lt;T&gt;</c> would shadow
+/// <c>System.Collections.Generic.Queue&lt;T&gt;</c> in any file that uses
+/// both — it broke this binding's own Listener and Stream first. Get one
+/// from <see cref="Database.Queue{TPayload}(string, QueueOptions?)"/>.
+///
+/// This wrapper covers enqueue, claim, ack, cancel, and read. Anything
+/// else on <see cref="Queue"/> — results (SaveResult, GetResult,
+/// WaitResult, SweepResults) and the by-id Ack/Retry/Fail/Heartbeat
+/// overloads — is reached through <see cref="Untyped"/>; results carry
+/// their own type, unrelated to <typeparamref name="TPayload"/>.
+///
+/// No claim method decodes the payload, so none of them throws on a
+/// payload that does not match <typeparamref name="TPayload"/>; see
+/// <see cref="Job{TPayload}.Payload"/>. <see cref="GetJob"/> is the one
+/// exception and the reason is spelled out there.
 /// </summary>
 public sealed class TypedQueue<TPayload>
 {
@@ -52,8 +69,7 @@ public sealed class TypedQueue<TPayload>
         TimeSpan? idlePoll = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        await foreach (var job in _queue.ClaimAsync(workerId, idlePoll, cancellationToken)
-            .WithCancellation(cancellationToken))
+        await foreach (var job in _queue.ClaimAsync(workerId, idlePoll, cancellationToken))
         {
             yield return new Job<TPayload>(job);
         }
@@ -62,6 +78,19 @@ public sealed class TypedQueue<TPayload>
     /// <summary>
     /// Read a single job row by id. Returns the snapshot or null on
     /// miss (ack'd, dead'd, or never existed). Pure read.
+    ///
+    /// NOT queue-scoped: job ids are globally unique and this lookup
+    /// spans every queue, so an id owned by another queue comes back as
+    /// a <see cref="JobSnapshot{TPayload}"/> whose payload was never
+    /// meant to be a <typeparamref name="TPayload"/>. Pass only ids you
+    /// know this queue owns. Scoping is tracked in #134.
+    ///
+    /// Throws <see cref="System.Text.Json.JsonException"/> when the
+    /// stored payload does not decode as <typeparamref name="TPayload"/>.
+    /// A read holds no claim, so nothing is stranded by that throw —
+    /// unlike a claim, which is why <see cref="Job{TPayload}.Payload"/>
+    /// defers instead. Use <see cref="Untyped"/>'s
+    /// <see cref="Queue.GetJob"/> to read the row regardless of shape.
     /// </summary>
     public JobSnapshot<TPayload>? GetJob(long jobId)
     {
