@@ -66,8 +66,8 @@ if (job is not null)
 
 The handle `db.Queue<TPayload>(name)` returns is called
 `TypedQueue<TPayload>`, not `Queue<TPayload>`. A `Honker.Queue<T>` would
-shadow `System.Collections.Generic.Queue<T>` in any file that uses both,
-so `var` or `TypedQueue<EmailPayload>` is the name to write down.
+shadow `System.Collections.Generic.Queue<T>` in any file that uses both.
+Write `var`, or `TypedQueue<EmailPayload>` where you need the name.
 
 The type parameter is a compile-time contract only. Honker stores
 payloads as opaque JSON and never validates their shape — in this
@@ -112,11 +112,11 @@ to the untyped handle when an API needs one — results (`SaveResult`,
 `GetResult`, `WaitResult`) live there, since a result's type has
 nothing to do with `TPayload`.
 
-Two spellings of "payload" sit side by side, so watch which type you
-hold. On the typed pair (`Job<T>`, `JobSnapshot<T>`) `Payload` is the
-decoded `T` and `PayloadRaw` is the JSON text. On the untyped pair,
-`Job.Payload` is a `JsonElement` (`Job.GetPayload<T>()` decodes) and
-`JobRow.Payload` is the JSON text with no `PayloadRaw` beside it.
+`Payload` means something different on each of these types, so check
+which one you hold. On the typed pair (`Job<T>`, `JobSnapshot<T>`) it is
+the decoded `T`, with `PayloadRaw` beside it for the JSON text. On `Job`
+it is a `JsonElement`, and `Job.GetPayload<T>()` decodes. On `JobRow` it
+is the JSON text itself, with no `PayloadRaw` beside it.
 
 `GetJob` is not scoped to the queue you called it on: job ids are
 globally unique and the lookup spans every queue, so pass only ids you
