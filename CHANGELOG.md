@@ -38,6 +38,14 @@
   shape in the database, and this binding adds no runtime check.
 - A claimed row missing `worker_id` or `claim_expires_at` now throws
   instead of being silently defaulted.
+- The typed job tests enqueue with a back-dated absolute `RunAtUnix`
+  (`now - 100`) so the job stays claimable while `RunAt` and `CreatedAt`
+  differ, then pin `RunAt` exactly and assert the two are not equal.
+  With an immediate enqueue the two are equal to the second, so all four
+  properties (`Job<T>.RunAt`/`CreatedAt` and `JobSnapshot<T>.FromRow`'s
+  two assignments) could be transposed and the suite stayed green.
+- `Job<TPayload>.PayloadRaw` is now asserted against the enqueued JSON.
+  Only `JobSnapshot<T>.PayloadRaw` was covered before.
 
 ## Unreleased — typed Node jobs
 

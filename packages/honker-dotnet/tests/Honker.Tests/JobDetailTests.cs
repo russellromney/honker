@@ -130,8 +130,15 @@ public sealed class JobDetailTests
         using var db = harness.Open();
         var queue = db.Queue<OrderPayload>("orders", new QueueOptions(VisibilityTimeoutSeconds: 90, MaxAttempts: 4));
 
+        // Back-dated absolute run_at: the job stays claimable (a delayed
+        // job is not) while RunAt and CreatedAt differ by 100 seconds. With
+        // an immediate enqueue the two are equal to the second, so the two
+        // properties could be transposed and every assertion still held.
+        var runAt = Now(db) - 100;
         var enqueuedBefore = Now(db);
-        var id = queue.Enqueue(new OrderPayload("SKU-42", 3), new EnqueueOptions(Priority: 6, ExpiresSeconds: 300));
+        var id = queue.Enqueue(
+            new OrderPayload("SKU-42", 3),
+            new EnqueueOptions(RunAtUnix: runAt, Priority: 6, ExpiresSeconds: 300));
         var enqueuedAfter = Now(db);
 
         var claimedBefore = Now(db);
@@ -142,14 +149,16 @@ public sealed class JobDetailTests
         Assert.Equal(id, job!.Id);
         Assert.Equal("orders", job.QueueName);
         Assert.Equal(new OrderPayload("SKU-42", 3), job.Payload);
+        Assert.Equal("{\"Sku\":\"SKU-42\",\"Quantity\":3}", job.PayloadRaw);
         Assert.Equal("processing", job.State);
         Assert.Equal(6, job.Priority);
-        Assert.InRange(job.RunAt, enqueuedBefore, enqueuedAfter);
+        Assert.Equal(runAt, job.RunAt);
         Assert.Equal("typed-worker", job.WorkerId);
         Assert.InRange(job.ClaimExpiresAt, claimedBefore + 90, claimedAfter + 90);
         Assert.Equal(1, job.Attempts);
         Assert.Equal(4, job.MaxAttempts);
         Assert.InRange(job.CreatedAt, enqueuedBefore, enqueuedAfter);
+        Assert.NotEqual(job.RunAt, job.CreatedAt);
         Assert.NotNull(job.ExpiresAt);
         Assert.InRange(job.ExpiresAt!.Value, enqueuedBefore + 300, enqueuedAfter + 300);
         Assert.True(job.Ack());
@@ -162,8 +171,14 @@ public sealed class JobDetailTests
         using var db = harness.Open();
         var queue = db.Queue<OrderPayload>("orders", new QueueOptions(VisibilityTimeoutSeconds: 30));
 
+        // Same back-dating as the claimed-job test, and for the same
+        // reason: it is the only thing that separates RunAt from CreatedAt
+        // on a job this test still needs to claim further down.
+        var runAt = Now(db) - 100;
         var enqueuedBefore = Now(db);
-        var id = queue.Enqueue(new OrderPayload("SKU-9", 11), new EnqueueOptions(Priority: 2, MaxAttempts: 7, ExpiresSeconds: 120));
+        var id = queue.Enqueue(
+            new OrderPayload("SKU-9", 11),
+            new EnqueueOptions(RunAtUnix: runAt, Priority: 2, MaxAttempts: 7, ExpiresSeconds: 120));
         var enqueuedAfter = Now(db);
 
         var pending = queue.GetJob(id);
@@ -174,12 +189,13 @@ public sealed class JobDetailTests
         Assert.Equal("{\"Sku\":\"SKU-9\",\"Quantity\":11}", pending.PayloadRaw);
         Assert.Equal("pending", pending.State);
         Assert.Equal(2, pending.Priority);
-        Assert.InRange(pending.RunAt, enqueuedBefore, enqueuedAfter);
+        Assert.Equal(runAt, pending.RunAt);
         Assert.Null(pending.WorkerId);
         Assert.Null(pending.ClaimExpiresAt);
         Assert.Equal(0, pending.Attempts);
         Assert.Equal(7, pending.MaxAttempts);
         Assert.InRange(pending.CreatedAt, enqueuedBefore, enqueuedAfter);
+        Assert.NotEqual(pending.RunAt, pending.CreatedAt);
         Assert.NotNull(pending.ExpiresAt);
         Assert.InRange(pending.ExpiresAt!.Value, enqueuedBefore + 120, enqueuedAfter + 120);
 
