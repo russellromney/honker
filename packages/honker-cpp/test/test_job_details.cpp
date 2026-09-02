@@ -476,6 +476,73 @@ void test_decode_reports_a_wrong_typed_field_as_honker_error() {
     std::cout << "decode_reports_a_wrong_typed_field_as_honker_error: ok\n";
 }
 
+void test_stream_and_scheduler_rows_decode_loudly() {
+    // Same anti-pattern as the job decoders, same fix. The offset one
+    // is the dangerous shape: a swallowed row used to yield offset 0,
+    // and a consumer that saved that offset replayed the whole topic.
+    const json event = json{
+        {"offset", 42},
+        {"topic", "t"},
+        {"key", "k"},
+        {"payload", R"({"n":1})"},
+        {"created_at", 1700000000},
+    };
+
+    // Positive: the well-formed row decodes, and a null key stays the
+    // empty string rather than becoming an error.
+    auto unkeyed = event;
+    unkeyed["key"] = nullptr;
+    const auto events = honker::detail::parse_stream_events(
+        json::array({event, unkeyed}).dump());
+    check_i64(static_cast<int64_t>(events.size()), 2, "stream events decoded");
+    check_i64(events[0].offset(), 42, "stream event offset");
+    check_str(events[0].key(), "k", "stream event key");
+    check_str(events[1].key(), "", "a null key decodes to the empty string");
+
+    for (const auto& key : std::vector<std::string>{
+             "offset", "topic", "payload", "created_at"}) {
+        auto bad = event;
+        bad.erase(key);
+        expect_honker_error(
+            [&] { (void)honker::detail::parse_stream_events(json::array({bad}).dump()); },
+            "missing required field '" + key + "'",
+            "stream event with no " + key);
+    }
+    auto typed = event;
+    typed["offset"] = "42";
+    expect_honker_error(
+        [&] { (void)honker::detail::parse_stream_events(json::array({typed}).dump()); },
+        "field 'offset' is not an integer",
+        "stream event with a string offset");
+    expect_honker_error(
+        [] { (void)honker::detail::parse_stream_events("{oops"); },
+        "not parseable", "stream read blob that is not JSON");
+
+    const json fire = json{
+        {"name", "nightly"},
+        {"queue", "emails"},
+        {"fire_at", 1700000000},
+        {"job_id", 7},
+    };
+    const auto fires = honker::detail::parse_scheduler_fires(json::array({fire}).dump());
+    check_i64(static_cast<int64_t>(fires.size()), 1, "scheduler fires decoded");
+    check_i64(fires[0].job_id(), 7, "scheduler fire job_id");
+
+    for (const auto& key : std::vector<std::string>{"name", "queue", "fire_at", "job_id"}) {
+        auto bad = fire;
+        bad.erase(key);
+        expect_honker_error(
+            [&] { (void)honker::detail::parse_scheduler_fires(json::array({bad}).dump()); },
+            "missing required field '" + key + "'",
+            "scheduler fire with no " + key);
+    }
+    expect_honker_error(
+        [] { (void)honker::detail::parse_scheduler_fires(R"({"name":"n"})"); },
+        "not a JSON array", "scheduler tick result that is a single object");
+
+    std::cout << "stream_and_scheduler_rows_decode_loudly: ok\n";
+}
+
 }  // anonymous namespace
 
 int main() {
@@ -486,6 +553,7 @@ int main() {
         test_decode_rejects_a_non_array_claim_result();
         test_decode_rejects_a_missing_required_field();
         test_decode_reports_a_wrong_typed_field_as_honker_error();
+        test_stream_and_scheduler_rows_decode_loudly();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

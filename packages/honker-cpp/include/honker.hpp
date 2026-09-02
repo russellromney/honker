@@ -1028,6 +1028,27 @@ private:
     int64_t     job_id_;
 };
 
+namespace detail {
+
+/// Decode one honker_scheduler_tick() blob. Every field is required: a
+/// fire with name "" or job_id 0 is not a plausible default, it is a
+/// row we failed to read.
+inline std::vector<ScheduledFire> parse_scheduler_fires(const std::string& json) {
+    auto arr = parse_row_array(json, "scheduler tick");
+    std::vector<ScheduledFire> out;
+    out.reserve(arr.size());
+    for (const auto& j : arr) {
+        out.emplace_back(
+            row_str(j, "name", "scheduler fire"),
+            row_str(j, "queue", "scheduler fire"),
+            row_i64(j, "fire_at", "scheduler fire"),
+            row_i64(j, "job_id", "scheduler fire"));
+    }
+    return out;
+}
+
+}  // namespace detail
+
 // =====================================================================
 // Scheduler
 // =====================================================================
@@ -1193,23 +1214,10 @@ public:
     Scheduler(Database* db) : db_(db) {}
 
 private:
-    /// Decode one honker_scheduler_tick() blob. Every field is required:
-    /// a fire with name "" or job_id 0 is not a plausible default, it is
-    /// a row we failed to read.
     std::vector<ScheduledFire> parse_fires(char* rows) {
         std::string json{rows};
         honker_cpp_free(rows);
-        auto arr = detail::parse_row_array(json, "scheduler tick");
-        std::vector<ScheduledFire> out;
-        out.reserve(arr.size());
-        for (const auto& j : arr) {
-            out.emplace_back(
-                detail::row_str(j, "name", "scheduler fire"),
-                detail::row_str(j, "queue", "scheduler fire"),
-                detail::row_i64(j, "fire_at", "scheduler fire"),
-                detail::row_i64(j, "job_id", "scheduler fire"));
-        }
-        return out;
+        return detail::parse_scheduler_fires(json);
     }
 
     Database* db_;
