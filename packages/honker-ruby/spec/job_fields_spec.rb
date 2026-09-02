@@ -26,6 +26,31 @@ def find_ext
   nil
 end
 
+# Same helper the other specs use: under
+# HONKER_REQUIRE_RUBY_EXTENSION_LOADING=1 a missing capability is a
+# failure, not a silent pass.
+unless defined?(require_load_extension_support!)
+  def require_load_extension_support!
+    return if SQLite3::Database.new(":memory:").respond_to?(:enable_load_extension)
+
+    message = "sqlite3 gem lacks loadable-extension support"
+    flunk message if ENV["HONKER_REQUIRE_RUBY_EXTENSION_LOADING"] == "1"
+    skip message
+  end
+end
+
+# A missing build artifact must not let this acceptance spec pass while
+# asserting nothing. Locally it still skips; under the CI flag it fails.
+unless defined?(require_built_extension!)
+  def require_built_extension!(ext)
+    return if ext
+
+    message = "honker extension not built"
+    flunk message if ENV["HONKER_REQUIRE_RUBY_EXTENSION_LOADING"] == "1"
+    skip message
+  end
+end
+
 class HonkerJobFieldsTest < Minitest::Test
   # Distinct values so no assertion can pass by two numbers happening
   # to be equal: priority, max_attempts, visibility timeout, delay, and
@@ -37,8 +62,9 @@ class HonkerJobFieldsTest < Minitest::Test
   EXPIRES_S = 900
 
   def setup
+    require_load_extension_support!
     ext = find_ext
-    skip "honker extension not built" unless ext
+    require_built_extension!(ext)
     @tmpdir = Dir.mktmpdir("honker-job-fields-")
     @db = Honker::Database.new(File.join(@tmpdir, "t.db"), extension_path: ext)
     @q = @db.queue("details",
