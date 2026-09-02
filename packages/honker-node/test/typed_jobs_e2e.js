@@ -116,3 +116,33 @@ test('getJob is scoped to its own queue', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a claimed job reports its own run_at, not its created_at', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'honker-runat-backdated-'));
+  const dbPath = path.join(dir, 'app.db');
+  let db;
+  try {
+    db = honker.open(dbPath);
+    const q = db.queue('backdated');
+
+    // Back-date run_at so it differs from created_at while the job stays
+    // claimable. A *delay* would push run_at into the future, which makes the
+    // job unclaimable — which is why every other test here compares two values
+    // that are equal to the second and cannot tell the two fields apart.
+    const runAt = Math.floor(Date.now() / 1000) - 100;
+    const id = q.enqueue({ hello: 'backdated' }, { runAt });
+
+    const snapshot = q.getJob(id);
+    assert.equal(snapshot.runAt, runAt);
+    assert.notEqual(snapshot.runAt, snapshot.createdAt);
+
+    const job = q.claimOne('worker-backdated');
+    assert.equal(job.id, id);
+    assert.equal(job.runAt, runAt);
+    assert.notEqual(job.runAt, job.createdAt);
+    assert.equal(job.createdAt, snapshot.createdAt);
+  } finally {
+    try { db?.close(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
