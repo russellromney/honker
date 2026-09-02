@@ -51,11 +51,17 @@
             <phase>process-resources</phase>
             <configuration>
               <!--
-                Packages the extension the jar ships to users. This used to
-                copy `target/debug` only, with failonerror="false", so a
-                release build produced a green `mvn install` and a jar whose
-                runtimes/ directory was empty. Prefer release, fall back to
-                debug, and fail the build when neither exists.
+                Packages the extension the jar ships to users, which is the
+                only way it is found once the jar leaves this repo (see
+                scripts/test-jvm-consumer.sh, which unsets
+                HONKER_EXTENSION_PATH). This used to copy `target/debug`
+                only, with failonerror="false", so a release cargo build
+                followed by `mvn install` gave a green build and a jar whose
+                runtimes/ directory was empty.
+
+                Take whichever of debug and release was built last, so a
+                stale artifact never beats the one you just compiled, and
+                fail the build when there is neither.
               -->
               <target>
                 <property name="honker.native.release"
@@ -63,9 +69,16 @@
                 <property name="honker.native.debug"
                           location="${project.basedir}/../../target/debug/${honker.native.name}"/>
                 <condition property="honker.native.src"
-                           value="${honker.native.release}"
-                           else="${honker.native.debug}">
-                  <available file="${honker.native.release}"/>
+                           value="${honker.native.debug}"
+                           else="${honker.native.release}">
+                  <and>
+                    <available file="${honker.native.debug}"/>
+                    <or>
+                      <not><available file="${honker.native.release}"/></not>
+                      <uptodate srcfile="${honker.native.release}"
+                                targetfile="${honker.native.debug}"/>
+                    </or>
+                  </and>
                 </condition>
                 <fail message="Honker extension not built for ${honker.native.platform}. Looked for ${honker.native.release} and ${honker.native.debug}. Run: cargo build --release -p honker-extension">
                   <condition>
