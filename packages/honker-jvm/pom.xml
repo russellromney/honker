@@ -50,11 +50,31 @@
             <id>copy-native-extension</id>
             <phase>process-resources</phase>
             <configuration>
+              <!--
+                Packages the extension the jar ships to users. This used to
+                copy `target/debug` only, with failonerror="false", so a
+                release build produced a green `mvn install` and a jar whose
+                runtimes/ directory was empty. Prefer release, fall back to
+                debug, and fail the build when neither exists.
+              -->
               <target>
+                <property name="honker.native.release"
+                          location="${project.basedir}/../../target/release/${honker.native.name}"/>
+                <property name="honker.native.debug"
+                          location="${project.basedir}/../../target/debug/${honker.native.name}"/>
+                <condition property="honker.native.src"
+                           value="${honker.native.release}"
+                           else="${honker.native.debug}">
+                  <available file="${honker.native.release}"/>
+                </condition>
+                <fail message="Honker extension not built for ${honker.native.platform}. Looked for ${honker.native.release} and ${honker.native.debug}. Run: cargo build --release -p honker-extension">
+                  <condition>
+                    <not><available file="${honker.native.src}"/></not>
+                  </condition>
+                </fail>
                 <mkdir dir="${project.build.outputDirectory}/runtimes/${honker.native.platform}/native"/>
-                <copy file="${project.basedir}/../../target/debug/${honker.native.name}"
-                      todir="${project.build.outputDirectory}/runtimes/${honker.native.platform}/native"
-                      failonerror="false"/>
+                <copy file="${honker.native.src}"
+                      todir="${project.build.outputDirectory}/runtimes/${honker.native.platform}/native"/>
               </target>
             </configuration>
             <goals>
