@@ -72,6 +72,9 @@
   position pending so the destructor and a manual retry try again. `next()`
   rolls its in-memory position back on that throw, so the event is
   redelivered rather than skipped.
+- `Queue::get_job_json()` and `Scheduler::list_json()` free the shim's
+  string with `honker_cpp_free()` instead of `std::free()`, matching every
+  other call that takes ownership of a `char*` from the shim.
 
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 

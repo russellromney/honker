@@ -718,7 +718,7 @@ public:
         char* raw = honker_cpp_get_job(db_, job_id);
         if (!raw) return {};
         std::string out{raw};
-        std::free(raw);
+        honker_cpp_free(raw);
         return out;
     }
 
@@ -1146,7 +1146,7 @@ public:
         char* raw = honker_cpp_scheduler_list(db_->raw());
         if (!raw) return "[]";
         std::string out{raw};
-        std::free(raw);
+        honker_cpp_free(raw);
         return out;
     }
 
