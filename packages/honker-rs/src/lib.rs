@@ -1964,3 +1964,85 @@ impl Drop for Lock {
         }
     }
 }
+
+#[cfg(test)]
+mod raw_job_mapping {
+    //! `state` on a claimed job is always `"processing"` end-to-end, so
+    //! no integration test can tell a real read from a hardcoded
+    //! `"processing"`. These tests drive `RawJob`'s two conversions
+    //! directly with a synthetic wire row whose every value is
+    //! distinct, so neither a swap nor a constant survives.
+    use super::*;
+
+    fn raw(state: &str) -> RawJob {
+        serde_json::from_value(serde_json::json!({
+            "id": 11,
+            "queue": "mapping",
+            "payload": "{\"k\":1}",
+            "state": state,
+            "priority": 13,
+            "run_at": 17,
+            "worker_id": "w-19",
+            "claim_expires_at": 23,
+            "attempts": 29,
+            "max_attempts": 31,
+            "created_at": 37,
+            "expires_at": 41
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn into_job_reads_every_field_from_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path().join("m.db")).unwrap();
+        let job: Job = raw("sentinel-state").into_job(db.inner.clone()).unwrap();
+
+        assert_eq!(job.state, "sentinel-state", "state, not a constant");
+        assert_eq!(job.id, 11, "id");
+        assert_eq!(job.queue, "mapping", "queue");
+        assert_eq!(job.payload, br#"{"k":1}"#.to_vec(), "payload");
+        assert_eq!(job.priority, 13, "priority");
+        assert_eq!(job.run_at, 17, "run_at");
+        assert_eq!(job.worker_id, "w-19", "worker_id");
+        assert_eq!(job.claim_expires_at, 23, "claim_expires_at");
+        assert_eq!(job.attempts, 29, "attempts");
+        assert_eq!(job.max_attempts, 31, "max_attempts");
+        assert_eq!(job.created_at, 37, "created_at");
+        assert_eq!(job.expires_at, Some(41), "expires_at");
+    }
+
+    #[test]
+    fn into_row_reads_every_field_from_the_row() {
+        let row: JobRow = raw("sentinel-state").into_row();
+
+        assert_eq!(row.state, "sentinel-state", "state, not a constant");
+        assert_eq!(row.id, 11, "id");
+        assert_eq!(row.queue, "mapping", "queue, not a constant");
+        assert_eq!(row.payload, r#"{"k":1}"#, "payload");
+        assert_eq!(row.priority, 13, "priority, not a constant");
+        assert_eq!(row.run_at, 17, "run_at");
+        assert_eq!(row.worker_id.as_deref(), Some("w-19"), "worker_id");
+        assert_eq!(row.claim_expires_at, Some(23), "claim_expires_at");
+        assert_eq!(row.attempts, 29, "attempts");
+        assert_eq!(row.max_attempts, 31, "max_attempts, not a constant");
+        assert_eq!(row.created_at, 37, "created_at");
+        assert_eq!(row.expires_at, Some(41), "expires_at");
+    }
+
+    #[test]
+    fn job_row_still_deserializes_from_a_raw_get_job_blob() {
+        // Regression guard for the restored `Deserialize` derive: this
+        // is the documented way to build a `JobRow` outside the crate.
+        let row: JobRow = serde_json::from_str(
+            r#"{"id":11,"queue":"mapping","payload":"{}","state":"pending",
+                "priority":13,"run_at":17,"worker_id":null,
+                "claim_expires_at":null,"attempts":0,"max_attempts":31,
+                "created_at":37,"expires_at":null}"#,
+        )
+        .unwrap();
+        assert_eq!(row.id, 11);
+        assert_eq!(row.priority, 13);
+        assert_eq!(row.worker_id, None);
+    }
+}

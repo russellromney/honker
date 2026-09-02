@@ -146,6 +146,40 @@ fn claimed_job_carries_every_core_field() {
         low.expires_at, None,
         "expires_at stays null when the enqueue set no expiry"
     );
+
+    // Snapshot read-back of BOTH rows. The claimed-job asserts above
+    // already read two rows; the snapshot mapping needs the same
+    // treatment, or a `get_job` that returned a constant would pass.
+    let high_row = q.get_job(high_id).unwrap().expect("high snapshot");
+    let low_row = q.get_job(low_id).unwrap().expect("low snapshot");
+    assert_eq!(high_row.id, high_id, "snapshot id, high row");
+    assert_eq!(low_row.id, low_id, "snapshot id, low row");
+    assert_eq!(high_row.priority, HIGH_PRIORITY, "snapshot priority");
+    assert_eq!(
+        low_row.priority, LOW_PRIORITY,
+        "snapshot priority is per-row, not a constant"
+    );
+    assert_ne!(
+        high_row.priority, low_row.priority,
+        "the two snapshot priorities must differ, or a constant passes"
+    );
+    assert_eq!(high_row.run_at, high_run_at, "snapshot run_at, high row");
+    assert_eq!(
+        low_row.run_at, low_run_at,
+        "snapshot run_at is per-row, not a constant"
+    );
+    assert_ne!(
+        high_row.run_at, low_row.run_at,
+        "the two snapshot run_ats must differ, or a constant passes"
+    );
+    assert!(
+        high_row.expires_at.is_some(),
+        "snapshot expires_at set on the high row"
+    );
+    assert_eq!(
+        low_row.expires_at, None,
+        "snapshot expires_at is per-row: null on the row with no expiry"
+    );
 }
 
 #[test]
@@ -333,6 +367,19 @@ fn typed_queue_round_trips_the_payload_type() {
         snapshot.payload_typed().unwrap(),
         sent,
         "the snapshot decodes into the queue's payload type"
+    );
+    // This queue is deliberately NOT the `parity_queue` fixture, so
+    // every value here differs from the fixture's. A snapshot mapping
+    // that returned the fixture constants (queue "details",
+    // max_attempts 9, priority 42) fails on these three lines.
+    assert_eq!(snapshot.queue, "typed", "snapshot queue is read per-row");
+    assert_eq!(
+        snapshot.max_attempts, 3,
+        "snapshot max_attempts is QueueOpts::default's 3, not the fixture's 9"
+    );
+    assert_eq!(
+        snapshot.priority, 0,
+        "snapshot priority is the default 0, not the fixture's 42"
     );
 
     let job = q.claim_one("w").unwrap().expect("claim");
