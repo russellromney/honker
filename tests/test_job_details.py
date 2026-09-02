@@ -7,6 +7,7 @@ Same scenarios are mirrored in every binding's own test file.
 
 import json
 import time
+from pathlib import Path
 
 import honker
 
@@ -122,19 +123,33 @@ def test_job_without_expiry_reports_none(tmp_path):
 
 
 def test_retry_moves_the_job_back_to_pending_with_the_new_run_at(tmp_path):
-    """A second claim reports the state the first claim's retry wrote."""
+    """A second claim reports the state the first claim's retry wrote.
+
+    `retry` sets `run_at = unixepoch() + delay_s`, so back-date the
+    enqueue: the retry then moves `run_at` forward by a measurable
+    ~100s while `delay_s=0` keeps the job claimable straight away. With
+    a non-back-dated enqueue the old and new `run_at` are equal to the
+    second and the "new run_at" this test is named for is untestable.
+    """
     db = honker.open(str(tmp_path / "t.db"))
     q = db.queue("emails", max_attempts=5)
-    jid = q.enqueue({"to": "x"}, priority=3)
+    enqueued_run_at = int(time.time()) - 100
+    jid = q.enqueue({"to": "x"}, priority=3, run_at=enqueued_run_at)
 
     first = q.claim_one("worker-a")
     assert first.attempts == 1
+    assert first.run_at == enqueued_run_at
+    retried_at = int(time.time())
     assert first.retry(delay_s=0, error="boom") is True
 
     row = q.get_job(jid)
     assert row["state"] == "pending"
     assert row["attempts"] == 1
     assert row["worker_id"] is None
+    assert row["claim_expires_at"] is None
+    # The whole point of the name: retry rewrote run_at to now.
+    assert row["run_at"] >= retried_at
+    assert row["run_at"] > enqueued_run_at
 
     second = q.claim_one("worker-b")
     assert second is not None
@@ -143,6 +158,8 @@ def test_retry_moves_the_job_back_to_pending_with_the_new_run_at(tmp_path):
     assert second.max_attempts == 5
     assert second.worker_id == "worker-b"
     assert second.created_at == first.created_at
+    # The claimed job reports the retry's run_at, not the original one.
+    assert second.run_at == row["run_at"]
 
 
 def test_typed_payload_hints_do_not_validate_at_runtime(tmp_path):
@@ -193,3 +210,22 @@ def test_claimed_job_reports_its_own_run_at_not_created_at(tmp_path):
     assert job.run_at == run_at
     assert job.run_at != job.created_at
     assert job.created_at == row["created_at"]
+
+
+def test_the_installed_package_ships_the_pep561_marker():
+    """`py.typed` has to be *in the installed package*, not just the repo.
+
+    Without it, PEP 561 says a type checker must ignore honker's inline
+    annotations, so `Queue[T]`, `Job[T]` and `JobSnapshot` all resolve to
+    `Any` in user code and every hint this module documents does nothing.
+    Checking `honker.__file__` means a wheel that drops the marker fails
+    here, on every OS in the matrix — `scripts/proof/check-python-wheel.py`
+    asserts the same thing about the built wheel, and the mypy step in CI
+    proves what the marker actually buys.
+    """
+    package_dir = Path(honker.__file__).resolve().parent
+    marker = package_dir / "py.typed"
+    assert marker.is_file(), (
+        f"PEP 561 marker missing from the installed package at {package_dir}; "
+        "type checkers will ignore every annotation honker ships"
+    )
