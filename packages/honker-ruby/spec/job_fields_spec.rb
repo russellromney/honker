@@ -169,6 +169,18 @@ class HonkerJobFieldsTest < Minitest::Test
     assert_equal "details", job.queue_name
   end
 
+  # The payload goes through JSON.dump/JSON.parse, so Symbol keys come
+  # back as Strings. That is the trap the README warns about.
+  def test_payload_symbol_keys_come_back_as_strings
+    id = @q.enqueue({ to: "dana@example.com", v: 2 })
+    job = @q.claim_one("worker-a")
+
+    assert_equal id, job.id
+    assert_equal({ "to" => "dana@example.com", "v" => 2 }, job.payload)
+    refute job.payload.key?(:to), "Symbol keys do not survive the round trip"
+    assert_equal '{"to":"dana@example.com","v":2}', @q.get_job(id).payload
+  end
+
   def test_delayed_job_reports_its_run_at
     id = @q.enqueue({ "x" => 1 }, delay: DELAY_S)
     snap = @q.get_job(id)

@@ -292,7 +292,8 @@ ack/retry/fail/heartbeat, because the reader holds no claim. `state` is
 `nil` until some worker claims the job. The snapshot's `payload` is the
 raw JSON *text* from the row, not a decoded value — call `JSON.parse` on
 it. `nil` means the job was ack'd, dead-lettered, cancelled, or never
-existed.
+existed. The lookup is by id alone, so an id belonging to another queue
+returns that queue's row rather than `nil`.
 
 `JobSnapshot` is a `Struct`, like `Honker::Notification`. It replaces the
 plain `Hash` older versions returned. Reader access still works
@@ -305,7 +306,14 @@ not String ones.
 Honker never inspects a payload. The shape is a contract between the app
 that enqueues and the app that claims, and both sides have to agree on it
 — including across languages, since another binding may write to the same
-queue. Version the payload if it will change:
+queue.
+
+The payload goes through `JSON.dump` on the way in and `JSON.parse` on
+the way out, so it must be JSON-serializable, and **Symbol keys come back
+as Strings**: `q.enqueue({to: "alice"})` claims as `{"to" => "alice"}`.
+Write `job.payload["to"]`, not `job.payload[:to]`.
+
+Version the payload if it will change:
 
 ```ruby
 q.enqueue({"v" => 2, "to" => "alice@example.com"})

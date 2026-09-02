@@ -812,8 +812,9 @@ module Honker
     # Read a single job row by id. Returns a JobSnapshot, or nil if the
     # job has been ack'd, dead'd, or never existed.
     #
-    # The lookup is by id alone. Ids are globally unique but not scoped
-    # to this queue, so a foreign id returns that queue's row (#134).
+    # The lookup is by id alone: ids are globally unique, so an id
+    # from another queue returns that other queue's row rather than
+    # nil. Scoping it is #134.
     def get_job(job_id)
       raw = @db.db.get_first_row("SELECT honker_get_job(?)", [job_id])[0]
       return nil if raw.nil? || raw.empty?
