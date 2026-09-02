@@ -225,3 +225,37 @@ func TestDelayedJobReportsItsRunAt(t *testing.T) {
 		t.Fatalf("delayed job claimed early: %+v", job)
 	}
 }
+
+// TestDecodePayloadRejectsEmptyInput: an empty payload must not decode
+// to a zero-valued T with a nil error. The core never emits an empty
+// payload, so empty means the bytes never arrived, and a caller cannot
+// otherwise tell that apart from a clean decode.
+func TestDecodePayloadRejectsEmptyInput(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"nil", nil},
+		{"empty", []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DecodePayload[emailPayload](tc.payload)
+			if err == nil {
+				t.Fatalf("DecodePayload(%s) = %+v, nil — want an error", tc.name, got)
+			}
+			if got != (emailPayload{}) {
+				t.Errorf("DecodePayload(%s) value = %+v, want the zero value", tc.name, got)
+			}
+		})
+	}
+
+	// A real payload still decodes.
+	want := emailPayload{Recipient: "carol@example.com", Template: "digest", Version: 3}
+	got, err := DecodePayload[emailPayload]([]byte(`{"recipient":"carol@example.com","template":"digest","version":3}`))
+	if err != nil {
+		t.Fatalf("DecodePayload(valid): %v", err)
+	}
+	if got != want {
+		t.Errorf("DecodePayload(valid) = %+v, want %+v", got, want)
+	}
+}

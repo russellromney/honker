@@ -33,12 +33,17 @@
   plus `JobRow.PayloadBytes()` so a snapshot decodes through the same path as
   a claimed job. The type parameter is a compile-time contract; Honker still
   does not validate payload shape in the database.
+- `DecodePayload` now returns an error on an empty payload instead of the zero
+  value with a nil error. The core never emits an empty payload, so empty means
+  the bytes never arrived, and a caller could not tell that apart from a clean
+  decode.
 - `TestClaimedJobAndSnapshotCarryEveryField` enqueues with a priority, TTL, and
   max-attempts, asserts each of the twelve fields on the pending snapshot, the
   claimed job, and a second `Database` handle's processing snapshot, then
   asserts the reader gets nothing after ack.
   `TestDelayedJobReportsItsRunAt` asserts a delayed job's `RunAt` and that it
   is not claimable early.
+  `TestDecodePayloadRejectsEmptyInput` covers the empty-payload error.
 
 ## Unreleased — typed Node jobs
 

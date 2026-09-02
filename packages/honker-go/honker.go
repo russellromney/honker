@@ -84,6 +84,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -839,10 +840,15 @@ func (r *JobRow) PayloadBytes() []byte {
 // payload shape in the database, so every app writing to a queue has to
 // agree on the JSON shape on its own. A payload that does not match T
 // surfaces here as an unmarshal error, not as an enqueue failure.
+//
+// An empty payload is an error, not a zero value. The core never emits
+// one, so empty means the bytes never arrived — a caller must not be
+// handed a zero-valued T that is indistinguishable from a successful
+// decode.
 func DecodePayload[T any](payload []byte) (T, error) {
 	var out T
 	if len(payload) == 0 {
-		return out, nil
+		return out, errors.New("decode payload: empty payload")
 	}
 	if err := json.Unmarshal(payload, &out); err != nil {
 		return out, fmt.Errorf("decode payload: %w", err)
