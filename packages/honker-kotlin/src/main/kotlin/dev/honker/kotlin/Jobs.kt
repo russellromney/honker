@@ -75,7 +75,10 @@ fun Job.details(): JobDetails<String> = snapshot().details()
 fun <T> Job.details(codec: JsonCodec<T>): JobDetails<T> = snapshot().details(codec)
 
 /** Every field of a claimed typed job, payload decoded by the queue's codec. */
-fun <T> TypedJob<T>.details(): JobDetails<T> = snapshot().toDetails(payload())
+// `raw().snapshot()`, not `snapshot()`: TypedJob.snapshot() returns the
+// decoded TypedJobSnapshot<T> on the current JVM binding and the undecoded
+// JobSnapshot on older ones. Job.snapshot() is JobSnapshot either way.
+fun <T> TypedJob<T>.details(): JobDetails<T> = raw().snapshot().toDetails(payload())
 
 /**
  * A snapshot of one live job in *this* queue, or `null` when the job was
