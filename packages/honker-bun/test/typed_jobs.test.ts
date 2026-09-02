@@ -3,7 +3,10 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { open, type Database } from "../src/index.ts";
+import { Job, open, type Database } from "../src/index.ts";
+
+/** The core's wire row, reached without exporting the internal type. */
+type RawRow = ConstructorParameters<typeof Job>[1];
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..");
 const EXT_CANDIDATES = [
@@ -219,6 +222,36 @@ maybe("honker-bun job details", () => {
       expect(snapshot!.runAt).toBeGreaterThanOrEqual(retriedAt + 30);
       expect(snapshot!.runAt).toBeLessThanOrEqual(now(db) + 30);
       expect(snapshot!.expiresAt).toBeNull();
+    }),
+  );
+
+  test(
+    "a claimed row missing its claim columns throws instead of being accepted",
+    withDb((db) => {
+      const complete: RawRow = {
+        id: 42,
+        queue: "emails",
+        payload: '{"recipient":"gwen@example.com","template":"welcome"}',
+        state: "processing",
+        priority: 0,
+        run_at: 1,
+        worker_id: "worker-1",
+        claim_expires_at: 2,
+        attempts: 1,
+        max_attempts: 3,
+        created_at: 1,
+        expires_at: null,
+      };
+
+      // The guard is not simply rejecting everything: a complete row builds.
+      expect(new Job<EmailPayload>(db, complete).workerId).toBe("worker-1");
+
+      expect(() => new Job<EmailPayload>(db, { ...complete, worker_id: null })).toThrow(
+        "claimed job 42 has no worker_id/claim_expires_at",
+      );
+      expect(
+        () => new Job<EmailPayload>(db, { ...complete, claim_expires_at: null }),
+      ).toThrow("claimed job 42 has no worker_id/claim_expires_at");
     }),
   );
 

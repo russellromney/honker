@@ -41,6 +41,10 @@ if (claimed) {
   claimed.workerId.toUpperCase();
   claimed.claimExpiresAt.toFixed(0);
   claimed.ack();
+  // @ts-expect-error the payload contract has no `subject`. Without a
+  // negative check like this one, widening Job<TPayload>.payload to `any`
+  // erases the whole generic and every assertion above still compiles.
+  claimed.payload.subject;
 }
 
 const waker = queue.claimWaker();

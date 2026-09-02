@@ -39,14 +39,18 @@
   snapshot payload encoding (Node decodes; Bun, Go, and Python return
   raw text) and one convention has not been chosen yet.
 - A claimed row without `worker_id` or `claim_expires_at` now throws
-  instead of being silently accepted.
+  instead of being silently accepted, and a test builds both a complete
+  and a truncated row to prove the guard fires only on the bad one.
 - A job enqueued without `expires` now has its `expiresAt` asserted to be
   `null` on both the snapshot and the claimed job. Nothing pinned it
   before, so an `expires_at ?? 0` fallback would have handed callers 0 —
   a valid unix timestamp meaning 1970 — with the suite still green.
 - Payload typing is compile-time only; honker adds no runtime payload
   validation. `bun run test:types` type-checks the binding and a typed
-  usage fixture, and CI runs it.
+  usage fixture, and CI runs it. The fixture carries two negative checks
+  (`@ts-expect-error`) so the gate fails if the generics go loose in
+  either direction — a missing required field, or `payload` decaying to
+  `any`, which every positive assertion would otherwise accept.
 - The binding's own sources now type-check under strict `tsc`. The
   `bun:ffi` watcher handle and one `bun:sqlite` query binding were
   previously untypeable (`never` symbols), which broke any strict
