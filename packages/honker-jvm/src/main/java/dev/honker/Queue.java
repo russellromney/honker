@@ -68,6 +68,19 @@ public final class Queue {
         return out;
     }
 
+    /**
+     * A read-only snapshot of one live job in <em>this</em> queue, or empty
+     * when the job was ack'd, dead-lettered, never existed, or belongs to a
+     * different queue.
+     *
+     * <p>Job ids are globally unique, so the id alone cannot say which queue
+     * owns the row. Scoping the lookup keeps a typed queue's payload type
+     * honest. Use {@link Database#getJob(long)} for a global lookup.
+     */
+    public Optional<JobSnapshot> getJob(long jobId) {
+        return db.getJob(jobId).filter(job -> name.equals(job.queue()));
+    }
+
     public long nextClaimAt() {
         return db.transaction(tx -> tx.query(
             "SELECT honker_queue_next_claim_at(?) AS t",

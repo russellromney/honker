@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -63,6 +64,23 @@ public final class Database implements AutoCloseable {
     public Queue queue(String name, QueueOptions options) {
         ensureOpen();
         return new Queue(this, name, options);
+    }
+
+    /**
+     * A read-only snapshot of one live job, looked up by id across every
+     * queue, or empty when the job was ack'd, dead-lettered or never
+     * existed. Use {@link Queue#getJob(long)} to scope the lookup to one
+     * queue.
+     */
+    public Optional<JobSnapshot> getJob(long jobId) {
+        String raw = transaction(tx -> tx.query(
+            "SELECT honker_get_job(?) AS job",
+            Params.of(jobId)
+        ).get(0).getString("job"));
+        if (raw == null || raw.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(JobSnapshot.from(Json.object(raw)));
     }
 
     public Outbox outbox(String name, Delivery delivery) {
