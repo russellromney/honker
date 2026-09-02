@@ -286,10 +286,10 @@ fn set_journal_mode_wal(conn: &Connection) -> rusqlite::Result<()> {
 // ---------------------------------------------------------------------
 
 /// Payloads crossing a public Honker write boundary are JSON text.
-/// Parse as a borrowed `RawValue` so validation does not allocate a JSON
-/// tree that the write path would immediately discard.
+/// Parse as `IgnoredAny` so validation does not allocate a JSON tree that the
+/// write path would immediately discard.
 pub(crate) fn validate_json_payload(payload: &str) -> rusqlite::Result<()> {
-    if serde_json::from_str::<&serde_json::value::RawValue>(payload).is_ok() {
+    if serde_json::from_str::<serde::de::IgnoredAny>(payload).is_ok() {
         Ok(())
     } else {
         Err(rusqlite::Error::UserFunctionError(Box::new(

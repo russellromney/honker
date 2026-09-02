@@ -92,8 +92,8 @@ work. Commit lands both rows. Rollback drops both rows.
 
 Payloads are JSON. Queue enqueue, stream publish, notifications, task results,
 and scheduler register/update accept any valid JSON value: objects, arrays,
-strings, numbers, booleans, or `null`. Language bindings serialize values for
-you. When calling the SQL extension directly, pass serialized JSON text (for
+strings, numbers, booleans, or `null`. Typed binding APIs serialize values where
+documented. Raw JSON APIs and direct SQL calls require serialized JSON text (for
 example, `'{"id":42}'`, `'[1,2]'`, or `'"ready"'`); non-JSON text is rejected.
 
 SQLite has no server-side push channel, so honker uses a shared watcher.
@@ -157,7 +157,7 @@ Any SQLite client that can load extensions can use honker directly:
 ```sql
 .load ./libhonker_ext
 SELECT honker_bootstrap();
-INSERT INTO _honker_live (queue, payload) VALUES ('emails', '{"to":"alice"}');
+SELECT honker_enqueue('emails', '{"to":"alice"}', NULL, NULL, 0, 3, NULL);
 SELECT honker_claim_batch('emails', 'worker-1', 32, 300);    -- JSON array
 SELECT honker_ack_batch('[1,2,3]', 'worker-1');              -- DELETEs; returns count
 SELECT honker_sweep_expired('emails');                       -- count moved to dead
@@ -181,7 +181,6 @@ SELECT honker_result_save(42, '{"ok":true}', 3600);          -- save w/ 1h TTL
 SELECT honker_result_get(42);                                -- value or NULL
 SELECT honker_result_sweep();                                -- prune expired
 SELECT notify('orders', '{"id":42}');
-SELECT honker_enqueue('emails', '{"to":"alice@example.com"}', NULL, NULL, 0, 3, NULL);
 ```
 
 The extension shares tables with the language bindings, so a Python

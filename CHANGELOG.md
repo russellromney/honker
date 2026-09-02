@@ -6,9 +6,9 @@
   enqueue, stream publish, notifications, task results, and scheduler register
   or update now reject non-JSON text with
   `honker: payload must be valid JSON`. Objects, arrays, strings, numbers,
-  booleans, and `null` remain valid payloads. Language bindings already encode
-  payloads as JSON; callers using the SQL extension directly must pass JSON
-  text.
+  booleans, and `null` remain valid payloads. Typed binding APIs encode values
+  where documented; raw JSON APIs and direct SQL callers must pass serialized
+  JSON text.
 
 ## 2026-08-27 — Node 0.5.1
 
