@@ -1022,6 +1022,12 @@ pub fn cancel_in_queue(conn: &Connection, queue: &str, job_id: i64) -> rusqlite:
 /// Bindings that talk to the extension over SQL (Go, Ruby, .NET, C++,
 /// Elixir, Bun) run this string verbatim; Rust-side bindings can call
 /// [`has_queue_scoped_cancel`] instead.
+///
+/// If the query itself raises, that is "cannot tell", not "absent" —
+/// a SQLite built with SQLITE_OMIT_INTROSPECTION_PRAGMAS has no
+/// `pragma_function_list` to read. Surface the error. A binding that
+/// rescues it into `false` reports an old extension while running a
+/// new one, which is the exact failure this probe exists to prevent.
 pub const CANCEL_QUEUE_SCOPED_PROBE_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM pragma_function_list WHERE name = 'honker_cancel' AND narg = 2)";
 
@@ -2067,6 +2073,22 @@ mod cancel_scoping {
             Some("sms"),
             "the processing sms row must still be live"
         );
+
+        // The owning queue does reach the claimed row. This half is
+        // what pins the 2-arg form to the same states as the 1-arg
+        // form: without it, narrowing the scoped DELETE to
+        // `state = 'pending'` leaves every other test in this module
+        // passing, and the two arities silently disagree about
+        // processing rows.
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel('sms', ?1)", [sms_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the owning queue cancels a processing row");
+        assert_eq!(
+            live_queue(&conn, sms_id),
+            None,
+            "the processing row is gone after its own queue cancels it"
+        );
     }
 
     /// The 1-arg form keeps its shipped meaning: global, ignores the
@@ -2081,6 +2103,35 @@ mod cancel_scoping {
             .unwrap();
         assert_eq!(n, 1, "1-arg cancel reaches a job in any queue");
         assert_eq!(live_queue(&conn, sms_id), None);
+    }
+
+    /// The 1-arg form's other shipped promise, the one its own doc
+    /// comment makes: it removes a claimed (processing) row, not just a
+    /// pending one. Nothing else in honker-core covered that, so the
+    /// two arities could have drifted apart on state — one keeping
+    /// 'processing' in its IN-list, the other losing it — with every
+    /// other test here still green.
+    #[test]
+    fn one_arg_form_cancels_a_processing_row() {
+        let conn = db();
+        let id = enqueue(&conn, "sms");
+        let _: String = conn
+            .query_row("SELECT honker_claim_batch('sms', 'w1', 8, 300)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let state: String = conn
+            .query_row("SELECT state FROM _honker_live WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "processing");
+
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel(?1)", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "1-arg cancel still reaches a claimed row");
+        assert_eq!(live_queue(&conn, id), None);
     }
 
     /// Idempotence and the missing-id case at the new arity: a second
@@ -2165,5 +2216,36 @@ mod cancel_scoping {
             .query_row(CANCEL_QUEUE_SCOPED_PROBE_SQL, [], |r| r.get(0))
             .unwrap();
         assert_eq!(raw, 0, "the exported probe SQL must return 0");
+    }
+
+    /// "Cannot tell" must not collapse into "absent". A real table
+    /// named `pragma_function_list` shadows the eponymous pragma table
+    /// on this connection, so the probe query no longer resolves —
+    /// the same shape a SQLite built with
+    /// SQLITE_OMIT_INTROSPECTION_PRAGMAS presents, where the pragma
+    /// table is not there at all.
+    ///
+    /// This is the test for the claim the doc comment makes. Without
+    /// it, `has_queue_scoped_cancel` could be rewritten to end in
+    /// `.unwrap_or(false)` and every other test in this module would
+    /// still pass — while a binding on a new extension got told the
+    /// extension was old and took the wrong migration path.
+    #[test]
+    fn probe_error_is_not_flattened_to_false() {
+        let conn = db();
+        assert!(
+            has_queue_scoped_cancel(&conn).unwrap(),
+            "precondition: this connection answers the probe with true"
+        );
+
+        conn.execute_batch("CREATE TABLE pragma_function_list (x)")
+            .unwrap();
+
+        let err = has_queue_scoped_cancel(&conn)
+            .expect_err("an unanswerable probe must be an Err, never Ok(false)");
+        assert!(
+            err.to_string().contains("no such column"),
+            "expected the probe query itself to fail, got: {err}"
+        );
     }
 }
