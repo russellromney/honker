@@ -120,6 +120,21 @@ class HonkerJobFieldsTest < Minitest::Test
     assert_nil @q.get_job(id).expires_at, "expires_at must be nil, not 0"
   end
 
+  # A snapshot names the queue #queue; a claimed Job named it
+  # #queue_name. Both answer to both, so code written against one
+  # works when handed the other.
+  def test_job_and_snapshot_agree_on_the_queue_accessor
+    id = @q.enqueue({ "x" => 1 })
+    snap = @q.get_job(id)
+    job = @q.claim_one("worker-a")
+
+    assert_equal id, job.id
+    assert_equal "details", snap.queue
+    assert_equal "details", snap.queue_name
+    assert_equal "details", job.queue
+    assert_equal "details", job.queue_name
+  end
+
   def test_delayed_job_reports_its_run_at
     id = @q.enqueue({ "x" => 1 }, delay: DELAY_S)
     snap = @q.get_job(id)

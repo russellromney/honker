@@ -272,7 +272,7 @@ A claimed `Honker::Job` carries the whole row as it stood at claim time:
 job = q.claim_one("worker-1")
 
 job.id                # row id
-job.queue_name        # queue this job came from
+job.queue_name        # queue this job came from (also job.queue)
 job.payload           # decoded JSON value
 job.state             # "processing"
 job.priority          # higher runs first within the queue

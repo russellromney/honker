@@ -936,6 +936,10 @@ module Honker
                 :worker_id, :claim_expires_at, :attempts, :max_attempts,
                 :created_at, :expires_at
 
+    # JobSnapshot names this field #queue; accept both here too, so
+    # code written against one works on the other.
+    alias_method :queue, :queue_name
+
     def initialize(queue, row)
       @queue = queue
       @id = row["id"]

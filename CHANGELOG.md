@@ -47,6 +47,8 @@
   read-only, with no ack/retry/fail/heartbeat. **Behavior change:** it used
   to return a plain `Hash` of the raw ABI row. `snapshot["state"]` still
   works (`Struct#[]` takes member names), but `Hash` methods no longer do.
+- `Job#queue` is a new alias for `Job#queue_name`, so the accessor name
+  `JobSnapshot` uses works on a claimed job too.
 - Snapshot `payload` stays the raw JSON text the row stores, matching the
   Python and Go snapshots. `Job#payload` is still decoded. The bindings do
   not yet agree on one snapshot payload encoding; Node decodes it.
