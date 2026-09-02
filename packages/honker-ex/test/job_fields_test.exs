@@ -140,6 +140,27 @@ defmodule HonkerJobFieldsTest do
     assert job.claim_expires_at <= after_ + @visibility_s
   end
 
+  # "a claimed job carries every field" compares run_at against a snapshot
+  # of an *undelayed* enqueue, where run_at == created_at to the second, so
+  # it cannot tell the two fields apart. A delay will not fix that: a
+  # delayed job is not claimable (see the test above). Back-dating an
+  # absolute run_at keeps the job claimable and makes the two differ.
+  test "a claimed job reports its own run_at, not its created_at", %{db: db} do
+    run_at = db_now(db) - 100
+    {:ok, id} = Queue.enqueue(db, "details", %{"x" => 1}, run_at: run_at)
+
+    {:ok, snap} = Queue.get_job(db, id)
+    assert snap.run_at == run_at
+    refute snap.run_at == snap.created_at
+
+    {:ok, job} = Queue.claim_one(db, "details", "worker-a")
+    assert job != nil, "a back-dated job must still be claimable"
+    assert job.id == id
+    assert job.run_at == run_at
+    refute job.run_at == job.created_at
+    assert job.created_at == snap.created_at
+  end
+
   test "a processing snapshot matches the claim, then misses after ack", %{db: db} do
     {:ok, id} = Queue.enqueue(db, "details", %{"to" => "carol@example.com"}, priority: @priority)
     {:ok, job} = Queue.claim_one(db, "details", "worker-b")
