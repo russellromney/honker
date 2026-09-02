@@ -159,6 +159,27 @@ class HonkerJobFieldsTest < Minitest::Test
     assert_operator job.claim_expires_at, :<=, after + VISIBILITY_S
   end
 
+  # test_claimed_job_carries_every_field compares run_at against a
+  # snapshot of an *undelayed* enqueue, where run_at == created_at to the
+  # second, so it cannot tell the two fields apart. A delay will not fix
+  # that: a delayed job is not claimable (see the test above). Back-dating
+  # an absolute run_at keeps the job claimable and makes the two differ.
+  def test_claimed_job_reports_its_own_run_at_not_created_at
+    run_at = db_now - 100
+    id = @q.enqueue({ "x" => 1 }, run_at: run_at)
+
+    snap = @q.get_job(id)
+    assert_equal run_at, snap.run_at
+    refute_equal snap.created_at, snap.run_at
+
+    job = @q.claim_one("worker-a")
+    refute_nil job, "a back-dated job must still be claimable"
+    assert_equal id, job.id
+    assert_equal run_at, job.run_at
+    refute_equal job.created_at, job.run_at
+    assert_equal snap.created_at, job.created_at
+  end
+
   def test_processing_snapshot_matches_the_claim_then_misses_after_ack
     id = @q.enqueue({ "to" => "carol@example.com" }, priority: PRIORITY)
     job = @q.claim_one("worker-b")
