@@ -63,10 +63,10 @@ class HonkerJobFieldsTest < Minitest::Test
 
   def setup
     require_load_extension_support!
-    ext = find_ext
-    require_built_extension!(ext)
+    @ext = find_ext
+    require_built_extension!(@ext)
     @tmpdir = Dir.mktmpdir("honker-job-fields-")
-    @db = Honker::Database.new(File.join(@tmpdir, "t.db"), extension_path: ext)
+    @db = Honker::Database.new(File.join(@tmpdir, "t.db"), extension_path: @ext)
     @q = @db.queue("details",
                    visibility_timeout_s: VISIBILITY_S,
                    max_attempts: MAX_ATTEMPTS)
@@ -118,6 +118,12 @@ class HonkerJobFieldsTest < Minitest::Test
   def test_snapshot_without_expiry_has_nil_expires_at
     id = @q.enqueue({ "x" => 1 })
     assert_nil @q.get_job(id).expires_at, "expires_at must be nil, not 0"
+  end
+
+  def test_claimed_job_without_expiry_has_nil_expires_at
+    @q.enqueue({ "x" => 1 })
+    job = @q.claim_one("worker-a")
+    assert_nil job.expires_at, "expires_at must be nil, not 0"
   end
 
   # get_job used to return a Hash. These are the access patterns that
@@ -239,6 +245,33 @@ class HonkerJobFieldsTest < Minitest::Test
 
     assert job.ack, "fresh claim should ack"
     assert_nil @q.get_job(id), "the row is gone after ack"
+  end
+
+  # #136 asks for the details to be visible to a *different* reader,
+  # not just to the connection that claimed. A second Database proves
+  # the claim and the ack are committed, not merely visible to the
+  # writer.
+  def test_a_second_connection_sees_the_claim_and_then_the_ack
+    id = @q.enqueue({ "x" => 1 }, priority: PRIORITY)
+    job = @q.claim_one("worker-d")
+    refute_nil job
+
+    reader = Honker::Database.new(@db.path, extension_path: @ext)
+    begin
+      reader_queue = reader.queue("details")
+      snap = reader_queue.get_job(id)
+      refute_nil snap, "another connection must see the committed claim"
+      assert_equal "processing", snap.state
+      assert_equal "worker-d", snap.worker_id
+      assert_equal job.claim_expires_at, snap.claim_expires_at
+      assert_equal 1, snap.attempts
+      assert_equal PRIORITY, snap.priority
+
+      assert job.ack
+      assert_nil reader_queue.get_job(id), "the ack is visible to the other connection"
+    ensure
+      reader.close
+    end
   end
 
   def test_retry_bumps_attempts_and_pushes_run_at_out
