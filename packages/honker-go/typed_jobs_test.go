@@ -226,6 +226,70 @@ func TestDelayedJobReportsItsRunAt(t *testing.T) {
 	}
 }
 
+// TestClaimedJobReportsBackDatedRunAt pins the claimed Job's RunAt and
+// CreatedAt apart. An immediately-enqueued job has run_at == created_at
+// to the second, so asserting both against the same instant proves
+// nothing: the two fields can be transposed in the claim decode and the
+// assertions still hold. Back-dating run_at with an absolute timestamp
+// keeps the job claimable (a delayed job is not) while the two values
+// differ by 100 seconds.
+func TestClaimedJobReportsBackDatedRunAt(t *testing.T) {
+	worker, reader := openTypedJobs(t)
+	wq := worker.Queue("backdated", QueueOptions{MaxAttempts: 3, VisibilityTimeoutS: 60})
+	rq := reader.Queue("backdated", QueueOptions{MaxAttempts: 3, VisibilityTimeoutS: 60})
+
+	before := time.Now().Unix()
+	past := before - 100
+	id, err := wq.Enqueue(
+		emailPayload{Recipient: "bob@example.com", Template: "reminder", Version: 1},
+		EnqueueOptions{RunAt: &past},
+	)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	after := time.Now().Unix()
+
+	// ---- snapshot keeps the two apart --------------------------------
+	row, err := rq.GetJob(id)
+	if err != nil || row == nil {
+		t.Fatalf("GetJob: row=%v err=%v", row, err)
+	}
+	if row.RunAt != past {
+		t.Errorf("row.RunAt = %d, want %d (the back-dated absolute run_at)", row.RunAt, past)
+	}
+	if row.CreatedAt < before || row.CreatedAt > after {
+		t.Errorf("row.CreatedAt = %d, want within [%d, %d]", row.CreatedAt, before, after)
+	}
+	if row.RunAt == row.CreatedAt {
+		t.Fatalf("row.RunAt == row.CreatedAt == %d, fixture no longer separates them", row.RunAt)
+	}
+
+	// ---- claimed job keeps the two apart -----------------------------
+	job, err := wq.ClaimOne("worker-backdated")
+	if err != nil {
+		t.Fatalf("ClaimOne: %v", err)
+	}
+	if job == nil {
+		t.Fatalf("ClaimOne returned nil, want the back-dated job to be claimable")
+	}
+	if job.RunAt != past {
+		t.Errorf("job.RunAt = %d, want %d (the back-dated absolute run_at)", job.RunAt, past)
+	}
+	if job.CreatedAt < before || job.CreatedAt > after {
+		t.Errorf("job.CreatedAt = %d, want within [%d, %d]", job.CreatedAt, before, after)
+	}
+	if job.RunAt == job.CreatedAt {
+		t.Errorf("job.RunAt == job.CreatedAt == %d, want run_at %d and created_at ~%d",
+			job.RunAt, past, before)
+	}
+	if job.CreatedAt-job.RunAt != row.CreatedAt-row.RunAt {
+		t.Errorf(
+			"claimed gap CreatedAt-RunAt = %d, snapshot gap = %d, want equal",
+			job.CreatedAt-job.RunAt, row.CreatedAt-row.RunAt,
+		)
+	}
+}
+
 // TestDecodePayloadRejectsEmptyInput: an empty payload must not decode
 // to a zero-valued T with a nil error. The core never emits an empty
 // payload, so empty means the bytes never arrived, and a caller cannot

@@ -43,6 +43,10 @@
   asserts the reader gets nothing after ack.
   `TestDelayedJobReportsItsRunAt` asserts a delayed job's `RunAt` and that it
   is not claimable early.
+  `TestClaimedJobReportsBackDatedRunAt` enqueues with a back-dated absolute
+  `RunAt` (`now - 100`) so the job stays claimable while `RunAt` and `CreatedAt`
+  differ, then pins both on the claimed job. Without it the two `json:` tags in
+  the claim decode can be transposed and the suite stays green.
   `TestDecodePayloadRejectsEmptyInput` covers the empty-payload error.
 
 ## Unreleased — typed Node jobs
