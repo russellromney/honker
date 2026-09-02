@@ -730,7 +730,7 @@ jobs:
         # differs is Linux-specific and needs its own investigation —
         # tracked in ROADMAP under Phase Kernel-JVM.
         #
-        # The other 49 tests gate, and so do the ORM recipes below.
+        # The other 52 tests gate, and so do the ORM recipes below.
         run: mvn -B test -Dtest='!HonkerJvmTest#childJvmKernelListenerWakesWhenParentNotifies'
       - name: ORM · JVM (JDBC, Hibernate, jOOQ)
         working-directory: scripts/proof/orm/jvm

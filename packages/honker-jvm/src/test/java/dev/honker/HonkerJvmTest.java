@@ -10,7 +10,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
@@ -261,6 +263,105 @@ class HonkerJvmTest {
             assertEquals("scoped-emails", emails.getJob(id).orElseThrow().queue());
             assertEquals("scoped-emails", db.getJob(id).orElseThrow().queue());
             assertTrue(db.getJob(id + 10_000).isEmpty(), "an unknown id has no snapshot");
+        }
+    }
+
+    @Test
+    void retriedJobSnapshotGoesBackToPendingAndKeepsItsAttempts() {
+        try (Database db = open()) {
+            Queue q = db.queue("retried-snapshot", QueueOptions.builder()
+                .visibilityTimeout(Duration.ofSeconds(90))
+                .maxAttempts(3)
+                .build());
+            long id = q.enqueue("{\"n\":1}");
+
+            Job claimed = q.claimOne("worker-1").orElseThrow();
+            JobSnapshot processing = q.getJob(id).orElseThrow();
+            assertEquals("processing", processing.state());
+            assertNotNull(processing.workerId());
+            assertNotNull(processing.claimExpiresAt());
+
+            long retriedBefore = unixNow(db);
+            assertTrue(claimed.retry(Duration.ofSeconds(45), "transient"));
+            long retriedAfter = unixNow(db);
+
+            // The other snapshot tests only watch null -> value. This is the
+            // clearing direction: a retry hands the row back to the queue.
+            JobSnapshot retried = q.getJob(id).orElseThrow();
+            assertEquals("pending", retried.state());
+            assertNull(retried.workerId(), "a retried job has no worker");
+            assertNull(retried.claimExpiresAt(), "a retried job has no claim deadline");
+            // Attempts survive the retry -- that is what maxAttempts counts.
+            assertEquals(1, retried.attempts());
+            assertEquals(3, retried.maxAttempts());
+            assertEquals(processing.createdAt(), retried.createdAt());
+            assertBetween(retried.runAt(), retriedBefore + 45, retriedAfter + 45, "runAt");
+            assertTrue(q.claimOne("worker-2").isEmpty(), "the retry delay holds the job back");
+        }
+    }
+
+    @Test
+    void failedJobIsDeadLetteredAndHasNoSnapshot() {
+        try (Database db = open()) {
+            Queue q = db.queue("dead-snapshot", QueueOptions.builder()
+                .visibilityTimeout(Duration.ofSeconds(60))
+                .maxAttempts(1)
+                .build());
+            long id = q.enqueue("{\"n\":2}");
+
+            Job claimed = q.claimOne("worker-1").orElseThrow();
+            assertTrue(q.getJob(id).isPresent(), "a processing job still has a snapshot");
+            assertTrue(claimed.fail("boom"));
+
+            assertTrue(q.getJob(id).isEmpty(), "a dead-lettered job leaves no live row");
+            assertTrue(db.getJob(id).isEmpty(), "the global lookup does not see dead letters either");
+            // Distinguishes "gone because dead-lettered" from "never existed".
+            assertEquals(1, count(db, "SELECT COUNT(*) AS n FROM _honker_dead WHERE queue='dead-snapshot'"));
+        }
+    }
+
+    @Test
+    void jobRowsMissingRequiredFieldsFailLoudly() {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("id", 1L);
+        row.put("queue", "emails");
+        row.put("payload", "{}");
+        row.put("state", "processing");
+        row.put("priority", 0L);
+        row.put("run_at", 100L);
+        row.put("worker_id", "worker-1");
+        row.put("claim_expires_at", 400L);
+        row.put("attempts", 1L);
+        row.put("max_attempts", 3L);
+        row.put("created_at", 100L);
+        row.put("expires_at", null);
+
+        JobSnapshot ok = JobSnapshot.from(row);
+        assertEquals(100L, ok.createdAt());
+        assertNull(ok.expiresAt());
+
+        // An extension older than the widened claim_batch RETURNING sends a
+        // narrower row. That must throw, not yield silent zeros.
+        Map<String, Object> narrow = new LinkedHashMap<>(row);
+        narrow.remove("state");
+        HonkerException missing = assertThrows(HonkerException.class, () -> JobSnapshot.from(narrow));
+        assertTrue(missing.getMessage().contains("state"), missing.getMessage());
+
+        Map<String, Object> malformed = new LinkedHashMap<>(row);
+        malformed.put("run_at", "not-a-number");
+        HonkerException bad = assertThrows(HonkerException.class, () -> JobSnapshot.from(malformed));
+        assertTrue(bad.getMessage().contains("run_at"), bad.getMessage());
+
+        // A snapshot may describe an unclaimed row; a claimed Job may not,
+        // because claimExpiresAt() unboxes.
+        Map<String, Object> unclaimed = new LinkedHashMap<>(row);
+        unclaimed.put("worker_id", null);
+        unclaimed.put("claim_expires_at", null);
+        assertNull(JobSnapshot.from(unclaimed).claimExpiresAt());
+        try (Database db = open()) {
+            Queue q = db.queue("emails");
+            HonkerException unheld = assertThrows(HonkerException.class, () -> Job.from(q, unclaimed));
+            assertTrue(unheld.getMessage().contains("claim_expires_at"), unheld.getMessage());
         }
     }
 
