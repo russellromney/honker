@@ -342,6 +342,33 @@ public sealed class JobDetailTests
         Assert.Null(queue.GetJob(id));
     }
 
+    [Fact]
+    public void AClaimRowFromAnOlderCoreIsRejectedRatherThanDefaulted()
+    {
+        // honker_claim_batch before 0.6 returned six columns and no
+        // "state". This is that payload, key for key. ClaimBatch now
+        // decodes it into JobRow like every other row, and JobRow's
+        // defaults would have made State "" and carried it to
+        // Job.State — where the old ClaimedJobRow's `?? "processing"`
+        // had been correct. Wrong and silent is the worst outcome, so
+        // the decode has to fail instead.
+        const string oldAbi =
+            """[{"id":1,"queue":"work","payload":"{}","worker_id":"w1","attempts":1,"claim_expires_at":100}]""";
+
+        var error = Assert.Throws<JsonException>(
+            () => JsonSerializer.Deserialize<List<JobRow>>(oldAbi));
+        Assert.Contains("state", error.Message);
+
+        // The current core emits all twelve, nulls included, and decodes.
+        const string currentAbi =
+            """[{"id":1,"queue":"work","payload":"{}","state":"processing","priority":0,"run_at":5,"worker_id":"w1","claim_expires_at":100,"attempts":1,"max_attempts":3,"created_at":5,"expires_at":null}]""";
+
+        var rows = JsonSerializer.Deserialize<List<JobRow>>(currentAbi);
+        Assert.NotNull(rows);
+        Assert.Equal("processing", rows!.Single().State);
+        Assert.Null(rows.Single().ExpiresAt);
+    }
+
     private static long Now(Database db)
     {
         return Convert.ToInt64(db.Query("SELECT unixepoch() AS v").Single()["v"]);

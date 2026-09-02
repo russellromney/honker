@@ -91,43 +91,61 @@ public sealed class ScheduleUpdate
     public ScheduleUpdate WithMaxAttempts(int? value) { MaxAttempts = value; HasMaxAttempts = true; return this; }
 }
 
+/// <summary>
+/// A job row exactly as the core returns it. Decodes the output of both
+/// honker_get_job and honker_claim_batch, which emit the same twelve
+/// keys.
+///
+/// Every member is required, so a core that omits one fails the decode
+/// with a JsonException naming the field. That matters most for a
+/// binding running against an older extension: honker_claim_batch before
+/// 0.6 returned six columns and no `state`, and a defaulted <c>""</c>
+/// would have travelled all the way to <see cref="Job.State"/> as a
+/// silently wrong value. The nullable members still have to be present
+/// in the JSON — the core emits them as null, never omits them.
+/// </summary>
 public sealed record JobRow
 {
     [System.Text.Json.Serialization.JsonPropertyName("id")]
-    public long Id { get; init; }
+    public required long Id { get; init; }
 
     [System.Text.Json.Serialization.JsonPropertyName("queue")]
-    public string Queue { get; init; } = "";
+    public required string Queue { get; init; }
 
+    /// <summary>The payload as stored: JSON text, not yet decoded.</summary>
     [System.Text.Json.Serialization.JsonPropertyName("payload")]
-    public string Payload { get; init; } = "";
+    public required string Payload { get; init; }
 
+    /// <summary>"pending" or "processing".</summary>
     [System.Text.Json.Serialization.JsonPropertyName("state")]
-    public string State { get; init; } = "";
+    public required string State { get; init; }
 
     [System.Text.Json.Serialization.JsonPropertyName("priority")]
-    public long Priority { get; init; }
+    public required long Priority { get; init; }
 
     [System.Text.Json.Serialization.JsonPropertyName("run_at")]
-    public long RunAt { get; init; }
+    public required long RunAt { get; init; }
 
+    /// <summary>Null while the job is pending.</summary>
     [System.Text.Json.Serialization.JsonPropertyName("worker_id")]
-    public string? WorkerId { get; init; }
+    public required string? WorkerId { get; init; }
 
+    /// <summary>Null while the job is pending.</summary>
     [System.Text.Json.Serialization.JsonPropertyName("claim_expires_at")]
-    public long? ClaimExpiresAt { get; init; }
+    public required long? ClaimExpiresAt { get; init; }
 
     [System.Text.Json.Serialization.JsonPropertyName("attempts")]
-    public long Attempts { get; init; }
+    public required long Attempts { get; init; }
 
     [System.Text.Json.Serialization.JsonPropertyName("max_attempts")]
-    public long MaxAttempts { get; init; }
+    public required long MaxAttempts { get; init; }
 
     [System.Text.Json.Serialization.JsonPropertyName("created_at")]
-    public long CreatedAt { get; init; }
+    public required long CreatedAt { get; init; }
 
+    /// <summary>Null when the job never expires.</summary>
     [System.Text.Json.Serialization.JsonPropertyName("expires_at")]
-    public long? ExpiresAt { get; init; }
+    public required long? ExpiresAt { get; init; }
 }
 
 public sealed record OutboxOptions(

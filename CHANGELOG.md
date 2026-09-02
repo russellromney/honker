@@ -63,6 +63,17 @@
 - Tests for the previously uncovered typed surface: `ClaimBatch`,
   `AckBatch`, `ClaimAsync`, `Cancel`, `Name`, `Job<T>.Untyped`,
   `Job<T>.Retry`, and `Job<T>.Heartbeat`.
+- Every `JobRow` member is now `required`, so a core that omits a field
+  fails the decode with a `JsonException` naming it. `ClaimBatch` decodes
+  into `JobRow` now, and `JobRow.State` defaulted to `""` — so this
+  binding run against a 0.5.x extension, whose `honker_claim_batch`
+  returns six columns and no `state`, would have reported
+  `Job.State == ""`. The `row.State ?? "processing"` fallback this PR
+  removed was right for that case. Wrong and silent is worse than the
+  fallback; loud is better than either. `worker_id` and
+  `claim_expires_at` are in the old ABI, so their new throws did not
+  catch it. Nothing in the binding constructs a `JobRow` — it is only a
+  deserialization target — so `required` costs callers nothing.
 - The README now names the `TypedQueue<T>` vs `Queue<T>` collision, shows
   the poison-payload worker loop, separates the four spellings of
   "payload" across the typed and untyped pairs, and says `GetJob` is not
