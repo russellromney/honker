@@ -864,6 +864,8 @@ impl RawJob {
 ///
 /// `payload` stays the raw JSON text exactly as stored. Use
 /// [`JobRow::payload_typed`] to decode it into the queue's `T`.
+#[derive(Deserialize)]
+#[serde(bound = "")]
 pub struct JobRow<T = serde_json::Value> {
     pub id: i64,
     pub queue: String,
@@ -879,6 +881,7 @@ pub struct JobRow<T = serde_json::Value> {
     pub max_attempts: i64,
     pub created_at: i64,
     pub expires_at: Option<i64>,
+    #[serde(skip)]
     _payload: PhantomData<fn(T) -> T>,
 }
 
