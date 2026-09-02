@@ -70,7 +70,10 @@ public record JobSnapshot(
     private static Object required(Map<String, Object> row, String field) {
         Object value = row.get(field);
         if (value == null) {
-            throw new HonkerException("job row from Honker is missing required field " + field);
+            throw new HonkerException(
+                "job row from Honker is missing required field " + field
+                    + "; the loaded extension may be older than this binding"
+            );
         }
         return value;
     }
