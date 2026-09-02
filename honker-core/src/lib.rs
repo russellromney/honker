@@ -285,17 +285,45 @@ fn set_journal_mode_wal(conn: &Connection) -> rusqlite::Result<()> {
 // notify() SQL function + notifications schema
 // ---------------------------------------------------------------------
 
-/// Payloads crossing a public Honker write boundary are JSON text.
-/// Parse as `IgnoredAny` so validation does not allocate a JSON tree that the
-/// write path would immediately discard.
+/// Payloads crossing a public Honker write boundary are JSON text that a
+/// JSON decoder can actually read back.
+///
+/// Validate by parsing into `serde_json::Value`, which is exactly what the
+/// read side does. A cheaper structural scan (`serde::de::IgnoredAny`) walks
+/// the grammar without unescaping strings or range-checking numbers, so it
+/// accepts text that every decoder then rejects:
+///
+/// | payload        | `IgnoredAny` | `Value` |
+/// |----------------|--------------|---------|
+/// | `"\ud800"`     | ok           | lone leading surrogate |
+/// | `1e999`        | ok           | number out of range |
+///
+/// Both shapes are what `json.dumps` and `JSON.stringify` can emit, so a
+/// Python or Node producer could enqueue a job no Rust consumer could decode.
+/// Rejecting at the producer keeps "payload is JSON, therefore decoding is
+/// safe" true instead of approximate.
+///
+/// The `Value` tree is dropped immediately. It costs a couple of allocations
+/// against a ~24 us enqueue that is dominated by the SQLite insert and
+/// binding marshaling; see `tests/test_performance_floors.py`.
 pub(crate) fn validate_json_payload(payload: &str) -> rusqlite::Result<()> {
-    if serde_json::from_str::<serde::de::IgnoredAny>(payload).is_ok() {
-        Ok(())
+    let err = match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(_) => return Ok(()),
+        Err(err) => err,
+    };
+    // Rejection only, so the second parse is off the hot path. A lone
+    // surrogate IS valid JSON by the grammar -- telling that caller their
+    // text "must be valid JSON" sends them looking for a syntax error they
+    // do not have. Re-scan structurally to name the real problem, and pass
+    // serde's own message through either way.
+    let message = if serde_json::from_str::<serde::de::IgnoredAny>(payload).is_ok() {
+        format!("honker: payload is valid JSON but cannot be decoded: {err}")
     } else {
-        Err(rusqlite::Error::UserFunctionError(Box::new(
-            std::io::Error::other("honker: payload must be valid JSON"),
-        )))
-    }
+        format!("honker: payload must be valid JSON: {err}")
+    };
+    Err(rusqlite::Error::UserFunctionError(Box::new(
+        std::io::Error::other(message),
+    )))
 }
 
 /// Install the `_honker_notifications` table and the
@@ -1443,11 +1471,51 @@ mod tests {
         let err = conn
             .query_row("SELECT notify('orders', 'not json')", [], |_| Ok(()))
             .unwrap_err();
+        let text = err.to_string();
         assert!(
-            err.to_string()
-                .contains("honker: payload must be valid JSON"),
+            text.contains("honker: payload must be valid JSON"),
             "expected the JSON payload contract error, got: {err}"
         );
+        assert!(
+            text.contains("line 1 column"),
+            "the error must pass serde's own message through, got: {err}"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_notifications", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "rejected payload must not be written");
+    }
+
+    /// Valid by the JSON grammar, undecodable by any JSON decoder: a lone
+    /// surrogate is not valid UTF-8 and 1e999 overflows f64. A structural
+    /// scan lets both through; the read side does not.
+    #[test]
+    fn notify_rejects_undecodable_json_payload() {
+        let conn = mem();
+        attach_notify(&conn).unwrap();
+        let payloads = [
+            r#""\ud800""#,
+            r#"{"a":"\ud800"}"#,
+            "1e999",
+            r#"{"a":1e999}"#,
+            "-1e999",
+        ];
+        for payload in payloads {
+            let err = conn
+                .query_row("SELECT notify('orders', ?1)", [payload], |_| Ok(()))
+                .unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("honker: payload is valid JSON but cannot be decoded"),
+                "expected the undecodable-JSON error for {payload}, got: {err}"
+            );
+            assert!(
+                text.contains("line 1 column"),
+                "the error must pass serde's own message through for {payload}, got: {err}"
+            );
+        }
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM _honker_notifications", [], |row| {
                 row.get(0)

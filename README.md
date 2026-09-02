@@ -91,10 +91,17 @@ All three are INSERTs inside your transaction. Put `queue.enqueue(...)`,
 work. Commit lands both rows. Rollback drops both rows.
 
 Payloads are JSON. Queue enqueue, stream publish, notifications, task results,
-and scheduler register/update accept any valid JSON value: objects, arrays,
-strings, numbers, booleans, or `null`. Typed binding APIs serialize values where
-documented. Raw JSON APIs and direct SQL calls require serialized JSON text (for
-example, `'{"id":42}'`, `'[1,2]'`, or `'"ready"'`); non-JSON text is rejected.
+and scheduler register/update accept any JSON value that decodes: objects,
+arrays, strings, numbers, booleans, or `null`. Typed binding APIs serialize
+values where documented. Raw JSON APIs and direct SQL calls require serialized
+JSON text (for example, `'{"id":42}'`, `'[1,2]'`, or `'"ready"'`); non-JSON text
+is rejected.
+
+Validation parses the payload the same way the read side does, so anything that
+enqueues will decode. That rules out a few shapes the JSON grammar allows but no
+decoder can represent: lone surrogates such as `"\ud800"`, numbers outside f64
+range such as `1e999`, and nesting deeper than 128 levels. These are rejected at
+the producer rather than surfacing as an undecodable job in another process.
 
 SQLite has no server-side push channel, so honker uses a shared watcher.
 The stable backend reads `PRAGMA data_version` every millisecond; when

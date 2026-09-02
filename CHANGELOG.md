@@ -2,13 +2,49 @@
 
 ## Unreleased — JSON payload contract
 
-- **Breaking:** every payload accepted by Honker core must be valid JSON. Queue
-  enqueue, stream publish, notifications, task results, and scheduler register
-  or update now reject non-JSON text with
-  `honker: payload must be valid JSON`. Objects, arrays, strings, numbers,
-  booleans, and `null` remain valid payloads. Typed binding APIs encode values
-  where documented; raw JSON APIs and direct SQL callers must pass serialized
-  JSON text.
+- **Breaking:** every payload accepted by Honker core must be JSON that a JSON
+  decoder can read back. Queue enqueue, stream publish, notifications, task
+  results, and scheduler register or update all validate before the write.
+  Objects, arrays, strings, numbers, booleans, and `null` remain valid
+  payloads. Typed binding APIs encode values where documented; raw JSON APIs
+  and direct SQL callers must pass serialized JSON text.
+- Validation parses into `serde_json::Value` — the same thing the read side
+  does — rather than scanning the grammar structurally. A structural scan does
+  not unescape strings, range-check numbers, or bound nesting, so it accepted
+  text that no decoder can read. Three payload classes that used to enqueue
+  now fail at the producer instead:
+  - **Lone surrogates**, such as `"\ud800"` or `{"a":"\ud800"}`. Valid by the
+    JSON grammar, not representable as UTF-8. Both `json.dumps` in Python and
+    `JSON.stringify` in Node can emit these.
+  - **Numbers outside f64 range**, such as `1e999`, `-1e999`, or
+    `{"a":1e999}`.
+  - **Nesting deeper than 128 levels**, which is `serde_json`'s own recursion
+    limit. SQLite's `json_valid()` allows about 1000, so honker is now the
+    stricter of the two on depth.
+
+  This is intended, not a regression. A producer emitting any of these was
+  creating a job that a consumer could not decode — the failure moved from an
+  unrelated process at read time to the caller that caused it. If you were
+  relying on one of these shapes, encode it: escape a surrogate pair properly,
+  send an out-of-range number as a string, or flatten the nesting.
+- Rejection messages now name the actual problem and carry serde's own text.
+  Text that is not JSON gets
+  `honker: payload must be valid JSON: <serde message>`. Text that parses as
+  JSON but cannot be decoded gets
+  `honker: payload is valid JSON but cannot be decoded: <serde message>` —
+  telling that caller their payload "must be valid JSON" would send them
+  hunting for a syntax error they do not have.
+- The stricter parse is not measurable at the enqueue floor:
+  `tests/test_performance_floors.py::test_enqueue_throughput_floor_one_tx`
+  (10,000 enqueues in one transaction) went from 0.235 s to 0.241 s median on
+  an M-series laptop, about 23.5 µs to 24.1 µs per enqueue against a 3.0 s
+  floor. The enqueue cost is dominated by the SQLite insert and binding
+  marshaling, not by the JSON check.
+- The migration detection query in the guide,
+  `SELECT id FROM _honker_live WHERE NOT json_valid(payload)`, still does not
+  agree with honker exactly. `json_valid()` returns 1 for lone surrogates and
+  for `1e999`, so it will miss legacy rows that honker now rejects. To find
+  every row that will not decode, decode it.
 
 ## 2026-08-27 — Node 0.5.1
 

@@ -1747,7 +1747,22 @@ mod payload_tests {
     use crate::{attach_honker_functions, bootstrap_honker_schema};
     use rusqlite::params;
 
+    // Bare scalars are JSON. A stricter validator is most likely to break
+    // these by accident, and #152 settled that they must keep working.
     const VALID_JSON_PAYLOADS: [&str; 6] = ["{}", "[]", "42", "\"str\"", "true", "null"];
+
+    // Valid by the JSON grammar, but no decoder can represent them: a lone
+    // surrogate is not valid UTF-8, and 1e999 overflows f64. A structural
+    // scan accepts all of these; `serde_json::Value` -- the read side --
+    // rejects them. Accepting them at enqueue is how a Python producer
+    // creates a job a Rust consumer cannot decode.
+    const UNDECODABLE_JSON_PAYLOADS: [&str; 5] = [
+        r#""\ud800""#,
+        r#"{"a":"\ud800"}"#,
+        "1e999",
+        r#"{"a":1e999}"#,
+        "-1e999",
+    ];
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1758,10 +1773,33 @@ mod payload_tests {
 
     fn assert_payload_error<T>(result: rusqlite::Result<T>) {
         let err = result.err().expect("non-JSON payload must be rejected");
+        let text = err.to_string();
         assert!(
-            err.to_string()
-                .contains("honker: payload must be valid JSON"),
+            text.contains("honker: payload must be valid JSON"),
             "expected the JSON payload contract error, got: {err}"
+        );
+        assert!(
+            text.contains("line 1 column"),
+            "the error must pass serde's own message through so it names \
+             the real problem, got: {err}"
+        );
+    }
+
+    /// Text that parses as JSON but cannot be decoded gets its own message.
+    /// Telling this caller their payload "must be valid JSON" would send
+    /// them hunting for a syntax error they do not have.
+    fn assert_undecodable_payload_error<T>(result: rusqlite::Result<T>, payload: &str) {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("undecodable JSON payload must be rejected: {payload}"));
+        let text = err.to_string();
+        assert!(
+            text.contains("honker: payload is valid JSON but cannot be decoded"),
+            "expected the undecodable-JSON error for {payload}, got: {err}"
+        );
+        assert!(
+            text.contains("line 1 column"),
+            "the error must pass serde's own message through for {payload}, got: {err}"
         );
     }
 
@@ -1929,6 +1967,103 @@ mod payload_tests {
         ] {
             let result = conn.query_row(sql, ["not json"], |r| r.get::<_, i64>(0));
             assert_payload_error(result);
+        }
+        let stored: String = conn
+            .query_row(
+                "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "{}", "rejected payload must not be written");
+    }
+
+    #[test]
+    fn orm_select_enqueue_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            let result = conn.query_row(
+                "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+                [payload],
+                |r| r.get::<_, i64>(0),
+            );
+            assert_undecodable_payload_error(result, payload);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn stream_publish_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            let result = conn.query_row(
+                "SELECT honker_stream_publish('orders', NULL, ?1)",
+                [payload],
+                |r| r.get::<_, i64>(0),
+            );
+            assert_undecodable_payload_error(result, payload);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_stream", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn result_save_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            let result = conn.query_row("SELECT honker_result_save(1, ?1, 0)", [payload], |r| {
+                r.get::<_, i64>(0)
+            });
+            assert_undecodable_payload_error(result, payload);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn scheduler_register_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            for sql in [
+                "SELECT honker_scheduler_register('nightly-6', 'backups', '@every 1m', ?1, 0, NULL)",
+                "SELECT honker_scheduler_register('nightly-7', 'backups', '@every 1m', ?1, 0, NULL, 3)",
+            ] {
+                let result = conn.query_row(sql, [payload], |r| r.get::<_, i64>(0));
+                assert_undecodable_payload_error(result, payload);
+            }
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_scheduler_tasks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn scheduler_update_rejects_undecodable_json_payload() {
+        let conn = db();
+        conn.query_row(
+            "SELECT honker_scheduler_register('nightly', 'backups', '@every 1m', '{}', 0, NULL, 3)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            for sql in [
+                "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0)",
+                "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0, NULL, 0)",
+            ] {
+                let result = conn.query_row(sql, [payload], |r| r.get::<_, i64>(0));
+                assert_undecodable_payload_error(result, payload);
+            }
         }
         let stored: String = conn
             .query_row(
