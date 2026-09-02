@@ -107,10 +107,18 @@ defmodule HonkerJobFieldsTest do
     assert abs(snap.expires_at - (snap.created_at + @expires_s)) <= 1
   end
 
-  test "a job enqueued without :expires has a nil expires_at", %{db: db} do
+  test "a job enqueued without :expires has a nil expires_at, claimed or not", %{db: db} do
     {:ok, id} = Queue.enqueue(db, "details", %{"x" => 1})
     {:ok, snap} = Queue.get_job(db, id)
     assert snap.expires_at == nil, "expires_at must be nil, not 0"
+
+    # The claimed Job comes from a different ABI call through a different
+    # builder (Queue.row_to_job/1), so nil has to be proven on that path
+    # too. Every other claim test enqueues with :expires, so a claim that
+    # turned a NULL expiry into 0 would otherwise go unnoticed.
+    {:ok, job} = Queue.claim_one(db, "details", "worker-x")
+    assert job.expires_at == nil, "a claimed job's expires_at must be nil, not 0"
+    assert job.claim_expires_at != nil, "but a claim always has a deadline"
   end
 
   test "a delayed job reports its run_at", %{db: db} do
