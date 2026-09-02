@@ -80,6 +80,8 @@ defmodule Honker.Queue do
   Atomically claim up to `n` jobs. Returns `{:ok, [%Job{}, ...]}`,
   possibly empty if the queue had no eligible rows.
   """
+  @spec claim_batch(%Database{}, String.t(), String.t(), pos_integer()) ::
+          {:ok, [Job.t()]} | {:error, term()}
   def claim_batch(%Database{conn: conn} = db, queue_name, worker_id, n) do
     {vis, _max} = Honker.queue_opts(db, queue_name)
 
@@ -102,6 +104,8 @@ defmodule Honker.Queue do
   end
 
   @doc "Claim a single job or `{:ok, nil}` if the queue is empty."
+  @spec claim_one(%Database{}, String.t(), String.t()) ::
+          {:ok, Job.t() | nil} | {:error, term()}
   def claim_one(db, queue_name, worker_id) do
     case claim_batch(db, queue_name, worker_id, 1) do
       {:ok, [job | _]} -> {:ok, job}
@@ -150,6 +154,8 @@ defmodule Honker.Queue do
   bracket form raises `UndefinedFunctionError` rather than returning
   nil. Rewrite every bracket read of a `get_job/2` result.
   """
+  @spec get_job(%Database{}, integer()) ::
+          {:ok, JobSnapshot.t() | nil} | {:error, term()}
   def get_job(%Honker.Database{conn: conn}, job_id) do
     case Honker.query_first(conn, "SELECT honker_get_job(?1)", [job_id]) do
       {:ok, [raw]} when is_binary(raw) and byte_size(raw) > 0 ->
