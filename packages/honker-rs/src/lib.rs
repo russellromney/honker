@@ -2059,6 +2059,71 @@ mod raw_job_mapping {
         assert_eq!(row.expires_at, Some(41), "expires_at");
     }
 
+    /// The wire row minus one key, so the null cases can be built
+    /// without repeating the whole blob.
+    fn raw_without(key: &str) -> RawJob {
+        let mut v = serde_json::json!({
+            "id": 11,
+            "queue": "mapping",
+            "payload": "{\"k\":1}",
+            "state": "processing",
+            "priority": 13,
+            "run_at": 17,
+            "worker_id": "w-19",
+            "claim_expires_at": 23,
+            "attempts": 29,
+            "max_attempts": 31,
+            "created_at": 37,
+            "expires_at": 41
+        });
+        v[key] = serde_json::Value::Null;
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn into_job_errors_on_a_claim_with_no_worker_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path().join("m.db")).unwrap();
+        let err = raw_without("worker_id")
+            .into_job::<serde_json::Value>(db.inner.clone())
+            .expect_err("a claimed row without a holder must not default past");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worker_id") && msg.contains("11"),
+            "the error should name the field and the job id, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn into_job_errors_on_a_claim_with_no_claim_expires_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path().join("m.db")).unwrap();
+        let err = raw_without("claim_expires_at")
+            .into_job::<serde_json::Value>(db.inner.clone())
+            .expect_err("a claimed row without a deadline must not default past");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claim_expires_at") && msg.contains("11"),
+            "the error should name the field and the job id, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn into_row_keeps_the_same_nulls_as_none() {
+        // The snapshot path is the mirror image: a pending row
+        // legitimately has neither, and they must arrive as `None` —
+        // never `Some("")` or `Some(0)`.
+        let row: JobRow = raw_without("worker_id").into_row();
+        assert_eq!(row.worker_id, None, "worker_id null stays None");
+        let row: JobRow = raw_without("claim_expires_at").into_row();
+        assert_eq!(
+            row.claim_expires_at, None,
+            "claim_expires_at null stays None"
+        );
+        let row: JobRow = raw_without("expires_at").into_row();
+        assert_eq!(row.expires_at, None, "expires_at null stays None");
+    }
+
     #[test]
     fn job_row_still_deserializes_from_a_raw_get_job_blob() {
         // Regression guard for the restored `Deserialize` derive: this

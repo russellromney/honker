@@ -435,6 +435,157 @@ fn typed_queue_reads_a_payload_another_writer_produced() {
 }
 
 #[test]
+fn typed_outbox_delivers_the_payload_type() {
+    // `db.typed_outbox`, `Outbox<T>::enqueue_tx` and `run_once`'s
+    // `FnMut(T)` closure are all new surface. `run_once`'s closure
+    // argument changing from `serde_json::Value` to `T` is one of the
+    // disclosed source breaks, so it needs a test that actually runs
+    // a typed delivery.
+    let (_tmp, db) = open_db();
+    let ob = db.typed_outbox::<Email>("mail", honker::OutboxOpts::default());
+    assert_eq!(ob.queue().name(), "_outbox:mail", "outbox queue naming");
+
+    let sent = Email {
+        version: 3,
+        to: "frank@example.com".into(),
+        subject: "typed outbox".into(),
+    };
+    {
+        let tx = db.transaction().unwrap();
+        ob.enqueue_tx(&tx, &sent, EnqueueOpts::default()).unwrap();
+        tx.rollback().unwrap();
+    }
+    assert!(
+        !ob.run_once("w", |_: Email| Ok::<(), String>(())).unwrap(),
+        "a rolled-back outbox enqueue delivers nothing"
+    );
+
+    {
+        let tx = db.transaction().unwrap();
+        ob.enqueue_tx(&tx, &sent, EnqueueOpts::default()).unwrap();
+        tx.commit().unwrap();
+    }
+    let mut delivered: Option<Email> = None;
+    assert!(
+        ob.run_once("w", |e: Email| {
+            delivered = Some(e);
+            Ok::<(), String>(())
+        })
+        .unwrap(),
+        "the committed row delivers"
+    );
+    assert_eq!(
+        delivered.unwrap(),
+        sent,
+        "the delivery closure receives the queue's payload type, decoded"
+    );
+    assert!(
+        !ob.run_once("w", |_: Email| Ok::<(), String>(())).unwrap(),
+        "nothing left after the ack"
+    );
+}
+
+#[test]
+fn typed_claim_waker_hands_back_a_typed_job() {
+    // `ClaimWaker<T>` carries the parameter through to `Job<T>`, and
+    // `try_next` routes through the same `RawJob::into_job` as
+    // `claim_batch`, so the full field set has to survive that path
+    // too.
+    let (_tmp, db) = open_db();
+    let q = db.typed_queue::<Email>(
+        "waker",
+        QueueOpts {
+            visibility_timeout_s: VISIBILITY_TIMEOUT_S,
+            max_attempts: MAX_ATTEMPTS,
+        },
+    );
+    let sent = Email {
+        version: 4,
+        to: "grace@example.com".into(),
+        subject: "woken".into(),
+    };
+    q.enqueue(
+        &sent,
+        EnqueueOpts {
+            priority: LOW_PRIORITY,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let waker = q.claim_waker();
+    let job = waker.try_next("w-waker").unwrap().expect("claim");
+    assert_eq!(job.payload_typed().unwrap(), sent, "typed payload");
+    assert_eq!(job.state, "processing", "state");
+    assert_eq!(job.worker_id, "w-waker", "worker_id");
+    assert_eq!(
+        job.priority, LOW_PRIORITY,
+        "priority survives the waker path"
+    );
+    assert_eq!(
+        job.max_attempts, MAX_ATTEMPTS,
+        "max_attempts survives the waker path"
+    );
+    assert_eq!(job.attempts, 1, "attempts");
+    assert!(job.ack().unwrap());
+    assert!(
+        waker.try_next("w-waker").unwrap().is_none(),
+        "nothing left after the ack"
+    );
+}
+
+/// A generic helper that took a plain `&Queue` before `enqueue`
+/// narrowed to `&T`. `typed::<P>()` keeps its signature — and so
+/// every one of its call sites — unchanged. This is the migration the
+/// CHANGELOG points at, compiled.
+fn generic_helper<P: Serialize>(q: &honker::Queue, p: &P) -> honker::Result<i64> {
+    q.typed::<P>().enqueue(p, EnqueueOpts::default())
+}
+
+#[test]
+fn a_generic_helper_migrates_without_touching_its_call_sites() {
+    let (_tmp, db) = open_db();
+    let q = db.queue("helper", QueueOpts::default());
+    let sent = Email {
+        version: 5,
+        to: "heidi@example.com".into(),
+        subject: "body-only migration".into(),
+    };
+    // Call site is byte-identical to the pre-generic one: a plain
+    // `db.queue(..)` handle passed by reference.
+    let id = generic_helper(&q, &sent).unwrap();
+    // The `serde_json::to_value` escape hatch also still compiles.
+    let id2 = q
+        .enqueue(
+            &serde_json::to_value(&sent).unwrap(),
+            EnqueueOpts::default(),
+        )
+        .unwrap();
+
+    let typed = q.typed::<Email>();
+    let helper_row = typed.get_job(id).unwrap().expect("helper row");
+    assert_eq!(
+        helper_row.payload_typed().unwrap(),
+        sent,
+        "the helper wrote a decodable row"
+    );
+    // `get_job` is not queue-scoped (#134), so the payload assertion
+    // alone would pass even if `typed()` had sent the row to some
+    // other queue. Pin the queue name too.
+    assert_eq!(
+        helper_row.queue, "helper",
+        "typed() must keep the handle's queue, not retarget it"
+    );
+    let hatch_row = typed.get_job(id2).unwrap().expect("escape-hatch row");
+    assert_eq!(
+        hatch_row.payload_typed().unwrap(),
+        sent,
+        "so did the escape hatch"
+    );
+    assert_eq!(hatch_row.queue, "helper", "escape hatch stays on the queue");
+}
+
+#[test]
 fn payload_shape_is_never_validated_by_honker() {
     // The type parameter is a compile-time convenience only. honker
     // stores whatever JSON you hand it; the mismatch only surfaces
