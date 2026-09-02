@@ -17,10 +17,18 @@ def check_wheel(path: Path) -> None:
     has_extension = any(
         name.startswith("honker/_lib/") and "honker_ext" in name for name in names
     )
+    # PEP 561 marker. Without it, mypy and pyright refuse to read
+    # honker's inline annotations at all, so Queue[T] / Job[T] /
+    # JobSnapshot all collapse to Any in user code — the hints ship but
+    # do nothing.
+    has_py_typed = "honker/py.typed" in names
+
     if not has_native:
         raise SystemExit(f"python wheel is missing _honker_native: {path}")
     if not has_extension:
         raise SystemExit(f"python wheel is missing bundled SQLite extension: {path}")
+    if not has_py_typed:
+        raise SystemExit(f"python wheel is missing the py.typed marker: {path}")
 
 
 def main() -> None:

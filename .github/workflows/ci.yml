@@ -285,6 +285,23 @@ jobs:
             . .venv/bin/activate
           fi
           python -m pytest tests/ -q -n 0 --tb=short
+      # The Node binding gates wrapper.d.ts with tsc. This is the Python
+      # equivalent: the public hints (Queue[T], Job[T], JobSnapshot) are
+      # checked, not just shipped. One leg is enough — the hints do not
+      # vary by OS or interpreter version.
+      #
+      # It resolves `honker` through site-packages, the way a user's
+      # project does. That is deliberate: a package without the PEP 561
+      # py.typed marker is skipped by mypy entirely and every annotation
+      # collapses to Any, so this step also proves the marker installed.
+      - name: Type-check the public Python hints (mypy)
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv pip install --python .venv/bin/python --quiet mypy
+          .venv/bin/mypy --warn-unused-ignores \
+            scripts/proof/typing/check_payload_hints.py
       - name: Prove the documented Python ORM recipes
         shell: bash
         run: |

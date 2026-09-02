@@ -57,6 +57,65 @@ async for job in q.claim("worker-1"):
     job.ack()
 ```
 
+### Job details and typed payloads
+
+A claimed `Job` and a `get_job()` snapshot both carry the full job shape:
+`id`, `queue`, `payload`, `state`, `priority`, `run_at`, `worker_id`,
+`claim_expires_at`, `attempts`, `max_attempts`, `created_at`, and
+`expires_at`. A `Job` also has the claim methods (`ack`, `retry`, `fail`,
+`heartbeat`); a snapshot is data only.
+
+```python
+job = q.claim_one("worker-1")
+print(job.state, job.priority, job.run_at, job.attempts, job.max_attempts)
+print(job.worker_id, job.claim_expires_at, job.created_at, job.expires_at)
+print(job.queue_name)            # the queue column; job.queue is the Queue
+
+row = q.get_job(job.id)          # snake_case dict, same twelve fields
+print(row["state"], row["worker_id"])
+```
+
+`worker_id`, `claim_expires_at` and `expires_at` are `None` when they have
+no value — never `0`, never `""`.
+
+Two things to know about `get_job()`:
+
+- Its `payload` is the raw JSON text the core returns; decode it with
+  `json.loads(row["payload"])`. A claimed `Job.payload` is decoded for you.
+  Bindings currently disagree on this (Node decodes its snapshot, Python and
+  Go do not); [#146](https://github.com/russellromney/honker/issues/146)
+  tracks settling on one.
+- It is **not** scoped to the queue you call it on. Job ids are globally
+  unique, so `emails.get_job(sms_id)` returns the SMS row. Check
+  `row["queue"]` if that matters;
+  [#134](https://github.com/russellromney/honker/issues/134) tracks scoping
+  it in the core, where the filter can stay atomic.
+
+`Queue` and `Job` take an optional payload type parameter:
+
+```python
+from typing import TypedDict
+
+class EmailPayload(TypedDict):
+    to: str
+    template: str
+
+emails: honker.Queue[EmailPayload] = db.queue("emails")
+emails.enqueue({"to": "a@example.com", "template": "welcome"})
+job = emails.claim_one("worker-1")   # job.payload is EmailPayload
+```
+
+`db.queue()` returns `Queue[Any]` — a queue name says nothing about payload
+shape — so the annotation on the left is what binds the type, the same way
+`xs: list[int] = json.loads(text)` does. Every later use of `emails` is then
+checked against `EmailPayload`, on the producer side as well as the consumer
+side.
+
+This is a type hint and nothing else. Honker does not validate payload shape
+in the database, so a payload that does not match the annotation still
+enqueues and claims fine — every app writing to a queue has to agree on the
+JSON shape itself.
+
 Delayed jobs use `run_at`:
 
 ```python

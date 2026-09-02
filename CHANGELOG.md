@@ -20,6 +20,52 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — full job details in the Python binding
+
+- Python `Job` now carries `expires_at`, and reads `state`, `priority`,
+  `run_at`, `max_attempts`, and `created_at` straight out of the claim result
+  instead of falling back to defaults. `honker_claim_batch` returns the
+  complete live-job snapshot, so the old "narrow claim path" comment and its
+  `row.get(..., default)` fallbacks were stale — a default there would have
+  silently papered over ABI drift between the core and the binding. A claimed
+  `Job` and a `get_job()` snapshot now describe the same twelve columns.
+- `Job.last_error` is now explicitly `None` with a comment saying why: the
+  claim ABI does not return it. It was already always None; the fallback just
+  made that look accidental.
+- New `honker.JobSnapshot` TypedDict names the twelve keys `get_job()`
+  returns. `get_job()` still returns a plain dict with the core's snake_case
+  keys and raw-JSON-text `payload` — nothing about its runtime value changed.
+- `Queue` and `Job` take an optional payload type parameter (`Queue[T]`,
+  `Job[T]`), flowing through `enqueue()`, `claim_one()`, `claim_batch()`,
+  `claim()`, and `Job.payload` — the producer side as well as the consumer
+  side. Type hints only; Honker still does not validate payload shape in the
+  database, and `test_typed_payload_hints_do_not_validate_at_runtime` pins
+  that.
+- The wheel now ships the PEP 561 `py.typed` marker. Without it a type
+  checker skips honker entirely and every annotation above resolves to `Any`
+  in user code, so the hints shipped but did nothing. Proven three ways:
+  `check-python-wheel.py` asserts the marker is in the built wheel,
+  `test_the_installed_package_ships_the_pep561_marker` asserts it is in the
+  installed package on every OS in the matrix, and the new mypy step proves
+  what it buys.
+- `Job`'s twelve fields carry real types. They are assigned out of an untyped
+  row dict, so a checker saw all of them as `Any` — the field list this
+  change is about was invisible to the thing meant to consume it. New
+  `honker.JobState` (`Literal["pending", "processing"]`) matches the Node
+  binding's exported type.
+- CI type-checks the public hints with mypy against the installed package
+  (`scripts/proof/typing/check_payload_hints.py`), the Python counterpart to
+  the `tsc` gate on Node's `wrapper.d.ts`. `assert_type` pins each shape and
+  `--warn-unused-ignores` makes the negative cases load-bearing too.
+- `get_job()` documents that it is not queue-scoped (#134) and that its
+  raw-text `payload` disagrees with Node's decoded one (#146). `Job.payload`
+  documents that it raises `json.JSONDecodeError` on undecodable text rather
+  than handing back the raw string the way Node does (#153).
+- `tests/test_job_details.py` covers the pending snapshot, the claimed job, a
+  second handle's processing snapshot, the post-ack miss, a delayed job's
+  `run_at`, a back-dated job's `run_at` on the claimed path, a job with no
+  TTL, and a retry round trip that asserts the rewritten `run_at`.
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry

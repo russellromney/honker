@@ -5,7 +5,28 @@ import time
 import traceback
 import uuid
 from collections import deque
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Generic,
+    Literal,
+    Optional,
+    TypedDict,
+    TypeVar,
+)
+
+# Payload type variable. Purely a type hint: it tells a checker (and a
+# reader) what JSON shape a queue's producers and consumers agreed on.
+# Honker never inspects or validates payload shape in the database, so
+# nothing here is enforced at runtime. An unparameterized `Queue` /
+# `Job` is `Queue[Any]` / `Job[Any]`, so untyped code is unaffected.
+PayloadT = TypeVar("PayloadT")
+
+# The only two states a *live* job row can be in. Ack'd and dead'd jobs
+# leave `_honker_live`, so neither `claim_batch` nor `get_job` can ever
+# report them. Matches the Node binding's exported `JobState`.
+JobState = Literal["pending", "processing"]
 
 # Queue / outbox defaults. Sentinels distinguish "caller omitted the
 # option" (pure lookup of a memoized instance) from "caller passed the
@@ -140,7 +161,78 @@ class Listener:
                 raise StopAsyncIteration
 
 
-class Job:
+class JobSnapshot(TypedDict):
+    """The shape `Queue.get_job()` returns: one live job row, data only.
+
+    A snapshot has no claim methods — it is not a claim, so there is
+    nothing to ack, retry, fail, or heartbeat. Use `Job` for that.
+
+    Keys are the core's snake_case column names, and `payload` is the
+    raw JSON *text* of the payload, exactly as `honker_get_job` returns
+    it. Decode it with `json.loads(row["payload"])`.
+
+    That is deliberately NOT the same as a claimed `Job.payload`, which
+    is decoded for you. The Node binding decodes both; Python and Go
+    return raw text here. Issue #146 tracks picking one encoding for
+    every binding's snapshot — this binding keeps its existing (raw)
+    encoding until that decision lands, because changing it silently
+    would break every caller that already calls `json.loads` on it.
+
+    `worker_id` and `claim_expires_at` are None while the job is pending
+    and set once a worker claims it. `expires_at` is None unless the job
+    was enqueued with `expires=`. None here always means "no value", not
+    0 and not "".
+    """
+
+    id: int
+    queue: str
+    payload: str
+    state: JobState
+    priority: int
+    run_at: int
+    worker_id: Optional[str]
+    claim_expires_at: Optional[int]
+    attempts: int
+    max_attempts: int
+    created_at: int
+    expires_at: Optional[int]
+
+
+class Job(Generic[PayloadT]):
+    """One claimed unit of work.
+
+    Carries the same twelve fields a `JobSnapshot` does, plus the claim
+    methods (`ack`, `retry`, `fail`, `heartbeat`).
+
+    Note the job's queue name is `job.queue_name`. `job.queue` is the
+    `Queue` object the job was claimed from, so the claim methods have
+    something to call — it is not the `queue` *column*.
+
+    `Job[T]` is an optional type hint for the decoded `payload`. It is a
+    compile-time contract between a queue's producers and consumers;
+    Honker does not validate payload shape in the database.
+    """
+
+    # Declared so a type checker sees the real column types instead of
+    # `Any` — `__init__` reads them out of an untyped row dict. Bare
+    # annotations do not create class attributes, so `__slots__` below
+    # still does its job.
+    queue: "Queue[PayloadT]"
+    id: int
+    queue_name: str
+    _payload_raw: Optional[str]
+    _payload: Any
+    state: JobState
+    priority: int
+    run_at: int
+    worker_id: str
+    claim_expires_at: Optional[int]
+    attempts: int
+    max_attempts: int
+    last_error: Optional[str]
+    created_at: int
+    expires_at: Optional[int]
+
     __slots__ = (
         "queue",
         "id",
@@ -156,34 +248,54 @@ class Job:
         "max_attempts",
         "last_error",
         "created_at",
+        "expires_at",
     )
 
     # Sentinel distinguishing "payload decoded to None" from "not yet decoded".
     _UNSET = object()
 
-    def __init__(self, queue: "Queue", row: dict):
-        # `row` comes from the claim UPDATE's RETURNING. The narrow claim
-        # path only returns hot-path fields (id, queue, payload, worker_id,
-        # attempts, claim_expires_at); other columns default to sensible
-        # post-claim values.
+    def __init__(self, queue: "Queue[PayloadT]", row: dict):
+        # `row` comes from `honker_claim_batch`, whose UPDATE ... RETURNING
+        # hands back the complete live-job snapshot — the same twelve
+        # columns `honker_get_job` returns. Read each one straight out of
+        # the row: a default here would silently paper over an ABI drift
+        # between the core and this binding.
         self.queue = queue
         self.id = row["id"]
         self.queue_name = row["queue"]
         self._payload_raw = row["payload"]
         self._payload = Job._UNSET
+        self.state = row["state"]
+        self.priority = row["priority"]
+        self.run_at = row["run_at"]
         self.worker_id = row["worker_id"]
-        self.attempts = row["attempts"]
         self.claim_expires_at = row["claim_expires_at"]
-        # After a claim UPDATE, state is by construction 'processing'.
-        self.state = row.get("state", "processing")
-        self.priority = row.get("priority", 0)
-        self.run_at = row.get("run_at", 0)
-        self.max_attempts = row.get("max_attempts", queue.max_attempts)
-        self.last_error = row.get("last_error", None)
-        self.created_at = row.get("created_at", 0)
+        self.attempts = row["attempts"]
+        self.max_attempts = row["max_attempts"]
+        self.created_at = row["created_at"]
+        self.expires_at = row["expires_at"]
+        # `last_error` is not part of the claim snapshot — the claim ABI
+        # does not return it — so it is always None on a claimed job.
+        # Read `_honker_live.last_error` directly if you need it.
+        self.last_error = None
 
     @property
-    def payload(self) -> Any:
+    def payload(self) -> PayloadT:
+        """The decoded JSON payload. Decoded once, then cached.
+
+        Raises `json.JSONDecodeError` if the stored payload text is not
+        valid JSON. That is deliberate: a payload that cannot be decoded
+        is a real error, and handing back the raw text instead (which is
+        what the Node binding currently does) turns it into a silent
+        type violation the caller only notices much later. The raise
+        propagates to whoever touched `.payload`: `Outbox.run_worker`
+        turns it into a retry, while the decorated-task worker loop lets
+        it escape and stop that worker, which is the loud outcome you
+        want for a queue whose rows are not what the binding promised.
+        Issue #153 pushes JSON validation into the core's write paths,
+        which makes an undecodable payload unreachable through any
+        honker API.
+        """
         if self._payload is Job._UNSET:
             self._payload = (
                 json.loads(self._payload_raw) if self._payload_raw else None
@@ -208,7 +320,29 @@ class Job:
         return self.queue.heartbeat(self.id, self.worker_id, extend_s)
 
 
-class Queue:
+class Queue(Generic[PayloadT]):
+    """A named work queue.
+
+    `Queue[T]` is an optional type hint naming the JSON payload shape
+    this queue's producers and consumers agreed on:
+
+        emails: Queue[EmailPayload] = db.queue("emails")
+
+    It flows through to `enqueue()`, `claim_one()`, `claim_batch()`,
+    `claim()`, and `Job.payload`, so a checker catches a producer that
+    enqueues the wrong shape as well as a consumer that reads the wrong
+    field.
+
+    `db.queue(...)` returns `Queue[Any]`; the annotation on the left is
+    what binds `T`, exactly like `xs: list[int] = json.loads(text)`.
+    That means the binding itself is asserted, not checked — from there
+    on, uses of `emails` are checked against `EmailPayload`.
+
+    Nothing about it is checked at runtime — Honker does not validate
+    payload shape in the database, so a wrong-shaped payload still
+    enqueues and still claims.
+    """
+
     def __init__(
         self,
         db,
@@ -271,7 +405,7 @@ class Queue:
 
     def enqueue(
         self,
-        payload: Any,
+        payload: PayloadT,
         tx=None,
         run_at: Optional[int] = None,
         delay: Optional[float] = None,
@@ -324,14 +458,18 @@ class Queue:
             rows = own_tx.query(sql, params)
             return rows[0]["id"]
 
-    def claim_one(self, worker_id: str) -> Optional[Job]:
+    def claim_one(self, worker_id: str) -> Optional["Job[PayloadT]"]:
         jobs = self.claim_batch(worker_id, 1)
         return jobs[0] if jobs else None
 
-    def claim_batch(self, worker_id: str, n: int) -> list:
+    def claim_batch(self, worker_id: str, n: int) -> list["Job[PayloadT]"]:
         """Atomically claim up to `n` jobs. Delegates to
         `honker_claim_batch`, which does one `UPDATE ... RETURNING` via
         the partial claim index in Rust — same SQL every binding uses.
+
+        The RETURNING clause hands back the complete live-job snapshot,
+        so each claimed `Job` carries the same twelve fields
+        `get_job()` returns.
         """
         n = int(n)
         if n <= 0:
@@ -372,7 +510,7 @@ class Queue:
         self,
         worker_id: str,
         idle_poll_s: Optional[float] = 5.0,
-    ) -> AsyncIterator[Job]:
+    ) -> AsyncIterator["Job[PayloadT]"]:
         """Async iterator over this queue. Yields one claimed Job per
         `__anext__` via a single-row `claim_batch(worker_id, 1)` — one
         write transaction per job. Wakes on database update from any process;
@@ -566,10 +704,28 @@ class Queue:
             )
         return bool(rows[0]["r"])
 
-    def get_job(self, job_id: int) -> Optional[dict]:
-        """Read a single job row by id. Returns a dict with the row
-        fields, or None if the job has been ack'd, dead'd, or never
-        existed. Pure read."""
+    def get_job(self, job_id: int) -> Optional[JobSnapshot]:
+        """Read a single job row by id. Pure read, no claim.
+
+        Returns a `JobSnapshot` — a plain dict carrying all twelve job
+        fields (id, queue, payload, state, priority, run_at, worker_id,
+        claim_expires_at, attempts, max_attempts, created_at,
+        expires_at) — or None if the job has been ack'd, dead'd, or
+        never existed.
+
+        NOT queue-scoped. Job ids are globally unique and this lookup
+        does not filter on `self.name`, so `emails.get_job(sms_id)`
+        returns the SMS row — whose payload will not match this queue's
+        `PayloadT`. Check `row["queue"]` if that matters to you. The
+        Node binding already scopes its `getJob`; #134 tracks doing the
+        same here, and the filter has to be pushed into the core to stay
+        atomic.
+
+        `payload` is the raw JSON text the core returns; decode it with
+        `json.loads(row["payload"])`. A claimed `Job.payload` is decoded
+        for you. That split is a known cross-binding inconsistency
+        (#146) — see `JobSnapshot`.
+        """
         with self.db.transaction() as tx:
             rows = tx.query("SELECT honker_get_job(?) AS j", [int(job_id)])
         raw = rows[0]["j"] if rows else ""
@@ -1249,8 +1405,14 @@ class Database:
         name: str,
         visibility_timeout_s=_UNSET,
         max_attempts=_UNSET,
-    ) -> Queue:
+    ) -> "Queue[Any]":
         """Return a memoized Queue for `name`.
+
+        The payload type is not inferable from a queue *name*, so this
+        returns `Queue[Any]`. Bind it by annotating the variable —
+        `emails: honker.Queue[EmailPayload] = db.queue("emails")` — and
+        every later use of `emails` is checked against that shape. See
+        :class:`Queue`.
 
         Options apply only on first open. Subsequent calls:
 
