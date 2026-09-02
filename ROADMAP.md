@@ -31,9 +31,11 @@ rather than the symptom, while alpha still makes that cheap.
 - **#133 / #138** — five core lookups stop swallowing SQLite errors.
   `fail()` gets a SAVEPOINT: propagating the error alone deleted the job
   from both tables. *Silent job loss under schema damage.*
-- **#135 / #140** — `claimed_at`, so "how long has this been running" is
-  answerable. Nullable, set on every claim and reclaim, cleared by retry,
-  untouched by heartbeat.
+- **#135 / #140** — `claimed_at` in core. Nullable, set on every claim and
+  reclaim, cleared by retry, untouched by heartbeat. Core emits it in
+  `claim_batch` and `get_job` JSON, but **no binding maps it yet** — #136
+  excluded it on purpose, so "how long has this been running" is answerable
+  only from raw SQL until a follow-up exposes it per binding.
 - **#152 / #153** — payload must be valid JSON, enforced at the five core
   entry points rather than by a table CHECK. Bare scalars stay legal: the
   contract is valid JSON, nothing more. *Breaking.*
