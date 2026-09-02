@@ -120,6 +120,34 @@ class HonkerJobFieldsTest < Minitest::Test
     assert_nil @q.get_job(id).expires_at, "expires_at must be nil, not 0"
   end
 
+  # get_job used to return a Hash. These are the access patterns that
+  # still have to work on the Struct, plus the JSON shape a caller who
+  # logs or ships a snapshot depends on. Without JobSnapshot#to_json a
+  # Struct serializes to its #inspect string, which parses back as a
+  # String, not a Hash.
+  def test_snapshot_keeps_the_reader_and_json_shape_the_hash_had
+    id = @q.enqueue({ "x" => 1 }, priority: PRIORITY)
+    snap = @q.get_job(id)
+
+    assert_equal id, snap["id"]
+    assert_equal "details", snap["queue"]
+    assert_equal "pending", snap["state"]
+    assert_equal PRIORITY, snap["priority"]
+    assert_equal "pending", snap.dig("state")
+
+    round_trip = JSON.parse(JSON.dump(snap))
+    assert_instance_of Hash, round_trip
+    assert_equal snap.to_h.transform_keys(&:to_s), round_trip
+    assert_equal 12, round_trip.size
+    assert_nil round_trip["worker_id"], "a JSON null, not a missing key"
+    assert round_trip.key?("worker_id")
+
+    # Documented breaks: Hash-only methods are gone, and an unknown
+    # field raises instead of quietly returning nil.
+    assert_raises(NoMethodError) { snap.fetch("state") }
+    assert_raises(NameError) { snap["claimed_at"] }
+  end
+
   # A snapshot names the queue #queue; a claimed Job named it
   # #queue_name. Both answer to both, so code written against one
   # works when handed the other.

@@ -895,6 +895,12 @@ module Honker
   # JSON.parse on it. That difference is inherited from the SQL ABI
   # and is deliberately left alone here; the bindings do not yet agree
   # on one snapshot payload encoding.
+  #
+  # get_job used to return a Hash of this row. Reader access
+  # (snapshot["state"]) still works, and JSON.dump still emits the
+  # same JSON object, but Hash-only methods do not: #fetch, #key? and
+  # #keys raise NoMethodError, an unknown name raises NameError
+  # instead of returning nil, and #to_h has Symbol keys, not String.
   JobSnapshot = Struct.new(
     :id, :queue, :payload, :state, :priority, :run_at, :worker_id,
     :claim_expires_at, :attempts, :max_attempts, :created_at, :expires_at
@@ -919,6 +925,13 @@ module Honker
 
     # Job exposes the same value as #queue_name; accept both here.
     alias_method :queue_name, :queue
+
+    # Serialize as the row's JSON object, the way the Hash this used
+    # to be did. Without this a Struct serializes to its #inspect
+    # string, which silently turns a logged snapshot into garbage.
+    def to_json(*args)
+      to_h.transform_keys(&:to_s).to_json(*args)
+    end
   end
 
   # A claimed unit of work. `payload` is the decoded JSON value (Hash,

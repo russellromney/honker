@@ -294,6 +294,14 @@ raw JSON *text* from the row, not a decoded value — call `JSON.parse` on
 it. `nil` means the job was ack'd, dead-lettered, cancelled, or never
 existed.
 
+`JobSnapshot` is a `Struct`, like `Honker::Notification`. It replaces the
+plain `Hash` older versions returned. Reader access still works
+(`snapshot["state"]`, `snapshot.dig("state")`), and `JSON.dump(snapshot)`
+still emits the same JSON object, but Hash-only methods do not: `fetch`,
+`key?` and `keys` raise `NoMethodError`, an unknown field name raises
+`NameError` instead of returning `nil`, and `to_h` gives you Symbol keys,
+not String ones.
+
 Honker never inspects a payload. The shape is a contract between the app
 that enqueues and the app that claims, and both sides have to agree on it
 — including across languages, since another binding may write to the same

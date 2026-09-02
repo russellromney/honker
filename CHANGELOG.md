@@ -45,8 +45,11 @@
   `worker_id`, and `attempts`.
 - `Queue#get_job` returns a `Honker::JobSnapshot` — the same twelve fields,
   read-only, with no ack/retry/fail/heartbeat. **Behavior change:** it used
-  to return a plain `Hash` of the raw ABI row. `snapshot["state"]` still
-  works (`Struct#[]` takes member names), but `Hash` methods no longer do.
+  to return a plain `Hash` of the raw ABI row. Reader access still works
+  (`snapshot["state"]`, `snapshot.dig("state")`), and `JSON.dump(snapshot)`
+  still emits the same JSON object, but Hash-only methods do not: `fetch`,
+  `key?` and `keys` raise `NoMethodError`, an unknown field name raises
+  `NameError` instead of returning `nil`, and `to_h` has Symbol keys.
 - `Job#queue` is a new alias for `Job#queue_name`, so the accessor name
   `JobSnapshot` uses works on a claimed job too.
 - Snapshot `payload` stays the raw JSON text the row stores, matching the
