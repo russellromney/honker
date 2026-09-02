@@ -82,7 +82,40 @@ if (job) {
 ```
 
 Payload generics describe the expected JSON shape at compile time; Honker does
-not perform runtime schema validation.
+not perform runtime schema validation. Anything that can write to the queue —
+another process, another language binding, or a raw `honker_enqueue` on your own
+SQLite connection — decides what actually comes back, so validate at the boundary
+when the producer is not under your control.
+
+Every job carries the same twelve fields, whether it came from a claim or from
+`getJob()`:
+
+| field | |
+| --- | --- |
+| `id` `queue` `payload` | identity and body; `payload` is already JSON-decoded |
+| `state` | `"pending"` or `"processing"` |
+| `priority` `attempts` `maxAttempts` | scheduling and retry budget |
+| `runAt` `createdAt` `claimExpiresAt` `expiresAt` | **Unix epoch seconds, not milliseconds** |
+
+`workerId`, `claimExpiresAt`, and `expiresAt` are `null` when they do not apply
+(an unclaimed job, a job with no TTL). On a claimed job `workerId` and
+`claimExpiresAt` are always set. For a `Date`, multiply: `new Date(job.createdAt * 1000)`.
+
+### Upgrading `getJob()` from 0.5.1
+
+`getJob()` used to hand back the SQL layer's raw row. It now returns the decoded
+camelCase snapshot above. Two things change for existing callers:
+
+- `row.run_at` is now `job.runAt`, and so on for every snake_case field. The old
+  names read back as `undefined` rather than throwing.
+- `payload` is already decoded. Drop any `JSON.parse(row.payload)` around it.
+
+`getJob()` is also scoped to its own queue now: it returns `null` for a job owned
+by a different queue, where it previously returned that queue's row. Job ids are
+globally unique, so the old lookup could hand `emails` an SMS payload. There is
+no unscoped replacement yet (tracked in issue #134) — until then, call the SQL
+function directly on your own connection with `SELECT honker_get_job(?)`, which
+still returns the raw snake_case row. `cancel()` is unchanged and stays global.
 
 Recurring schedules use `schedule`:
 

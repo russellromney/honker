@@ -52,17 +52,25 @@ test('typed job details survive a producer-to-consumer process journey', () => {
     db.close();
     db = null;
 
+    // A distinctive visibility timeout so claimExpiresAt cannot be confused
+    // with any other timestamp on the job: runAt and createdAt sit at ~+0 and
+    // expiresAt at ~+600, while this claim's deadline lands at ~+77.
+    const visibilityTimeoutS = 77;
     const consumerOutput = runNode(`
       const honker = require('.');
       const db = honker.open(process.argv[1]);
-      const job = db.queue('emails').claimOne('worker-e2e');
+      const job = db.queue('emails', { visibilityTimeoutS: ${visibilityTimeoutS} })
+        .claimOne('worker-e2e');
       console.log(JSON.stringify({
+        fields: Object.keys(job).filter((k) => !k.startsWith('_')),
         id: job.id,
+        queue: job.queue,
         payload: job.payload,
         state: job.state,
         priority: job.priority,
         runAt: job.runAt,
         workerId: job.workerId,
+        claimExpiresAt: job.claimExpiresAt,
         attempts: job.attempts,
         maxAttempts: job.maxAttempts,
         createdAt: job.createdAt,
@@ -73,6 +81,7 @@ test('typed job details survive a producer-to-consumer process journey', () => {
     `, dbPath);
     const claimed = JSON.parse(consumerOutput);
     assert.equal(claimed.id, jobId);
+    assert.equal(claimed.queue, 'emails');
     assert.deepEqual(claimed.payload, snapshot.payload);
     assert.equal(claimed.state, 'processing');
     assert.equal(claimed.priority, 7);
@@ -83,6 +92,29 @@ test('typed job details survive a producer-to-consumer process journey', () => {
     assert.equal(claimed.createdAt, snapshot.createdAt);
     assert.equal(claimed.expiresAt, snapshot.expiresAt);
     assert.equal(claimed.acked, true);
+
+    // The claim lease. Nothing else pins this field, and every other timestamp
+    // on the job is far outside this window, so a mapping that returned runAt,
+    // createdAt, or expiresAt here fails.
+    assert.equal(typeof claimed.claimExpiresAt, 'number');
+    assert.ok(
+      claimed.claimExpiresAt >= claimed.createdAt + visibilityTimeoutS,
+      `claimExpiresAt ${claimed.claimExpiresAt} is before createdAt + ${visibilityTimeoutS}`,
+    );
+    assert.ok(
+      claimed.claimExpiresAt <= claimed.createdAt + visibilityTimeoutS + 120,
+      `claimExpiresAt ${claimed.claimExpiresAt} is far past createdAt + ${visibilityTimeoutS}`,
+    );
+
+    // A claimed Job and a JobSnapshot must expose the same twelve fields.
+    // Without this, a field added to one shape and not the other ships silently.
+    const JOB_FIELDS = [
+      'attempts', 'claimExpiresAt', 'createdAt', 'expiresAt', 'id',
+      'maxAttempts', 'payload', 'priority', 'queue', 'runAt', 'state',
+      'workerId',
+    ];
+    assert.deepEqual(claimed.fields.slice().sort(), JOB_FIELDS);
+    assert.deepEqual(Object.keys(snapshot).sort(), JOB_FIELDS);
 
     db = honker.open(dbPath);
     assert.equal(db.queue('emails').getJob(jobId), null);
@@ -141,6 +173,33 @@ test('a claimed job reports its own run_at, not its created_at', () => {
     assert.equal(job.runAt, runAt);
     assert.notEqual(job.runAt, job.createdAt);
     assert.equal(job.createdAt, snapshot.createdAt);
+  } finally {
+    try { db?.close(); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a JSON null payload comes back as null, not as the string "null"', () => {
+  // `Job<T>.payload` and `JobSnapshot<T>.payload` are declared as `T`, but the
+  // generic is an unchecked assertion: honker never inspects payload shape. A
+  // JSON null is the one violation reachable from any producer with no raw SQL
+  // at all, so pin what a reader actually gets. The TSDoc on
+  // `JobSnapshot.payload` documents this; this test keeps that doc honest.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'honker-null-payload-'));
+  const dbPath = path.join(dir, 'app.db');
+  let db;
+  try {
+    db = honker.open(dbPath);
+    const q = db.queue('nullable');
+    const id = q.enqueue(null);
+
+    const snapshot = q.getJob(id);
+    assert.equal(snapshot.payload, null);
+
+    const job = q.claimOne('worker-null');
+    assert.equal(job.id, id);
+    assert.equal(job.payload, null);
+    assert.equal(job.ack(), true);
   } finally {
     try { db?.close(); } catch {}
     fs.rmSync(dir, { recursive: true, force: true });
