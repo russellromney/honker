@@ -58,7 +58,21 @@ defmodule Honker.JobSnapshot do
           expires_at: integer() | nil
         }
 
-  @doc "Build a snapshot from a decoded `honker_get_job()` row."
+  @doc """
+  Build a snapshot from a decoded `honker_get_job()` row.
+
+  `Honker.Queue.get_job/2` calls this for you. Reach for it directly
+  when you run the SQL yourself — the Ecto path in `Honker.Extension`,
+  where Honker is loaded onto a connection you own:
+
+      %{rows: [[raw]]} =
+        Ecto.Adapters.SQL.query!(Repo, "SELECT honker_get_job(?)", [job_id])
+
+      snapshot = raw |> Jason.decode!() |> Honker.JobSnapshot.from_row()
+
+  `honker_get_job()` returns the empty string on a miss, so check for
+  that before decoding.
+  """
   @spec from_row(map()) :: t()
   def from_row(row) when is_map(row) do
     %__MODULE__{
