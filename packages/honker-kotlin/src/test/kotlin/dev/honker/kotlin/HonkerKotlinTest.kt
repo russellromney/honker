@@ -321,6 +321,100 @@ class HonkerKotlinTest {
     }
 
     @Test
+    fun codecOverloadsDecodeOnEveryReceiver() {
+        honker(tmp.resolve("codecs.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { db ->
+            val emails = db.queue("codec-emails")
+            val reports = db.queue("codec-reports")
+            val id = emails.enqueue("alice@example.com", stringCodec)
+
+            val fromQueue = assertNotNull(emails.jobDetails(id, stringCodec))
+            assertEquals("alice@example.com", fromQueue.payload)
+            assertEquals(""""alice@example.com"""", fromQueue.payloadJson)
+            assertEquals("codec-emails", fromQueue.queue)
+            assertNull(
+                reports.jobDetails(id, stringCodec),
+                "the codec overload is scoped to its queue like the raw one",
+            )
+
+            val fromDatabase = assertNotNull(db.jobDetails(id, stringCodec))
+            assertEquals("alice@example.com", fromDatabase.payload)
+            assertEquals(""""alice@example.com"""", fromDatabase.payloadJson)
+
+            val snapshot = emails.getJob(id).orElseThrow()
+            assertEquals("alice@example.com", snapshot.details(stringCodec).payload)
+            assertEquals(""""alice@example.com"""", snapshot.details().payload)
+
+            val claimed = emails.claimOne("codec-worker").orElseThrow()
+            val decoded = claimed.details(stringCodec)
+            assertEquals("alice@example.com", decoded.payload)
+            assertEquals(""""alice@example.com"""", decoded.payloadJson)
+            assertEquals("processing", decoded.state)
+            assertEquals("codec-worker", decoded.workerId)
+            // The raw overload on the same job leaves the payload as JSON.
+            assertEquals(""""alice@example.com"""", claimed.details().payload)
+
+            assertTrue(claimed.ack())
+            assertNull(db.jobDetails(id, stringCodec))
+        }
+    }
+
+    @Test
+    fun retriedJobDetailsDropBackToPendingWithNoWorker() {
+        honker(tmp.resolve("retried.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { db ->
+            val queue = db.queue("retries", queueOptions {
+                visibilityTimeout(Duration.ofSeconds(60))
+                maxAttempts(3)
+            })
+            val id = queue.enqueueJson("""{"n":1}""")
+
+            val claimed = queue.claimOne("worker-a").orElseThrow()
+            val processing = assertNotNull(queue.jobDetails(id))
+            assertEquals("processing", processing.state)
+            assertEquals("worker-a", processing.workerId)
+            assertNotNull(processing.claimExpiresAt, "a claimed job has a claim deadline")
+
+            val retriedBefore = unixNow(db)
+            assertTrue(claimed.retry(Duration.ofSeconds(45), "boom"))
+            val retriedAfter = unixNow(db)
+
+            // The only path where a non-null worker and claim deadline go
+            // back to null on the same row.
+            val pending = assertNotNull(queue.jobDetails(id))
+            assertEquals("pending", pending.state)
+            assertNull(pending.workerId, "a retried job releases its worker")
+            assertNull(pending.claimExpiresAt, "a retried job releases its claim deadline")
+            assertEquals(1, pending.attempts, "the spent attempt still counts")
+            assertEquals(3, pending.maxAttempts)
+            assertEquals(processing.createdAt, pending.createdAt)
+            assertBetween(pending.runAt, retriedBefore + 45, retriedAfter + 45, "runAt")
+        }
+    }
+
+    @Test
+    fun deadLetteredJobDetailsAreGoneFromBothLookups() {
+        honker(tmp.resolve("dead.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }.use { db ->
+            val queue = db.queue("dead-letters", queueOptions {
+                visibilityTimeout(Duration.ofSeconds(60))
+                maxAttempts(1)
+            })
+            val id = queue.enqueueJson("""{"n":1}""")
+
+            val claimed = queue.claimOne("worker-b").orElseThrow()
+            assertEquals("processing", assertNotNull(queue.jobDetails(id)).state)
+
+            assertTrue(claimed.fail("nope"))
+            assertNull(queue.jobDetails(id), "a dead-lettered job leaves no live row")
+            assertNull(db.jobDetails(id), "the global lookup does not see dead letters either")
+        }
+    }
+
+    @Test
     // `runBlocking<Unit>` is deliberate: an expression-bodied test whose
     // last expression is not Unit compiles to a non-void method and JUnit
     // silently never runs it.

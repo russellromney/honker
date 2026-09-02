@@ -80,11 +80,17 @@ does not match the queue's type. `Database.jobDetails(id)` is the global
 lookup.
 
 Pass a `JsonCodec<T>` — or use a `TypedQueue<T>` — to get the payload
-decoded:
+decoded. Both give the same `JobDetails<T>`; `payloadJson` is always the
+raw row text either way:
 
 ```kotlin
 val typed = db.queue("emails").typed(strings)
 val details: JobDetails<String>? = typed.jobDetails(id)
+
+// Same thing without a typed queue. The codec overload exists on
+// `Queue.jobDetails`, `Database.jobDetails`, `Job.details` and
+// `JobSnapshot.details`.
+val same: JobDetails<String>? = db.queue("emails").jobDetails(id, strings)
 ```
 
 The payload type is a compile-time contract between the callers that
