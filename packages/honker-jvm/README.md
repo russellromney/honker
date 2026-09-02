@@ -92,12 +92,17 @@ A claimed `Job` carries every field the core returns for the row:
 `id`, `queue`, `payloadJson`, `state`, `priority`, `runAt`, `workerId`,
 `claimExpiresAt`, `attempts`, `maxAttempts`, `createdAt`, and `expiresAt`.
 The core JSON is snake_case; the accessors are camelCase. Times are unix
-epoch seconds. `workerId`, `claimExpiresAt` and `expiresAt` are `null`
-when the row has no value for them.
+epoch seconds. A claimed row always names its worker and carries a claim
+deadline, so `workerId()` and `claimExpiresAt()` are never `null` on a
+`Job`. Only `expiresAt()` is, and only when the job was enqueued without
+`expires`.
 
 `JobSnapshot` is the same data with no claim operations. Read one with
 `Queue.getJob(id)` (scoped to that queue) or `Database.getJob(id)`
-(global). It is empty once the job is ack'd or dead-lettered.
+(global). It is empty once the job is ack'd or dead-lettered. A snapshot
+can describe a pending row, so all three of `workerId()`,
+`claimExpiresAt()` and `expiresAt()` are `null` when the row has no value
+for them.
 
 ```java
 Queue emails = db.queue("emails");
@@ -117,7 +122,10 @@ emails.getJob(id);                        // Optional.empty()
 ```
 
 `TypedQueue.getJob(id)` returns a `TypedJobSnapshot<T>` with the payload
-already decoded.
+already decoded, and `TypedJob.snapshot()` hands out the same shape for a
+job you already claimed. `raw()` steps down a layer either way:
+`TypedJob.raw()` is the `Job`, `TypedJobSnapshot.raw()` is the
+`JobSnapshot`.
 
 Payload types are a compile-time contract between the callers that share
 a queue. Honker does not validate payload shape in the database, so every

@@ -2,6 +2,8 @@ package dev.honker;
 
 import java.time.Duration;
 
+import org.jspecify.annotations.Nullable;
+
 public final class TypedJob<T> {
     private final Job raw;
     private final JsonCodec<T> codec;
@@ -15,9 +17,13 @@ public final class TypedJob<T> {
         return raw;
     }
 
-    /** The read-only view of this job's row. */
-    public JobSnapshot snapshot() {
-        return raw.snapshot();
+    /**
+     * The read-only view of this job's row, with the payload decoded by
+     * this queue's codec. Use {@code raw().snapshot()} for the undecoded
+     * {@link JobSnapshot}.
+     */
+    public TypedJobSnapshot<T> snapshot() {
+        return TypedJobSnapshot.of(raw.snapshot(), codec);
     }
 
     /**
@@ -62,7 +68,7 @@ public final class TypedJob<T> {
         return raw.attempts();
     }
 
-    /** When this claim lapses, unix epoch seconds. */
+    /** When this claim lapses, unix epoch seconds. Always set on a claimed job. */
     public long claimExpiresAt() {
         return raw.claimExpiresAt();
     }
@@ -80,7 +86,7 @@ public final class TypedJob<T> {
      * When the job stops being claimable, unix epoch seconds, or
      * {@code null} when it was enqueued without {@code expires}.
      */
-    public Long expiresAt() {
+    public @Nullable Long expiresAt() {
         return raw.expiresAt();
     }
 

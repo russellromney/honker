@@ -1,5 +1,7 @@
 package dev.honker;
 
+import org.jspecify.annotations.Nullable;
+
 /**
  * A {@link JobSnapshot} whose payload is already decoded to {@code T}.
  *
@@ -35,11 +37,11 @@ public record TypedJobSnapshot<T>(JobSnapshot raw, T payload) {
         return raw.runAt();
     }
 
-    public String workerId() {
+    public @Nullable String workerId() {
         return raw.workerId();
     }
 
-    public Long claimExpiresAt() {
+    public @Nullable Long claimExpiresAt() {
         return raw.claimExpiresAt();
     }
 
@@ -55,7 +57,7 @@ public record TypedJobSnapshot<T>(JobSnapshot raw, T payload) {
         return raw.createdAt();
     }
 
-    public Long expiresAt() {
+    public @Nullable Long expiresAt() {
         return raw.expiresAt();
     }
 }

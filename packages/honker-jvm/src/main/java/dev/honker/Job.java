@@ -3,12 +3,19 @@ package dev.honker;
 import java.time.Duration;
 import java.util.Map;
 
+import org.jspecify.annotations.Nullable;
+
 /**
  * One job this worker holds a claim on.
  *
  * <p>Carries every field the core returns for the row (see
  * {@link #snapshot()}) plus the claim operations: ack, retry, fail and
  * heartbeat.
+ *
+ * <p>A claimed row always names its worker and carries a claim deadline,
+ * so {@link #workerId()} and {@link #claimExpiresAt()} are never null
+ * here. Only {@link #expiresAt()} can be. On a {@link JobSnapshot}, which
+ * can describe a pending row too, all three can be null.
  */
 public final class Job {
     private final Queue queueRef;
@@ -20,7 +27,16 @@ public final class Job {
     }
 
     static Job from(Queue queue, Map<String, Object> row) {
-        return new Job(queue, JobSnapshot.from(row));
+        JobSnapshot snapshot = JobSnapshot.from(row);
+        if (snapshot.workerId() == null || snapshot.claimExpiresAt() == null) {
+            // claimExpiresAt() below unboxes, and every accessor promises a
+            // held claim. A row without both is not one we hold, so say so
+            // rather than throwing a bare NullPointerException later.
+            throw new HonkerException(
+                "claimed job row from Honker has no worker_id or claim_expires_at: id=" + snapshot.id()
+            );
+        }
+        return new Job(queue, snapshot);
     }
 
     /** The read-only view of this job's row. */
@@ -66,7 +82,7 @@ public final class Job {
         return snapshot.workerId();
     }
 
-    /** When this claim lapses, unix epoch seconds. Never null on a claimed job. */
+    /** When this claim lapses, unix epoch seconds. Always set on a claimed job. */
     public long claimExpiresAt() {
         return snapshot.claimExpiresAt();
     }
@@ -88,7 +104,7 @@ public final class Job {
      * When the job stops being claimable, unix epoch seconds, or {@code null}
      * when it was enqueued without {@code expires}.
      */
-    public Long expiresAt() {
+    public @Nullable Long expiresAt() {
         return snapshot.expiresAt();
     }
 

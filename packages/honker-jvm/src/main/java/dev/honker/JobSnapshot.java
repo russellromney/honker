@@ -2,6 +2,8 @@ package dev.honker;
 
 import java.util.Map;
 
+import org.jspecify.annotations.Nullable;
+
 /**
  * A read-only view of one live job row, carrying every field the core
  * returns from {@code honker_claim_batch} and {@code honker_get_job}.
@@ -21,12 +23,12 @@ public record JobSnapshot(
     String state,
     int priority,
     long runAt,
-    String workerId,
-    Long claimExpiresAt,
+    @Nullable String workerId,
+    @Nullable Long claimExpiresAt,
     int attempts,
     int maxAttempts,
     long createdAt,
-    Long expiresAt
+    @Nullable Long expiresAt
 ) {
     /**
      * Decode {@link #payloadJson()} with {@code codec}.
