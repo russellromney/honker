@@ -27,9 +27,16 @@
   changes: every current caller keeps hitting `honker_cancel(job_id)`.
 - Tests cover both arities on one connection, the wrong-queue no-op on
   pending and processing rows (asserting the row is still live afterwards),
-  idempotence, the arity error, and the probe with and without the 2-arg
-  form — in honker-core against rusqlite, and again through the real
+  the owning queue cancelling a claimed row at both arities, idempotence,
+  the arity error, and the probe with and without the 2-arg form,
+  including that an unanswerable probe is an error and not a `false` —
+  in honker-core against rusqlite, and again through the real
   `.load libhonker_ext` path in `tests/test_extension_interop.py`.
+- The shared ORM surface (`scripts/proof/orm/surface.json`, replayed by
+  every documented ORM recipe in 11 languages) gains the scoped cancel
+  and the capability probe. That is what proves the new arity and
+  `pragma_function_list` work through each binding's own SQLite build,
+  not just through rusqlite and CPython's.
 
 ## 2026-08-27 — Node 0.5.1
 
