@@ -674,6 +674,12 @@ public:
         return std::move(jobs.front());
     }
 
+    /// Claim up to n jobs. Decoding is all-or-nothing: one unreadable
+    /// row throws and no Job comes back, even though the claim UPDATE
+    /// already ran on every row it matched. Those rows stay claimed and
+    /// carry a burnt attempt until their visibility timeout expires,
+    /// and the exception carries no ids, so treat it as a core bug and
+    /// not as a retryable condition.
     std::vector<Job> claim_batch(std::string_view worker_id, int64_t n) {
         const std::string w{worker_id};
         char* rows = honker_cpp_claim_batch(
@@ -733,8 +739,9 @@ public:
     /// Read a single job row by id as a decoded JobSnapshot. Returns
     /// nullopt on miss (ack'd, dead'd, or never existed).
     ///
-    /// NOT queue-scoped: job ids are globally unique and this lookup
-    /// hits any queue's row. Scoping is tracked in #134.
+    /// Today this lookup is not queue-scoped — job ids are globally
+    /// unique and it hits any queue's row. Whether it stays that way
+    /// is #134; do not depend on either answer.
     std::optional<JobSnapshot> get_job(int64_t job_id) {
         const std::string json = get_job_json(job_id);
         if (json.empty()) return std::nullopt;
