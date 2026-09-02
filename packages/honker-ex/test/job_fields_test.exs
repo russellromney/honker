@@ -16,6 +16,10 @@ defmodule HonkerJobFieldsTest do
   @visibility_s 11
   @delay_s 300
   @expires_s 900
+  # Row ids spent in setup so the first id a test sees is 21 — clear of
+  # attempts (0 or 1), priority (7), max_attempts (5), and the visibility
+  # timeout (11). See the setup block.
+  @id_burn 20
 
   @candidates [
     "target/debug/libhonker_ext.dylib",
@@ -50,6 +54,14 @@ defmodule HonkerJobFieldsTest do
         visibility_timeout_s: @visibility_s,
         max_attempts: @max_attempts
       )
+
+    # Burn a few row ids in an unrelated queue before any test enqueues.
+    # In a fresh database the first job has id == 1, and once claimed it
+    # also has attempts == 1, so `id: row["attempts"]` in row_to_job/1
+    # passed every assertion in this file. Ids are unique across the whole
+    # database, so spending them here pushes id clear of attempts,
+    # priority, and max_attempts. Nothing ever claims from "decoys".
+    for _ <- 1..@id_burn, do: {:ok, _} = Queue.enqueue(db, "decoys", %{"burn" => true})
 
     on_exit(fn ->
       Honker.close(db)
