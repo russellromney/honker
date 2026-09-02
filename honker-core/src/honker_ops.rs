@@ -87,6 +87,114 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
     rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(e.to_string())))
 }
 
+/// Run `body` inside `SAVEPOINT <name>` and undo it if anything fails.
+///
+/// Five honker operations destroy a row and then do more work with what
+/// came back: `DELETE ... RETURNING` decodes the returned columns, and
+/// the dead-letter paths follow the DELETE with an INSERT into
+/// `_honker_dead`. Measured on issue #133: without a savepoint a failure
+/// in that second half leaves the DELETE committed and the job in
+/// neither `_honker_live` nor `_honker_dead` — silent job loss.
+///
+/// SAVEPOINT rather than BEGIN/COMMIT: these functions run inside the
+/// caller's statement and the caller may already hold a transaction.
+/// SAVEPOINT nests; BEGIN does not.
+///
+/// The error handling is the point, so it is spelled out:
+///
+///   * The undo result is never discarded. A connection left in an
+///     unknown state has to be loud, and swallowing it is the exact bug
+///     #133 is about.
+///   * `body`'s error wins when the undo also fails — it is the cause —
+///     and the undo failure is appended to its message rather than
+///     replacing it.
+///   * If RELEASE fails, the transaction this savepoint opened is still
+///     open. We undo it before returning, so a caller never gets an
+///     error *and* a connection silently left mid-transaction. Bindings
+///     hold long-lived connections; every later call would otherwise
+///     join that transaction.
+fn in_savepoint<T>(
+    conn: &Connection,
+    name: &str,
+    body: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    // True means this SAVEPOINT is what opens the transaction, so we
+    // own it and nobody else's work is inside it.
+    let owns_transaction = conn.is_autocommit();
+    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    match body() {
+        Ok(value) => match conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
+            Ok(()) => Ok(value),
+            // RELEASE of the outermost savepoint is the COMMIT. If it
+            // fails (a lock conflict on a rollback-journal database,
+            // say) the write is not durable, so roll it back instead of
+            // leaving it dangling.
+            Err(release_err) => Err(undo_savepoint(conn, name, owns_transaction, release_err)),
+        },
+        Err(body_err) => Err(undo_savepoint(conn, name, owns_transaction, body_err)),
+    }
+}
+
+/// Undo the savepoint opened by [`in_savepoint`] and return the error to
+/// hand back to the caller.
+fn undo_savepoint(
+    conn: &Connection,
+    name: &str,
+    owns_transaction: bool,
+    cause: rusqlite::Error,
+) -> rusqlite::Error {
+    if conn.is_autocommit() {
+        // SQLite already rolled the whole transaction back on its own —
+        // an ABORT, SQLITE_FULL or an I/O error does that. There is no
+        // savepoint left to roll back to, and issuing one would turn a
+        // clean state into a bogus second error.
+        return cause;
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // Undo our own frame and pop it, leaving any outer transaction the
+    // caller opened untouched. This is also the form that is legal from
+    // inside a scalar function: every one of these operations is reached
+    // as `SELECT honker_*(...)`, and SQLite refuses a bare
+    // COMMIT/ROLLBACK while the outer statement is still stepping.
+    if let Err(err) = conn.execute_batch(&format!(
+        "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+    )) {
+        failures.push(format!("ROLLBACK TO SAVEPOINT {name} failed: {err}"));
+    }
+
+    // For the outermost savepoint that RELEASE is the COMMIT, so it can
+    // fail exactly the way the first one did (a lock conflict on a
+    // rollback-journal database). If we opened the transaction, nobody
+    // else's work is inside it and a plain ROLLBACK is the way out.
+    // Without this the caller gets an error *and* a connection silently
+    // left mid-transaction — bindings hold long-lived connections, so
+    // every later call would join it.
+    if owns_transaction && !conn.is_autocommit() {
+        match conn.execute_batch("ROLLBACK") {
+            // Back to a known state: nothing was committed and the
+            // connection is out of the transaction. Whatever went wrong
+            // above is no longer an unknown state, so don't dress the
+            // caller's error up with it.
+            Ok(()) => failures.clear(),
+            Err(err) => failures.push(format!("ROLLBACK failed: {err}")),
+        }
+    }
+
+    if failures.is_empty() {
+        return cause;
+    }
+    // Never swallow a failed undo: the connection is in an unknown state
+    // and that has to be loud. Keep the cause's text intact — callers
+    // and tests match on it — and append what else went wrong.
+    to_sql_err(format!(
+        "{cause}; additionally, undoing SAVEPOINT {name} left the connection \
+         in an unknown state: {}",
+        failures.join("; ")
+    ))
+}
+
 /// Register all `honker_*` honker scalar functions on `conn`. Idempotent
 /// per-connection: creating the same function twice is a rusqlite
 /// error, so call exactly once per connection.
@@ -605,7 +713,20 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 /// processing with an expired visibility timeout. In-flight claims
 /// that still hold a valid timeout are left alone so the holder can
 /// still ack / retry / fail.
+///
+/// Runs in a SAVEPOINT. The DELETE uses RETURNING and the rows are only
+/// decoded and re-inserted afterwards, so a decode or INSERT failure
+/// would otherwise leave the whole matching batch in neither table.
+/// Measured before the fix: one bad `attempts` value lost every row the
+/// DELETE matched (live=0, dead=0 for all of them). This one runs on
+/// every ordinary claim, so it is the most reachable of the five.
 fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+    in_savepoint(conn, "honker_dead_letter_claimable", || {
+        dead_letter_exhausted_claimable_inner(conn, queue)
+    })
+}
+
+fn dead_letter_exhausted_claimable_inner(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
     let mut select = conn.prepare_cached(
         "DELETE FROM _honker_live
          WHERE queue = ?1
@@ -663,6 +784,11 @@ pub fn claim_batch(
     // shares the caller's transaction with the claim UPDATE below.
     dead_letter_exhausted_claimable(conn, queue)?;
 
+    // No SAVEPOINT around this one. It is an UPDATE, not a DELETE: a
+    // decode failure in the mapper below leaves the row in
+    // `_honker_live` with `attempts` bumped and the claim held, so the
+    // job is still there and becomes reclaimable when the visibility
+    // timeout expires. Nothing is lost, so there is nothing to undo.
     let mut stmt = conn.prepare_cached(
         "UPDATE _honker_live
          SET state = 'processing',
@@ -709,6 +835,10 @@ pub fn claim_batch(
     Ok(Value::Array(out).to_string())
 }
 
+/// Batch ack. No SAVEPOINT, unlike the dead-letter paths: this DELETE
+/// is the whole operation. `RETURNING id` is only counted, never
+/// decoded into Rust, and nothing runs after it that could fail and
+/// strand the deleted rows. The jobs are meant to be gone.
 pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
     let mut stmt = conn.prepare_cached(
         "DELETE FROM _honker_live
@@ -870,27 +1000,33 @@ pub fn retry(
         return Ok(0);
     };
     if attempts >= max_attempts {
-        conn.execute(
-            "DELETE FROM _honker_live WHERE id = ?1",
-            rusqlite::params![id],
-        )?;
-        conn.execute(
-            "INSERT INTO _honker_dead
-               (id, queue, payload, priority, run_at, max_attempts,
-                attempts, last_error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                id,
-                queue,
-                payload,
-                priority,
-                run_at,
-                max_attempts,
-                attempts,
-                error,
-                created_at
-            ],
-        )?;
+        // DELETE then INSERT as two statements: without a savepoint a
+        // failing INSERT leaves the job in neither table. Measured on
+        // this branch before the fix: live=0, dead=0.
+        in_savepoint(conn, "honker_retry_dead_letter", || {
+            conn.execute(
+                "DELETE FROM _honker_live WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            conn.execute(
+                "INSERT INTO _honker_dead
+                   (id, queue, payload, priority, run_at, max_attempts,
+                    attempts, last_error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    id,
+                    queue,
+                    payload,
+                    priority,
+                    run_at,
+                    max_attempts,
+                    attempts,
+                    error,
+                    created_at
+                ],
+            )?;
+            Ok(())
+        })?;
     } else {
         conn.execute(
             "UPDATE _honker_live
@@ -915,19 +1051,12 @@ pub fn retry(
 /// `attempts`, say — would otherwise leave the job in neither
 /// `_honker_live` nor `_honker_dead`: silent job loss. Verified: an
 /// error out of the mapper alone does NOT undo the DELETE. So the
-/// delete-decode-insert runs inside a SAVEPOINT and any error rolls
-/// it back before propagating. SAVEPOINT rather than BEGIN/COMMIT so
-/// we nest cleanly when the caller already holds a transaction.
+/// delete-decode-insert runs inside [`in_savepoint`], which rolls it
+/// back before propagating.
 pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rusqlite::Result<i64> {
-    conn.execute_batch("SAVEPOINT honker_fail")?;
-    let result = fail_inner(conn, job_id, worker_id, error);
-    if result.is_err() {
-        let _ =
-            conn.execute_batch("ROLLBACK TO SAVEPOINT honker_fail; RELEASE SAVEPOINT honker_fail");
-        return result;
-    }
-    conn.execute_batch("RELEASE SAVEPOINT honker_fail")?;
-    result
+    in_savepoint(conn, "honker_fail", || {
+        fail_inner(conn, job_id, worker_id, error)
+    })
 }
 
 fn fail_inner(
@@ -1103,7 +1232,18 @@ pub fn heartbeat(
 
 /// Move expired-pending rows from `_honker_live` to `_honker_dead`
 /// with `last_error='expired'`. Returns count moved.
+///
+/// Runs in a SAVEPOINT for the same reason as
+/// `dead_letter_exhausted_claimable`: DELETE ... RETURNING, then decode,
+/// then INSERT. Measured before the fix: a decode failure and a failing
+/// dead-table INSERT both gave live=0, dead=0.
 pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+    in_savepoint(conn, "honker_sweep_expired", || {
+        sweep_expired_inner(conn, queue)
+    })
+}
+
+fn sweep_expired_inner(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
     let mut select = conn.prepare_cached(
         "DELETE FROM _honker_live
          WHERE queue = ?1
@@ -1928,7 +2068,10 @@ mod real_arg_tests {
 // make the row mapper fail on a row that really exists.
 #[cfg(test)]
 mod optional_error_tests {
-    use super::{fail, get_job, lock_acquire, result_get, retry};
+    use super::{
+        claim_batch, fail, get_job, in_savepoint, lock_acquire, result_get, retry, sweep_expired,
+        to_sql_err,
+    };
     use crate::{attach_honker_functions, bootstrap_honker_schema};
     use rusqlite::Connection;
 
@@ -2104,6 +2247,455 @@ mod optional_error_tests {
             caller_row, 1,
             "ROLLBACK TO SAVEPOINT must not discard work the caller did before fail()"
         );
+    }
+
+    // ---------------- dead-letter savepoints ----------------
+    //
+    // Four operations do delete-then-more-work. Only `fail()` was
+    // covered before; the other three were measured losing the job the
+    // same way (issue #133 / PR #138 review):
+    //
+    //   claim_batch -> dead_letter_exhausted_claimable  live=0, dead=0
+    //   retry()'s dead-letter branch                    live=0, dead=0
+    //   sweep_expired                                   live=0, dead=0
+
+    /// Make every INSERT into `_honker_dead` fail. Stands in for a
+    /// constraint violation or an I/O error on the second half of a
+    /// dead-letter move.
+    fn block_dead_inserts(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TRIGGER test_block_dead BEFORE INSERT ON _honker_dead
+             BEGIN SELECT RAISE(ABORT, 'dead insert blocked'); END",
+        )
+        .unwrap();
+    }
+
+    /// A pending, due job whose `attempts` cannot be decoded. Text
+    /// compares greater than any integer in SQLite, so it also matches
+    /// `attempts >= max_attempts` and lands in the dead-letter sweep.
+    fn undecodable_pending_job(conn: &Connection) -> i64 {
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        corrupt_attempts(conn, id);
+        id
+    }
+
+    /// A due job that has already used its whole attempt budget, so an
+    /// ordinary claim dead-letters it.
+    fn exhausted_pending_job(conn: &Connection) -> i64 {
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 1, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("UPDATE _honker_live SET attempts = 1 WHERE id = ?1", [id])
+            .unwrap();
+        id
+    }
+
+    // The hot path: no fail() call involved, an ordinary claim triggers
+    // it. Before the savepoint this returned the decode error with the
+    // job gone from both tables.
+    #[test]
+    fn claim_batch_rolls_back_a_dead_letter_decode_failure() {
+        let conn = db();
+        let id = undecodable_pending_job(&conn);
+        let err = claim_batch(&conn, "emails", "w1", 8, 300)
+            .expect_err("a non-integer attempts column must reach the caller");
+        assert!(
+            err.to_string().contains("attempts"),
+            "expected the error to name the bad column, got: {err}"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "the dead-letter DELETE must roll back: the job has to stay in \
+             _honker_live, not vanish from both tables"
+        );
+        assert_eq!(dead_count(&conn, id), 0, "and it must not be half-moved");
+    }
+
+    // The DELETE takes the whole matching set before anything is
+    // decoded, so one bad row used to lose every job beside it.
+    #[test]
+    fn claim_batch_dead_letter_keeps_the_whole_batch() {
+        let conn = db();
+        let bad = undecodable_pending_job(&conn);
+        let neighbour = undecodable_pending_job(&conn);
+        let _ = claim_batch(&conn, "emails", "w1", 8, 300)
+            .expect_err("a non-integer attempts column must reach the caller");
+        assert_eq!(
+            (live_count(&conn, bad), live_count(&conn, neighbour)),
+            (1, 1),
+            "one undecodable row must not take the rest of the batch with it"
+        );
+    }
+
+    #[test]
+    fn claim_batch_rolls_back_when_the_dead_insert_fails() {
+        let conn = db();
+        let id = exhausted_pending_job(&conn);
+        block_dead_inserts(&conn);
+        let err = claim_batch(&conn, "emails", "w1", 8, 300)
+            .expect_err("a failing _honker_dead INSERT must reach the caller");
+        assert!(
+            err.to_string().contains("dead insert blocked"),
+            "expected the trigger's message, got: {err}"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "the DELETE must roll back when the dead-table INSERT fails"
+        );
+        assert_eq!(dead_count(&conn, id), 0);
+    }
+
+    // A genuine claim must be untouched by the savepoint: the exhausted
+    // job still dead-letters, the healthy one is still handed out.
+    #[test]
+    fn claim_batch_still_dead_letters_and_claims_normally() {
+        let conn = db();
+        let exhausted = exhausted_pending_job(&conn);
+        let fresh: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let claimed = claim_batch(&conn, "emails", "w1", 8, 300).unwrap();
+        assert_eq!(live_count(&conn, exhausted), 0);
+        assert_eq!(dead_count(&conn, exhausted), 1);
+        assert!(
+            claimed.contains(&format!("\"id\":{fresh}")),
+            "the healthy job must still be claimed, got: {claimed}"
+        );
+    }
+
+    // retry()'s dead-letter branch: DELETE then INSERT as two
+    // statements. Measured before the fix: live=0, dead=0.
+    #[test]
+    fn retry_rolls_back_the_dead_letter_when_the_insert_fails() {
+        let conn = db();
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 1, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let _: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('emails', 'w1', 8, 300)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        block_dead_inserts(&conn);
+        let err = retry(&conn, id, "w1", 10, "boom")
+            .expect_err("a failing _honker_dead INSERT must reach the caller");
+        assert!(
+            err.to_string().contains("dead insert blocked"),
+            "expected the trigger's message, got: {err}"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "retry() must not destroy the job in a way fail() no longer can"
+        );
+        assert_eq!(dead_count(&conn, id), 0);
+    }
+
+    #[test]
+    fn retry_still_dead_letters_an_exhausted_job() {
+        let conn = db();
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 1, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let _: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('emails', 'w1', 8, 300)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry(&conn, id, "w1", 10, "boom").unwrap(), 1);
+        assert_eq!(live_count(&conn, id), 0);
+        assert_eq!(dead_count(&conn, id), 1);
+    }
+
+    // sweep_expired: same DELETE ... RETURNING then decode then INSERT.
+    #[test]
+    fn sweep_expired_rolls_back_a_decode_failure() {
+        let conn = db();
+        let id = undecodable_pending_job(&conn);
+        conn.execute(
+            "UPDATE _honker_live SET expires_at = unixepoch() - 10 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        let err = sweep_expired(&conn, "emails")
+            .expect_err("a non-integer attempts column must reach the caller");
+        assert!(
+            err.to_string().contains("attempts"),
+            "expected the error to name the bad column, got: {err}"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "the sweep's DELETE must roll back, not lose the job"
+        );
+        assert_eq!(dead_count(&conn, id), 0);
+    }
+
+    #[test]
+    fn sweep_expired_rolls_back_when_the_dead_insert_fails() {
+        let conn = db();
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE _honker_live SET expires_at = unixepoch() - 10 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        block_dead_inserts(&conn);
+        let err = sweep_expired(&conn, "emails")
+            .expect_err("a failing _honker_dead INSERT must reach the caller");
+        assert!(
+            err.to_string().contains("dead insert blocked"),
+            "expected the trigger's message, got: {err}"
+        );
+        assert_eq!(live_count(&conn, id), 1);
+        assert_eq!(dead_count(&conn, id), 0);
+    }
+
+    // Genuine misses must still be misses, not errors, at every site
+    // that gained a savepoint.
+    #[test]
+    fn savepoint_sites_still_report_a_genuine_miss() {
+        let conn = db();
+        assert_eq!(
+            sweep_expired(&conn, "emails").unwrap(),
+            0,
+            "nothing expired is 0, not an error"
+        );
+        assert_eq!(
+            claim_batch(&conn, "emails", "w1", 8, 300).unwrap(),
+            "[]",
+            "an empty queue claims nothing, without erroring"
+        );
+        assert_eq!(
+            retry(&conn, 999_999, "w1", 10, "boom").unwrap(),
+            0,
+            "a job id that was never enqueued must return 0"
+        );
+        assert_eq!(fail(&conn, 999_999, "w1", "boom").unwrap(), 0);
+        assert!(
+            conn.is_autocommit(),
+            "no savepoint may be left on the stack"
+        );
+    }
+
+    // ---------------- through the SQL functions ----------------
+    //
+    // `SELECT honker_*(...)` is the only path bindings and ORM users
+    // take, and it is the one the savepoints have to survive: the outer
+    // statement is still stepping while the scalar function runs
+    // SAVEPOINT / ROLLBACK TO on the same connection. Nothing pinned
+    // that before.
+
+    #[test]
+    fn sql_honker_fail_rolls_back_through_the_scalar_function() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        corrupt_attempts(&conn, id);
+        let err = conn
+            .query_row("SELECT honker_fail(?1, 'w1', 'boom')", [id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect_err("the decode error must surface through the SQL function too");
+        assert!(
+            err.to_string().contains("attempts"),
+            "expected the error to name the bad column, got: {err}"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "SAVEPOINT rollback from inside a scalar function must still \
+             put the job back"
+        );
+        assert_eq!(dead_count(&conn, id), 0);
+        assert!(
+            conn.is_autocommit(),
+            "no transaction may be left open on the caller's connection"
+        );
+    }
+
+    #[test]
+    fn sql_honker_fail_still_works_on_the_healthy_path() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        let moved: i64 = conn
+            .query_row("SELECT honker_fail(?1, 'w1', 'boom')", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, 1);
+        assert_eq!(live_count(&conn, id), 0);
+        assert_eq!(dead_count(&conn, id), 1);
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn sql_honker_claim_batch_rolls_back_the_dead_letter_sweep() {
+        let conn = db();
+        let id = undecodable_pending_job(&conn);
+        let err = conn
+            .query_row(
+                "SELECT honker_claim_batch('emails', 'w1', 8, 300)",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .expect_err("the decode error must surface through the SQL function too");
+        assert!(
+            err.to_string().contains("attempts"),
+            "expected the error to name the bad column, got: {err}"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "the dead-letter sweep must roll back on the binding path too"
+        );
+        assert_eq!(dead_count(&conn, id), 0);
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn sql_honker_sweep_expired_rolls_back() {
+        let conn = db();
+        let id = undecodable_pending_job(&conn);
+        conn.execute(
+            "UPDATE _honker_live SET expires_at = unixepoch() - 10 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        let err = conn
+            .query_row("SELECT honker_sweep_expired('emails')", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect_err("the decode error must surface through the SQL function too");
+        assert!(err.to_string().contains("attempts"), "got: {err}");
+        assert_eq!(live_count(&conn, id), 1);
+        assert_eq!(dead_count(&conn, id), 0);
+        assert!(conn.is_autocommit());
+    }
+
+    // ---------------- in_savepoint itself ----------------
+
+    // Defect 4 from the review: the old code did
+    // `let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT ...")`, so a
+    // failed rollback left the connection in an unknown state with no
+    // signal. The rollback failure has to be reported *and* the original
+    // cause has to survive, since callers match on its text.
+    #[test]
+    fn in_savepoint_reports_a_rollback_failure_without_losing_the_cause() {
+        let conn = db();
+        // An outer transaction, so in_savepoint nests and undoes with
+        // ROLLBACK TO SAVEPOINT rather than a plain ROLLBACK.
+        conn.execute_batch("BEGIN").unwrap();
+        let err = in_savepoint(&conn, "honker_test_sp", || {
+            // The frame is gone before the body fails, so the rollback
+            // below cannot succeed.
+            conn.execute_batch("RELEASE SAVEPOINT honker_test_sp")?;
+            Err::<(), _>(to_sql_err("original cause"))
+        })
+        .expect_err("the body error must still reach the caller");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("original cause"),
+            "the original error must not be lost, got: {msg}"
+        );
+        assert!(
+            msg.contains("ROLLBACK TO SAVEPOINT honker_test_sp failed"),
+            "a failed rollback must be reported, not discarded, got: {msg}"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+
+    // Defect 5 from the review: RELEASE of the outermost savepoint is
+    // the COMMIT. When it failed, fail() returned the error with the
+    // transaction it opened still open — is_autocommit() == false, and
+    // the connection's own reads claimed the job had been dead-lettered.
+    // Bindings hold long-lived connections, so every later call would
+    // join that transaction.
+    //
+    // Reproduced with a rollback-journal database and a second
+    // connection holding a read transaction, which is the configuration
+    // honker documents supporting for ORM users.
+    #[test]
+    fn fail_leaves_no_open_transaction_when_release_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "honker-release-fail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("honker.db");
+        let _ = std::fs::remove_file(&path);
+
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode = delete; PRAGMA busy_timeout = 0;")
+            .unwrap();
+        attach_honker_functions(&writer).unwrap();
+        bootstrap_honker_schema(&writer).unwrap();
+        let id = claimed_job(&writer);
+
+        // A concurrent read transaction blocks the writer's commit.
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("PRAGMA busy_timeout = 0; BEGIN;")
+            .unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+
+        let err = fail(&writer, id, "w1", "boom")
+            .expect_err("the blocked commit must reach the caller as an error");
+        assert!(
+            err.to_string().contains("locked") || err.to_string().contains("busy"),
+            "expected a lock conflict, got: {err}"
+        );
+        assert!(
+            writer.is_autocommit(),
+            "a failed RELEASE must not leave the caller inside the transaction \
+             fail() opened; the connection is long-lived and every later call \
+             would silently join it"
+        );
+        assert_eq!(
+            live_count(&writer, id),
+            1,
+            "the job must not read as dead-lettered after a commit that failed"
+        );
+        assert_eq!(dead_count(&writer, id), 0);
+
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------------- get_job ----------------
