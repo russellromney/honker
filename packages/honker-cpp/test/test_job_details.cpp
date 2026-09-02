@@ -485,6 +485,17 @@ void test_decode_rejects_a_missing_required_field() {
         [] { (void)honker::JobSnapshot::from_json(json::array({1, 2})); },
         "not a JSON object", "snapshot from a JSON array");
 
+    // The nullable helpers are nullable, not tolerant. Without their own
+    // object check they read nullopt off any non-object, which would let
+    // a garbage row decode as "every optional field is unset" the moment
+    // a required field stops being read first.
+    expect_honker_error(
+        [] { (void)honker::detail::row_opt_i64(json::array({1}), "expires_at", "job row"); },
+        "not a JSON object", "row_opt_i64 on a row that is not an object");
+    expect_honker_error(
+        [] { (void)honker::detail::row_opt_str(json("nope"), "worker_id", "job row"); },
+        "not a JSON object", "row_opt_str on a row that is not an object");
+
     std::cout << "decode_rejects_a_missing_required_field: ok\n";
 }
 

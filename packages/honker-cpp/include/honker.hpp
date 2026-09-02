@@ -410,8 +410,15 @@ inline std::string row_str(const nlohmann::json& j, const char* key, const char*
     return row_get<std::string>(row_field(j, key, what), key, what, "a string");
 }
 
+/// A genuinely nullable key: absent or null means std::nullopt, never
+/// 0 or "". The row still has to be an object — otherwise every
+/// nullable field on a garbage row would silently read as null, which
+/// is the tolerant lookup this file exists to avoid.
 inline std::optional<int64_t> row_opt_i64(
     const nlohmann::json& j, const char* key, const char* what) {
+    if (!j.is_object()) {
+        throw Error{std::string{what} + " is not a JSON object"};
+    }
     const auto it = j.find(key);
     if (it == j.end() || it->is_null()) return std::nullopt;
     return row_get<int64_t>(*it, key, what, "an integer");
@@ -419,6 +426,9 @@ inline std::optional<int64_t> row_opt_i64(
 
 inline std::optional<std::string> row_opt_str(
     const nlohmann::json& j, const char* key, const char* what) {
+    if (!j.is_object()) {
+        throw Error{std::string{what} + " is not a JSON object"};
+    }
     const auto it = j.find(key);
     if (it == j.end() || it->is_null()) return std::nullopt;
     return row_get<std::string>(*it, key, what, "a string");
