@@ -120,6 +120,9 @@ public sealed class JobDetailTests
         Assert.NotNull(row);
         Assert.Equal("pending", row!.State);
         Assert.InRange(row.RunAt, before + 60, after + 60);
+        // No ExpiresSeconds was given, so this has to be null, not 0.
+        // Every other test here enqueues with an expiry.
+        Assert.Null(row.ExpiresAt);
         Assert.Null(queue.ClaimOne("early-worker"));
     }
 
