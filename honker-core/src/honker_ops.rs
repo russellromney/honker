@@ -2075,6 +2075,52 @@ mod payload_tests {
         assert_eq!(stored, "{}", "rejected payload must not be written");
     }
 
+    /// The stricter parse also bounds nesting, which the structural scan did
+    /// not -- 50,000 nested arrays used to enqueue. A consumer decoding with
+    /// `serde_json` hits the same bound, so accepting these was the same
+    /// undecodable-job bug in a third shape.
+    ///
+    /// Deliberately does not pin the exact limit: `serde_json` owns that
+    /// number and may move it. 4096 is far enough past any plausible limit to
+    /// stay a rejection, and 32 is shallow enough to stay accepted.
+    #[test]
+    fn enqueue_rejects_nesting_deeper_than_the_decoder_accepts() {
+        let conn = db();
+        let payload = format!("{}{}", "[".repeat(4096), "]".repeat(4096));
+        let result = conn.query_row(
+            "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+            [payload.as_str()],
+            |r| r.get::<_, i64>(0),
+        );
+        assert_undecodable_payload_error(result, "4096 nested arrays");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    /// The guard against over-tightening: ordinary nesting must still enqueue.
+    #[test]
+    fn enqueue_accepts_ordinary_nesting() {
+        let conn = db();
+        let payload = format!("{}{}", "[".repeat(32), "]".repeat(32));
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+                [payload.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT payload FROM _honker_live WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, payload);
+    }
+
     #[test]
     fn scheduler_update_accepts_every_json_payload_shape() {
         let conn = db();
