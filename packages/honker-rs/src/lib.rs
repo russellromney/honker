@@ -183,6 +183,16 @@ impl Database {
     /// Get a named queue handle whose payload type is
     /// `serde_json::Value`. Defaults: 300s visibility timeout,
     /// 3 max attempts.
+    ///
+    /// **For your own payload type, use
+    /// [`typed_queue`](Database::typed_queue) — not this method.**
+    /// `queue` is deliberately non-generic so that
+    /// `let q = db.queue(..)` keeps inferring, which means
+    /// `db.queue::<Email>(..)` is a compile error ("method takes 0
+    /// generic arguments") and `let q: Queue<Email> = db.queue(..)`
+    /// is a type mismatch. Neither message will point you here.
+    /// Reach for `db.typed_queue::<Email>(..)`, or
+    /// [`Queue::typed`] on a handle you already hold.
     pub fn queue(&self, name: &str, opts: QueueOpts) -> Queue {
         self.typed_queue(name, opts)
     }
@@ -498,6 +508,12 @@ pub struct EnqueueOpts {
 /// A named queue handle. `T` is the payload type this handle
 /// enqueues and decodes; it defaults to `serde_json::Value`.
 ///
+/// Build one with [`Database::queue`] for the `serde_json::Value`
+/// default, or [`Database::typed_queue`] / [`Queue::typed`] for your
+/// own type. A default type parameter cannot live on a function, so
+/// `Database::queue` is not generic and there is a separate
+/// constructor rather than one inferring `queue::<T>()`.
+///
 /// The parameter is compile-time only. honker does not validate
 /// payload shape in the database — see the crate docs.
 pub struct Queue<T = serde_json::Value> {
@@ -653,6 +669,19 @@ impl<T> Queue<T> {
     /// re-encoded or re-validated — rows already on disk are
     /// untouched, and a mismatched `U` only surfaces as a `serde`
     /// error when you call `payload_typed()`.
+    ///
+    /// This is also how a generic helper keeps taking a plain
+    /// `&Queue` after `enqueue` narrowed to `&T`: change the body,
+    /// not the signature, so the helper's own call sites are
+    /// untouched.
+    ///
+    /// ```no_run
+    /// # use honker::{EnqueueOpts, Queue};
+    /// # use serde::Serialize;
+    /// fn helper<P: Serialize>(q: &Queue, p: &P) -> honker::Result<i64> {
+    ///     q.typed::<P>().enqueue(p, EnqueueOpts::default())
+    /// }
+    /// ```
     pub fn typed<U>(&self) -> Queue<U> {
         Queue {
             inner: self.inner.clone(),

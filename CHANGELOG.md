@@ -33,6 +33,14 @@
   `db.typed_outbox::<T>()`, and `Queue::typed::<T>()` produce typed
   handles; `payload_typed()` decodes into the handle's `T` and the
   existing `payload_as::<U>()` still decodes into anything you name.
+  A default type parameter cannot go on a function, so `Database::queue`
+  stays non-generic (otherwise `let q = db.queue(..)` would stop
+  inferring) and `typed_queue` is a separate constructor. The cost is
+  that `db.queue::<Email>(..)` is `error[E0107]: method takes 0 generic
+  arguments` — with a "remove the unnecessary generics" hint pointing
+  the wrong way — and `let q: Queue<Email> = db.queue(..)` is an E0308.
+  Neither message mentions `typed_queue`, so `Database::queue`'s and
+  `Queue`'s rustdoc now say where to go.
 - Payload encoding is unchanged: `Job::payload` stays raw JSON bytes and
   `JobRow::payload` stays a raw JSON string. The type parameter is
   compile-time only — honker never validates payload shape in the
@@ -50,12 +58,21 @@
   - Two different payload types through one handle — you now need one
     typed handle per type, or keep the handle at `serde_json::Value` and
     `serde_json::to_value(..)` at the call site.
-  - **A generic helper has no drop-in migration.**
-    `fn helper<P: Serialize>(q: &Queue, p: &P)` no longer compiles; the
-    signature must become `fn helper<P: Serialize>(q: &Queue<P>, p: &P)`,
-    which changes every call site of the helper too, not just the body.
-    If you cannot change the call sites, keep `q: &Queue` and pass
-    `&serde_json::to_value(p)?` instead.
+  - A generic helper, `fn helper<P: Serialize>(q: &Queue, p: &P)`, no
+    longer compiles as written, but the migration is body-only —
+    `Queue::typed` reinterprets the handle in place, so the signature
+    and every call site stay as they are:
+    ```rust
+    fn helper<P: Serialize>(q: &Queue, p: &P) -> honker::Result<i64> {
+        q.typed::<P>().enqueue(p, EnqueueOpts::default())
+    }
+    ```
+    `typed()` clones the handle (an `Arc` and the queue name); it does
+    not touch the database. Widening the signature to
+    `fn helper<P: Serialize>(q: &Queue<P>, p: &P)` also works but
+    changes the helper's call sites too, and
+    `q.enqueue(&serde_json::to_value(p)?, ..)` works at the cost of an
+    intermediate `Value`. Prefer `typed::<P>()`.
 - **Breaking (source), 2 of 2 — `JobRow` is no longer constructible with
   struct literal syntax.** `JobRow<T>` needs a private `PhantomData`
   field to carry `T`, and a private field disables struct literals

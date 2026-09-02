@@ -65,6 +65,23 @@ if let Some(job) = q.claim_one("worker-1")? {
 `payload_typed()` decodes into the queue's `T`; `payload_as::<U>()`
 decodes into anything you name. Both are plain `serde` deserialization.
 
+There is no `db.queue::<Email>(..)`. Rust cannot put a default on a
+function's type parameter, so making `queue` generic would break every
+bare `let q = db.queue(..)`; `typed_queue` is a separate constructor
+instead. `db.queue::<Email>(..)` therefore fails with `error[E0107]:
+method takes 0 generic arguments` and the compiler's "remove the
+unnecessary generics" hint points the wrong way — reach for
+`db.typed_queue::<Email>(..)` or `q.typed::<Email>()`.
+
+A generic helper that used to take a plain `&Queue` keeps its
+signature — and so its call sites — by reinterpreting inside the body:
+
+```rust
+fn helper<P: serde::Serialize>(q: &honker::Queue, p: &P) -> honker::Result<i64> {
+    q.typed::<P>().enqueue(p, EnqueueOpts::default())
+}
+```
+
 **honker never checks payload shape.** The type parameter is a
 compile-time convenience for your code only. The database stores the
 payload as opaque JSON text and nothing on the write path validates it,
