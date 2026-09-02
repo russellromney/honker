@@ -3,7 +3,11 @@ package dev.honker.kotlin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import org.junit.jupiter.api.Timeout.ThreadMode
 import org.junit.jupiter.api.io.TempDir
 import dev.honker.Database
 import dev.honker.HonkerInvalidOptionException
@@ -20,6 +24,10 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
+// The whole suite runs in well under a second. The cap exists so a flow
+// wrapper that stops producing fails by name instead of parking the
+// runner until the CI job's own 20-minute timeout kills it.
+@Timeout(value = 60, threadMode = ThreadMode.SEPARATE_THREAD)
 class HonkerKotlinTest {
     @TempDir
     lateinit var tmp: Path
@@ -310,6 +318,30 @@ class HonkerKotlinTest {
             assertEquals("scoped-emails", assertNotNull(db.jobDetails(id)).queue)
             assertNull(db.jobDetails(id + 10_000), "an unknown id has no snapshot")
         }
+    }
+
+    @Test
+    // `runBlocking<Unit>` is deliberate: an expression-bodied test whose
+    // last expression is not Unit compiles to a non-void method and JUnit
+    // silently never runs it.
+    fun queueFlowEndsWhenTheDatabaseClosesInsteadOfParkingTheCollector() = runBlocking<Unit> {
+        val db = honker(tmp.resolve("flow-close.db")) {
+            fallbackPollInterval(Duration.ofMillis(2))
+        }
+        val jobs = db.queue("flow-close").asFlow("flow-close-worker", workerOptions {
+            idlePollInterval(Duration.ofMillis(20))
+        })
+        val drained = async { runCatching { jobs.collect { } } }
+        delay(200)
+
+        // The producer thread is now inside its claim loop. Closing the
+        // database makes every call it depends on throw. It must end the
+        // flow — normally or with the failure — never leave the collector
+        // parked on a producer that already died.
+        db.close()
+        val finished = withTimeoutOrNull(15_000) { drained.await() }
+        drained.cancel()
+        assertNotNull(finished, "closing the database must end the queue flow")
     }
 
     private fun unixNow(db: Database): Long =
