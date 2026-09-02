@@ -166,3 +166,30 @@ def test_typed_payload_hints_do_not_validate_at_runtime(tmp_path):
     assert job.id == jid
     assert job.payload == {"totally": "different", "shape": [1, 2, 3]}
     assert job.ack() is True
+
+
+def test_claimed_job_reports_its_own_run_at_not_created_at(tmp_path):
+    """A claimed job must report `run_at`, not `created_at`.
+
+    Back-date `run_at` so the two fields differ while the job stays
+    claimable. A *delay* pushes `run_at` into the future, which makes the
+    job unclaimable — which is why `test_delayed_job_reports_its_run_at`
+    above cannot catch a swap of these two fields on the claimed path.
+    """
+    db = honker.open(str(tmp_path / "t.db"))
+    q = db.queue("backdated")
+
+    run_at = int(time.time()) - 100
+    jid = q.enqueue({"to": "backdated"}, run_at=run_at)
+
+    row = q.get_job(jid)
+    assert row is not None
+    assert row["run_at"] == run_at
+    assert row["run_at"] != row["created_at"]
+
+    job = q.claim_one("worker-py")
+    assert job is not None, "a back-dated job must still be claimable"
+    assert job.id == jid
+    assert job.run_at == run_at
+    assert job.run_at != job.created_at
+    assert job.created_at == row["created_at"]
