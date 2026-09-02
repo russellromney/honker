@@ -96,6 +96,10 @@ is `std::optional<int64_t>` on both.
 preferred JSON library. honker never checks the payload's shape; every
 process writing a queue must agree on it.
 
+The string accessors (`queue()`, `payload()`, `state()`, `worker_id()`)
+return a `const&` into the `Job` or `JobSnapshot`, so reading a payload
+costs nothing. Copy it if you need it to outlive the job.
+
 ```cpp
 if (auto row = q.get_job(id)) {
     row->state();                       // "pending" or "processing"

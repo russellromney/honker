@@ -483,16 +483,20 @@ inline nlohmann::json parse_row_array(const std::string& json, const char* what)
 /// worker_id() and claim_expires_at() are optional because a pending
 /// row has neither. payload() is the raw JSON text exactly as stored;
 /// parse it with your preferred JSON library.
+///
+/// The string accessors hand back a reference into the snapshot, so
+/// they neither copy nor allocate — keep the JobSnapshot alive for as
+/// long as you hold one.
 class JobSnapshot {
 public:
     int64_t     id()         const noexcept { return id_; }
-    std::string queue()      const noexcept { return queue_; }
-    std::string payload()    const noexcept { return payload_; }
+    const std::string& queue()   const noexcept { return queue_; }
+    const std::string& payload() const noexcept { return payload_; }
     /// "pending" or "processing".
-    std::string state()      const noexcept { return state_; }
+    const std::string& state()   const noexcept { return state_; }
     int64_t     priority()   const noexcept { return priority_; }
     int64_t     run_at()     const noexcept { return run_at_; }
-    std::optional<std::string> worker_id() const noexcept { return worker_id_; }
+    const std::optional<std::string>& worker_id() const noexcept { return worker_id_; }
     std::optional<int64_t> claim_expires_at() const noexcept { return claim_expires_at_; }
     int64_t     attempts()     const noexcept { return attempts_; }
     int64_t     max_attempts() const noexcept { return max_attempts_; }
@@ -545,16 +549,20 @@ private:
 /// a claim is what makes this a Job.
 ///
 /// payload() is the raw JSON text exactly as stored.
+///
+/// The string accessors hand back a reference into the Job, so they
+/// neither copy nor allocate — keep the Job alive for as long as you
+/// hold one.
 class Job {
 public:
     int64_t     id()        const noexcept { return id_; }
-    std::string queue()     const noexcept { return queue_; }
-    std::string payload()   const noexcept { return payload_; }
+    const std::string& queue()   const noexcept { return queue_; }
+    const std::string& payload() const noexcept { return payload_; }
     /// Always "processing" for a claimed job.
-    std::string state()     const noexcept { return state_; }
+    const std::string& state()   const noexcept { return state_; }
     int64_t     priority()  const noexcept { return priority_; }
     int64_t     run_at()    const noexcept { return run_at_; }
-    std::string worker_id() const noexcept { return worker_id_; }
+    const std::string& worker_id() const noexcept { return worker_id_; }
     int64_t     claim_expires_at() const noexcept { return claim_expires_at_; }
     int64_t     attempts()     const noexcept { return attempts_; }
     int64_t     max_attempts() const noexcept { return max_attempts_; }

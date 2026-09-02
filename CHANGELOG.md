@@ -75,6 +75,10 @@
 - `Queue::get_job_json()` and `Scheduler::list_json()` free the shim's
   string with `honker_cpp_free()` instead of `std::free()`, matching every
   other call that takes ownership of a `char*` from the shim.
+- `Job` and `JobSnapshot` string accessors return `const std::string&`
+  instead of a copy. They were marked `noexcept` while returning by value,
+  which allocates — a `std::bad_alloc` there would have called
+  `std::terminate` rather than propagating.
 
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
