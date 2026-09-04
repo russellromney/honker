@@ -50,6 +50,31 @@
   `SELECT honker_get_job(?)` on their own connection, which still returns the
   raw snake_case row. `cancel()` is unchanged and remains not queue-scoped.
 
+## Unreleased — Ruby job details
+
+- `Honker::Job` now exposes every field the claim ABI returns: `state`,
+  `priority`, `run_at`, `claim_expires_at`, `max_attempts`, `created_at`,
+  and `expires_at` join the existing `id`, `queue_name`, `payload`,
+  `worker_id`, and `attempts`.
+- `Queue#get_job` returns a `Honker::JobSnapshot` — the same twelve fields,
+  read-only, with no ack/retry/fail/heartbeat. **Behavior change:** it used
+  to return a plain `Hash` of the raw ABI row. Reader access still works
+  (`snapshot["state"]`, `snapshot.dig("state")`), and `JSON.dump(snapshot)`
+  still emits the same JSON object, but Hash-only methods do not: `fetch`,
+  `key?` and `keys` raise `NoMethodError`, an unknown field name raises
+  `NameError` instead of returning `nil`, and `to_h` has Symbol keys. One
+  break is silent: `each` and `map` yield the twelve values, not
+  `[key, value]` pairs, so a `|name, value|` block gets a value and `nil`
+  with no error. Iterate over `to_h` instead.
+- `Job#queue` is a new alias for `Job#queue_name`, so the accessor name
+  `JobSnapshot` uses works on a claimed job too.
+- Snapshot `payload` stays the raw JSON text the row stores, matching the
+  Python and Go snapshots. `Job#payload` is still decoded. The bindings do
+  not yet agree on one snapshot payload encoding; Node decodes it.
+- `spec/job_fields_spec.rb` asserts every field against the value it was
+  enqueued or claimed with, across pending, delayed, processing, retried,
+  and acked jobs.
+
 ## Unreleased — Node checkpoint interoperability (Phase Robinson)
 
 - Node stream checkpoint calls now use the shared SQL ABI's canonical

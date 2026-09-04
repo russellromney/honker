@@ -263,3 +263,68 @@ Supported schedule forms:
 - `@every 1s`
 
 `schedule:` is the canonical recurring name. `cron:` still works as a compatibility alias.
+
+## Job details
+
+A claimed `Honker::Job` carries the whole row as it stood at claim time:
+
+```ruby
+job = q.claim_one("worker-1")
+
+job.id                # row id
+job.queue_name        # queue this job came from (also job.queue)
+job.payload           # decoded JSON value
+job.state             # "processing"
+job.priority          # higher runs first within the queue
+job.run_at            # unix seconds; when it became claimable
+job.worker_id         # "worker-1"
+job.claim_expires_at  # unix seconds; heartbeat before this
+job.attempts          # already incremented by this claim
+job.max_attempts      # dead-letters once attempts reaches this
+job.created_at        # unix seconds
+job.expires_at        # unix seconds, or nil when enqueued without expires:
+```
+
+`q.get_job(id)` returns a `Honker::JobSnapshot` — the same twelve fields,
+read-only, for a job you did not claim. It is data alone: no
+ack/retry/fail/heartbeat, because the reader holds no claim. `state` is
+`"pending"` or `"processing"`, and `worker_id` / `claim_expires_at` are
+`nil` until some worker claims the job. The snapshot's `payload` is the
+raw JSON *text* from the row, not a decoded value — call `JSON.parse` on
+it. `nil` means the job was ack'd, dead-lettered, cancelled, or never
+existed. The lookup is by id alone, so an id belonging to another queue
+returns that queue's row rather than `nil`.
+
+`JobSnapshot` is a `Struct`, like `Honker::Notification`. It replaces the
+plain `Hash` older versions returned. Reader access still works
+(`snapshot["state"]`, `snapshot.dig("state")`), and `JSON.dump(snapshot)`
+still emits the same JSON object, but Hash-only methods do not: `fetch`,
+`key?` and `keys` raise `NoMethodError`, an unknown field name raises
+`NameError` instead of returning `nil`, and `to_h` gives you Symbol keys,
+not String ones.
+
+One break is silent rather than loud: iteration. A `Struct`'s `each` and
+`map` yield the twelve values, not `[key, value]` pairs, so a block
+written `|name, value|` against the old `Hash` now gets a value and `nil`
+with no error. Iterate over `snapshot.to_h` instead.
+
+Honker never inspects a payload. The shape is a contract between the app
+that enqueues and the app that claims, and both sides have to agree on it
+— including across languages, since another binding may write to the same
+queue.
+
+The payload goes through `JSON.dump` on the way in and `JSON.parse` on
+the way out, so it must be JSON-serializable, and **Symbol keys come back
+as Strings**: `q.enqueue({to: "alice"})` claims as `{"to" => "alice"}`.
+Write `job.payload["to"]`, not `job.payload[:to]`.
+
+Version the payload if it will change:
+
+```ruby
+q.enqueue({"v" => 2, "to" => "alice@example.com"})
+
+case job.payload["v"]
+when 2 then send_email(job.payload["to"])
+else raise "unknown payload version #{job.payload["v"].inspect}"
+end
+```
