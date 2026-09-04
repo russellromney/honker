@@ -79,9 +79,38 @@ Every binding already JSON-encodes on enqueue, so the JSON contract breaks
 almost nobody. The exceptions are C++, whose `honker_cpp_enqueue` takes a
 bare `const char* payload_json` with nothing validating it, and anyone
 writing raw `honker_enqueue` SQL through the extension path. No table
-rebuild — detection only:
+rebuild.
 
+The table that matters is `_honker_scheduler_tasks`, not `_honker_live`. A
+legacy non-JSON row in `_honker_live` is inert — it sits there until someone
+reads it. One in `_honker_scheduler_tasks` stops **every** schedule
+permanently: `scheduler_tick` errors, no `next_fire_at` advances, and healthy
+schedules never fire again. Found in the #153 round-two review and fixed
+there, to the extent that the error now names the offending row. The rows
+still have to be found and repaired.
+
+Detection is harder than it looks, and the query this section used to give
+was wrong:
+
+    -- INCOMPLETE. Finds outright non-JSON only.
     SELECT id FROM _honker_live WHERE NOT json_valid(payload);
+
+SQLite's `json_valid` and serde_json do not agree. Measured on SQLite 3.51.0,
+`json_valid` returns 1 for all three break classes honker now rejects: lone
+surrogates (`"\ud800"`), out-of-range numbers (`1e999`), and nesting past 128
+levels. So the query above misses exactly the rows that are surprising, and
+catches only the ones that were obviously broken. The disagreement runs one
+way — no false positives — so what it does find is real.
+
+There is no SQL-only fix, because core exposes no validator UDF. Until one
+exists, detection means reading candidate rows back through a binding and
+catching the decode error. Both payload tables need it:
+
+    SELECT id, payload FROM _honker_live;
+    SELECT id, payload FROM _honker_scheduler_tasks WHERE payload IS NOT NULL;
+
+Exposing `honker_payload_valid(text)` would make this a one-line query and is
+worth doing before the release, not after.
 
 ### Deliberately not in this phase
 
