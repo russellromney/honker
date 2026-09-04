@@ -2398,6 +2398,38 @@ while True:
         // Idempotent: the second bootstrap must not error on the column
         // it just added.
         bootstrap_honker_schema(&conn).unwrap();
+
+        // A migrated table and a fresh one must be the same table. Not
+        // just the same set of names — the same names in the same `cid`
+        // order, so anything that reads _honker_live positionally (a
+        // `SELECT *` in a user's own SQL, a dump and restore) behaves
+        // identically on both. ALTER TABLE ADD COLUMN appends, and the
+        // CREATE TABLE puts claimed_at last, which is what makes this
+        // hold; it breaks the moment someone inserts a column mid-list
+        // in BOOTSTRAP_HONKER_SQL. Measured: moving claimed_at above
+        // expires_at in the CREATE TABLE fails this and nothing else.
+        let migrated_cols = live_column_names(&conn);
+        let fresh = mem();
+        bootstrap_honker_schema(&fresh).unwrap();
+        let fresh_cols = live_column_names(&fresh);
+        assert_eq!(
+            migrated_cols, fresh_cols,
+            "a migrated _honker_live must have the same columns in the same order as a fresh one"
+        );
+        assert_eq!(
+            migrated_cols.last().map(String::as_str),
+            Some("claimed_at"),
+            "claimed_at is appended by ALTER TABLE, so the fresh CREATE TABLE must put it last too"
+        );
+    }
+
+    fn live_column_names(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM pragma_table_info('_honker_live') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     #[test]

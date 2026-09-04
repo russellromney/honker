@@ -16,6 +16,15 @@
   JSON. Both are additive; no binding declares
   `serde(deny_unknown_fields)`, so existing consumers ignore it until
   they opt in.
+- Validity window, documented in README under "How long has this job
+  been running": `claimed_at` is the start of the CURRENT claim and is
+  only meaningful while `claim_expires_at >= unixepoch()`. A claim that
+  lapses without a reclaim leaves `worker_id`, `claim_expires_at` and
+  `claimed_at` on the row, all stale together, until the next claim
+  overwrites all three. Nothing clears them, by design — there is no
+  expiry sweep for processing rows, and blanking `claimed_at` alone
+  would throw away the abandoned attempt's start time while leaving the
+  other two stale anyway.
 - Existing databases migrate with `ALTER TABLE ... ADD COLUMN`, matching
   the `enabled` and `max_attempts` migrations, and tolerating the
   "duplicate column" error when a concurrent bootstrap wins the race.

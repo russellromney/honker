@@ -656,6 +656,16 @@ fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::
 /// first one. `heartbeat()` deliberately leaves it alone — that is the
 /// whole reason `claim_expires_at` cannot answer "how long has this
 /// been running".
+///
+/// Here it is always a number: the UPDATE just wrote it on every row
+/// this RETURNING sees. `get_job` is the one that can report
+/// `"claimed_at": null`, for a job that has never been claimed.
+///
+/// Validity window: `claimed_at` is the start of the CURRENT claim and
+/// is only meaningful while `claim_expires_at >= unixepoch()`. When a
+/// claim lapses without a reclaim, `worker_id`, `claim_expires_at` and
+/// `claimed_at` all stay on the row and all go stale together; the
+/// next claim overwrites the three of them.
 pub fn claim_batch(
     conn: &Connection,
     queue: &str,
@@ -1014,6 +1024,12 @@ pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
 /// Read a single job row by id. Returns a JSON object on success or
 /// the empty string on miss (job ack'd, dead'd, or never existed).
 /// Pure read — does not change state.
+///
+/// `claimed_at` is null for a job that has never been claimed, and for
+/// a job that was already in flight when an existing database migrated
+/// (the migration adds the column without backfilling). Otherwise it is
+/// the start of the current claim, and it is only meaningful while
+/// `claim_expires_at >= unixepoch()` — see `claim_batch`.
 pub fn get_job(conn: &Connection, job_id: i64) -> rusqlite::Result<String> {
     let row: Option<(
         i64,
@@ -2404,14 +2420,22 @@ mod claimed_at_tests {
         )
         .unwrap();
 
+        // Read the clock before the reclaim. `second > first - 3600`
+        // would only prove the value moved off the backdated one; any
+        // write at all satisfies it. Measured: with the claim writing
+        // `unixepoch() - 1000`, the old bound passes and this one
+        // fails. `second >= before_reclaim` pins the actual reclaim.
+        let before_reclaim = now(&conn);
         let batch: serde_json::Value = serde_json::from_str(&claim(&conn, "w2", 300)).unwrap();
         assert_eq!(batch[0]["id"].as_i64(), Some(id), "w2 must reclaim the row");
+        let after_reclaim = now(&conn);
 
         let second = stored_claimed_at(&conn, id).unwrap();
         assert!(
-            second > first - 3600,
-            "a reclaim starts a new attempt, so claimed_at must move forward \
-             to the reclaim time; got {second}, backdated first claim was {}",
+            second >= before_reclaim && second <= after_reclaim,
+            "a reclaim starts a new attempt, so claimed_at must be the reclaim time, \
+             between {before_reclaim} and {after_reclaim}; got {second}, \
+             backdated first claim was {}",
             first - 3600
         );
         assert_eq!(
@@ -2421,14 +2445,98 @@ mod claimed_at_tests {
         );
     }
 
+    // Both terminal paths DELETE the row, so `claimed_at` leaves with
+    // it. Neither reads the column. This pins that the extra column
+    // breaks neither one, and that the row really leaves _honker_live
+    // rather than lingering with a stale claimed_at.
     #[test]
     fn ack_and_fail_do_not_need_claimed_at_but_still_work() {
         let conn = db();
-        let id = enqueue(&conn);
+
+        let acked_id = enqueue(&conn);
         claim(&conn, "w1", 300);
         let acked: i64 = conn
-            .query_row("SELECT honker_ack(?1, 'w1')", [id], |r| r.get(0))
+            .query_row("SELECT honker_ack(?1, 'w1')", [acked_id], |r| r.get(0))
             .unwrap();
         assert_eq!(acked, 1, "the extra column must not break the ack path");
+        assert_eq!(
+            live_row_count(&conn, acked_id),
+            0,
+            "ack must remove the row, taking claimed_at with it"
+        );
+
+        let failed_id = enqueue(&conn);
+        claim(&conn, "w1", 300);
+        assert!(
+            stored_claimed_at(&conn, failed_id).is_some(),
+            "the claim must have set claimed_at before fail() runs"
+        );
+        let failed: i64 = conn
+            .query_row("SELECT honker_fail(?1, 'w1', 'boom')", [failed_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(failed, 1, "the extra column must not break the fail path");
+        assert_eq!(
+            live_row_count(&conn, failed_id),
+            0,
+            "fail must remove the row from _honker_live"
+        );
+        let dead: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM _honker_dead WHERE id = ?1",
+                [failed_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dead, 1, "fail must land the job in _honker_dead");
+    }
+
+    // `claimed_at` is the start of the CURRENT claim, and it is only
+    // meaningful while `claim_expires_at >= now`. When a claim lapses
+    // with nobody reclaiming (attempts exhausted, no worker on the
+    // queue, queue drained) the row keeps `state='processing'`,
+    // `worker_id`, `claim_expires_at` AND `claimed_at` — all of it is
+    // the last claim, and all of it goes stale together. Nothing
+    // clears it; the next claim overwrites it. This is the one case
+    // where `unixepoch() - claimed_at` read without the
+    // `claim_expires_at` filter gives a growing number for an attempt
+    // nobody is running, so the behaviour is pinned here and the
+    // filter is documented in README.
+    #[test]
+    fn an_expired_claim_keeps_claimed_at_with_the_rest_of_the_stale_claim() {
+        let conn = db();
+        let id = enqueue(&conn);
+        // A timeout already in the past: claimed, and immediately past
+        // its deadline.
+        claim(&conn, "w1", -60);
+
+        let job: serde_json::Value = serde_json::from_str(&get_job(&conn, id).unwrap()).unwrap();
+        let now_s = now(&conn);
+        assert_eq!(job["state"].as_str(), Some("processing"));
+        assert!(
+            job["claim_expires_at"].as_i64().unwrap() < now_s,
+            "the claim must actually be expired for this test to mean anything"
+        );
+        assert_eq!(
+            job["worker_id"].as_str(),
+            Some("w1"),
+            "worker_id is not cleared on expiry either — claimed_at is no more \
+             stale than the rest of the claim"
+        );
+        assert!(
+            job["claimed_at"].as_i64().is_some(),
+            "claimed_at is deliberately left in place: it is the last claim's \
+             start, valid only while claim_expires_at >= now"
+        );
+    }
+
+    fn live_row_count(conn: &Connection, id: i64) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM _honker_live WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 }

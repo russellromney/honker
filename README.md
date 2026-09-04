@@ -182,6 +182,34 @@ The extension shares tables with the language bindings, so a Python
 worker can claim jobs written by SQL, Node, Ruby, Go, or any other
 binding.
 
+### How long has this job been running
+
+`_honker_live.claimed_at` is when the CURRENT claim started. Nothing
+else answers that: `created_at` includes queue wait, `run_at` is when
+the job became ready, and `claim_expires_at` moves on every heartbeat.
+No language binding exposes `claimed_at` yet, so read it in SQL:
+
+```sql
+SELECT id, queue, unixepoch() - claimed_at AS running_s
+  FROM _honker_live
+ WHERE state = 'processing'
+   AND claim_expires_at >= unixepoch();   -- required, see below
+```
+
+`claimed_at` is only meaningful while `claim_expires_at >= unixepoch()`.
+When a claim lapses and nobody reclaims the job — attempts exhausted, no
+worker on that queue, queue drained — honker does not touch the row.
+`worker_id`, `claim_expires_at` and `claimed_at` all stay put and all go
+stale together, and the next claim overwrites all three. Without the
+`claim_expires_at` filter, `unixepoch() - claimed_at` keeps counting up
+for an attempt nobody is running.
+
+`claimed_at` is NULL until the first claim, and stays NULL for jobs that
+were already in flight when an existing database was upgraded: the
+migration adds the column without backfilling, because a backfill would
+date those rows to upgrade time and read as a claim that never happened.
+They pick up a real value on their next claim.
+
 ## Architecture
 
 - One `PRAGMA data_version` watcher per `Database`; the default
