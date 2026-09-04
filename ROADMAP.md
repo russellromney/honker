@@ -59,12 +59,43 @@ rather than the symptom, while alpha still makes that cheap.
 ### Sequence
 
 1. Independent adversarial review of every open PR. Not merged before this.
-   Round one is complete: every PR reviewed, every finding fixed. It found a
-   defect shared by six bindings — a `run_at`/`created_at` transposition that
-   passed every test, because the claimed-job assertion compared against an
-   undelayed enqueue where the two fields are equal to the second. Round two
-   is in flight, one agent per binding, asking a different question: is this
-   complete, well designed, and does it make sense to a user of that language.
+   **Both rounds are complete on all fifteen PRs.** Round one asked whether
+   the code was correct. It found a defect shared by six bindings — a
+   `run_at`/`created_at` transposition that passed every test, because the
+   claimed-job assertion compared against an undelayed enqueue where the two
+   fields are equal to the second. Round two asked a different question: is
+   this complete, well designed, and does it make sense to a user. It found
+   two high-severity bugs that round one missed.
+
+   - **#153** — one legacy non-JSON row in `_honker_scheduler_tasks` stops
+     **every** schedule permanently. `scheduler_tick` errors, no
+     `next_fire_at` advances, healthy schedules never fire again. The error
+     named neither the row nor the queue. Fixed.
+   - **#138** — a panicking body skipped `in_savepoint`'s undo entirely,
+     leaving the DELETE applied and `is_autocommit()` false. The next
+     `fail()` on that connection then returned `Ok(0)`: a silent miss from
+     inside the leaked transaction, the exact bug class #138 exists to
+     close. Latent today, since no current body panics. Fixed with a drop
+     guard.
+
+   The rest of round two was about tests that pass for the wrong reason,
+   which is where this project's defects actually live:
+
+   - **#155** — the repo's own `.ok()` trap landed in a *new test helper*.
+     With the table name typo'd, 8 of 10 tests still passed; every "the row
+     is gone" assertion was proving nothing.
+   - **#148** — `spec/phase_mantle_spec.rb` had never run in CI, and it was
+     the only pre-existing spec reading a `get_job` result's fields, which
+     is exactly what that PR reshaped. Now wired in. Added to #147.
+   - **#142** — a commit message stated a proof that does not reproduce, and
+     `required` on the public `JobRow` was a source break the CHANGELOG said
+     was not one.
+   - **#140** — round one's own reported mutation count was wrong (14 tests
+     fail, not 5), and its "loose bound" nit was a real hole: under a
+     back-dated write the old assertion passes and the new one fails.
+
+   Reviewers were told to break each guard and watch the test fail. Every
+   round-two finding above came from that, not from reading.
 2. Merge `#124` → the nine #136 binding PRs → `#138` → `#140` → `#153`.
 3. Second pass, one PR per binding: #134 scoping, `Database.*` globals, and
    the #152 loud decode together. They touch the same files, so splitting
@@ -72,6 +103,12 @@ rather than the symptom, while alpha still makes that cheap.
    (`db.getJob(id).filter(job -> name.equals(job.queue()))`) — use it as the
    reference.
 4. One release PR. One migration guide covering all five breaks.
+
+Opened by round two, not yet scheduled: **#159** (`Queue.getResult` and
+`Queue.saveResult` reach across queues — same class as #134, which does not
+name it), **#160** (no way to find payloads the new contract rejects; needed
+before the release, not after), **#161** (rollback errors do not tell an
+operator the job survived, which is the one fact they need).
 
 ### Migration reality
 
