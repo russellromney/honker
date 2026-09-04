@@ -1,5 +1,47 @@
 # CHANGELOG
 
+## Unreleased — `claimed_at` on `_honker_live`
+
+- New nullable `claimed_at INTEGER` column on `_honker_live`: when the
+  CURRENT attempt started. Nothing else could answer that.
+  `created_at` includes queue wait, `run_at` is when the job became
+  ready, and `claim_expires_at` moves on every heartbeat.
+- NULL until the first claim. Set to `unixepoch()` on every successful
+  claim and reclaim, so it tracks the current attempt and not the first
+  one. Cleared when `retry` returns the job to pending — a job waiting
+  in the queue is not running. `heartbeat()` deliberately leaves it
+  alone; refreshing it there would reintroduce exactly the blind spot
+  the column exists to fix.
+- Exposed in `claim_batch`'s RETURNING and JSON, and in `get_job`'s
+  JSON. Both are additive; no binding declares
+  `serde(deny_unknown_fields)`, so existing consumers ignore it until
+  they opt in.
+- Validity window, documented in README under "How long has this job
+  been running": `claimed_at` is the start of the CURRENT claim and is
+  only meaningful while `claim_expires_at >= unixepoch()`. A claim that
+  lapses without a reclaim leaves `worker_id`, `claim_expires_at` and
+  `claimed_at` on the row, all stale together, until the next claim
+  overwrites all three. Nothing clears them, by design — there is no
+  expiry sweep for processing rows, and blanking `claimed_at` alone
+  would throw away the abandoned attempt's start time while leaving the
+  other two stale anyway.
+- Existing databases migrate with `ALTER TABLE ... ADD COLUMN`, matching
+  the `enabled` and `max_attempts` migrations, and tolerating the
+  "duplicate column" error when a concurrent bootstrap wins the race.
+  `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that
+  already exists, which is what the migration test pins.
+- No language binding maps `claimed_at` onto its job type yet, so for
+  now it is read in SQL. #136 tracks adding it to the full job shape
+  per binding.
+- Tests: NULL before first claim, first claim, heartbeat-does-not-move,
+  retry clears, reclaim resets to the reclaim time (bounded by a clock
+  read taken either side of the reclaim, not just "moved off the old
+  value"), ack and fail both remove the row, an expired claim keeps
+  `claimed_at` alongside the rest of the stale claim, plus a migration
+  test proving a pre-column database gains the column, keeps its rows
+  with `claimed_at` NULL rather than a backfilled timestamp, and ends
+  up with the same columns in the same order as a fresh database.
+
 ## Unreleased — Core SQLite error propagation
 
 - `honker-core` no longer discards SQLite errors in five lookups.
