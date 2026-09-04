@@ -1,7 +1,6 @@
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Microsoft.Data.Sqlite;
 
 namespace Honker;
@@ -52,9 +51,11 @@ public sealed class Queue
             _options.VisibilityTimeoutSeconds
         )) ?? "[]";
 
-        var rows = JsonSerializer.Deserialize<List<ClaimedJobRow>>(rowsJson) ?? [];
+        // honker_claim_batch returns the whole job snapshot, the same
+        // field set honker_get_job returns, so JobRow decodes both.
+        var rows = JsonSerializer.Deserialize<List<JobRow>>(rowsJson) ?? [];
         return rows
-            .Select(row => new Job(this, row.Id, row.Queue, row.Payload, row.WorkerId, row.Attempts, row.ClaimExpiresAt, row.State ?? "processing"))
+            .Select(row => new Job(this, row))
             .ToList();
     }
 
@@ -202,6 +203,12 @@ public sealed class Queue
     /// <summary>
     /// Read a single job row by id. Returns the row or null on miss
     /// (ack'd, dead'd, or never existed). Pure read.
+    ///
+    /// NOT queue-scoped: job ids are globally unique and this lookup
+    /// spans every queue, so it can return a row belonging to a
+    /// different queue than this handle. Check
+    /// <see cref="JobRow.Queue"/> if that matters. Node's equivalent is
+    /// already scoped; aligning .NET is tracked in #134.
     /// </summary>
     public JobRow? GetJob(long jobId)
     {
@@ -317,29 +324,5 @@ public sealed class Queue
         tx.Execute("DROP TABLE IF EXISTS _honker_pending");
         tx.Execute("DROP TABLE IF EXISTS _honker_processing");
         tx.Commit();
-    }
-
-    private sealed class ClaimedJobRow
-    {
-        [JsonPropertyName("id")]
-        public long Id { get; init; }
-
-        [JsonPropertyName("queue")]
-        public string Queue { get; init; } = "";
-
-        [JsonPropertyName("payload")]
-        public string Payload { get; init; } = "";
-
-        [JsonPropertyName("worker_id")]
-        public string WorkerId { get; init; } = "";
-
-        [JsonPropertyName("attempts")]
-        public long Attempts { get; init; }
-
-        [JsonPropertyName("claim_expires_at")]
-        public long ClaimExpiresAt { get; init; }
-
-        [JsonPropertyName("state")]
-        public string? State { get; init; }
     }
 }

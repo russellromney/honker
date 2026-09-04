@@ -20,6 +20,79 @@
 - Regression test claims a job at a deadline with one claim forced to
   return empty: it fails on the unpatched `api.js` and passes on the fix.
 
+## Unreleased — .NET job details and typed queues
+
+- .NET claimed jobs (`Job`) now carry every field the core returns:
+  `State`, `Priority`, `RunAt`, `MaxAttempts`, `CreatedAt`, and
+  `ExpiresAt` join the id, queue, payload, worker, attempts, and
+  claim-expiry fields they already had. `ClaimBatch` decodes the claim
+  ABI into the same `JobRow` shape `GetJob()` returns, so the old
+  `row.State ?? "processing"` fallback is gone — `state` is now a real
+  value from the core.
+- New `db.Queue<TPayload>(name)` returns a `TypedQueue<TPayload>` whose
+  claims yield `Job<TPayload>` and whose `GetJob()` yields the
+  data-only `JobSnapshot<TPayload>` record. Named `TypedQueue` rather
+  than `Queue<T>` so it cannot collide with
+  `System.Collections.Generic.Queue<T>` in callers' files.
+- Payload typing is compile-time only. Honker never validates payload
+  shape in the database, and this binding adds no runtime check.
+- A claimed row missing `worker_id` or `claim_expires_at` now throws
+  instead of being silently defaulted.
+- The typed job tests enqueue with a back-dated absolute `RunAtUnix`
+  (`now - 100`) so the job stays claimable while `RunAt` and `CreatedAt`
+  differ, then pin `RunAt` exactly and assert the two are not equal.
+  With an immediate enqueue the two are equal to the second, so all four
+  properties (`Job<T>.RunAt`/`CreatedAt` and `JobSnapshot<T>.FromRow`'s
+  two assignments) could be transposed and the suite stayed green.
+- `Job<TPayload>.PayloadRaw` is now asserted against the enqueued JSON.
+  Only `JobSnapshot<T>.PayloadRaw` was covered before.
+- `Job<TPayload>.Payload` decodes on first read instead of inside the
+  constructor. It used to decode during the claim, so a payload that did
+  not match `TPayload` threw from inside `ClaimBatch`/`ClaimOne`/
+  `ClaimAsync` — after the rows were already claimed in the database.
+  The caller got an exception and no handle, so it could not `Ack`,
+  `Retry`, or `Fail` any job in that batch; they stayed invisible until
+  the visibility timeout and then poisoned the next claim. Honker never
+  validates payload shape, so one disagreeing producer was enough. A
+  claim now never decodes and never throws; the `JsonException` arrives
+  when you read `Payload`, with the job in hand to `Fail`.
+- `TypedQueue<T>.GetJob` still decodes eagerly and still throws on a
+  mismatched payload — a read holds no claim, so nothing is stranded.
+  `Untyped.GetJob` reads the row whatever shape it is. Both behaviours
+  are documented on the members and in the README.
+- Tests for the previously uncovered typed surface: `ClaimBatch`,
+  `AckBatch`, `ClaimAsync`, `Cancel`, `Name`, `Job<T>.Untyped`,
+  `Job<T>.Retry`, and `Job<T>.Heartbeat`.
+- Every `JobRow` member is now `required`, so a core that omits a field
+  fails the decode with a `JsonException` naming it. `ClaimBatch` decodes
+  into `JobRow` now, and `JobRow.State` defaulted to `""` — so this
+  binding run against a 0.5.x extension, whose `honker_claim_batch`
+  returns six columns and no `state`, would have reported
+  `Job.State == ""`. The `row.State ?? "processing"` fallback this PR
+  removed was right for that case. Wrong and silent is worse than the
+  fallback; loud is better than either. `worker_id` and
+  `claim_expires_at` are in the old ABI, so their new throws did not
+  catch it. Nothing in the binding constructs a `JobRow` — it is only a
+  deserialization target.
+- `JobRow` is public, so `required` is a source-breaking change for a
+  downstream caller who constructs one: `new JobRow { Id = 1 }` compiled
+  before and is now `CS9035: Required member 'JobRow.Payload' must be
+  set`. Nothing outside a decoder has a reason to build a `JobRow`, and
+  the package is pre-1.0, so this is the accepted cost of the loud
+  decode.
+- Against a 0.5.x extension, `required` moves the failure from a wrong
+  `Job.State` to a `JsonException` thrown inside `ClaimBatch` — after
+  the rows are claimed in the database, which is the same stranding
+  shape the `Job<TPayload>.Payload` fix above removes. It is still the
+  right trade: a version-mismatched core fails on the very first claim
+  and every claim after, so the worker never appears to run, whereas one
+  producer's mismatched payload is an ordinary production event a
+  healthy worker has to survive.
+- The README now names the `TypedQueue<T>` vs `Queue<T>` collision, shows
+  the poison-payload worker loop, separates the four spellings of
+  "payload" across the typed and untyped pairs, and says `GetJob` is not
+  queue-scoped. `Queue.GetJob` says so in its XML doc too (#134).
+
 ## Unreleased — typed Node jobs
 
 - Node `Queue`, `Job`, `JobSnapshot`, `ClaimWaker`, and `Outbox` APIs now carry

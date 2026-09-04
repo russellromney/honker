@@ -83,6 +83,20 @@ public sealed class Database : IDisposable
         }
     }
 
+    /// <summary>
+    /// Get a queue whose payloads are typed as
+    /// <typeparamref name="TPayload"/>. Wraps the same underlying
+    /// queue <see cref="Queue(string, QueueOptions?)"/> returns, so a
+    /// typed and an untyped handle to one queue stay consistent.
+    ///
+    /// Typing is compile-time only: honker never checks payload shape
+    /// in the database.
+    /// </summary>
+    public TypedQueue<TPayload> Queue<TPayload>(string name, QueueOptions? options = null)
+    {
+        return new TypedQueue<TPayload>(Queue(name, options));
+    }
+
     public Stream Stream(string name)
     {
         lock (_gate)
