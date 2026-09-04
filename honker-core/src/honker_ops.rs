@@ -1970,6 +1970,7 @@ mod cancel_scoping {
         has_queue_scoped_cancel,
     };
     use rusqlite::Connection;
+    use rusqlite::OptionalExtension;
     use rusqlite::functions::FunctionFlags;
 
     fn db() -> Connection {
@@ -1993,10 +1994,15 @@ mod cancel_scoping {
     /// the wrong-queue tests, so they assert on this, not just on the
     /// return count.
     fn live_queue(conn: &Connection, id: i64) -> Option<String> {
+        // `.optional()` and not `.ok()`: `.ok()` turns EVERY error into
+        // None, so a typo'd table name or a schema change would make
+        // "the row is gone" assertions below pass without the cancel
+        // having done anything. Only QueryReturnedNoRows means gone.
         conn.query_row("SELECT queue FROM _honker_live WHERE id = ?1", [id], |r| {
             r.get(0)
         })
-        .ok()
+        .optional()
+        .unwrap()
     }
 
     /// Both arities are callable on the SAME connection, under the SAME
