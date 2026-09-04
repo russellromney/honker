@@ -73,7 +73,21 @@
   fallback; loud is better than either. `worker_id` and
   `claim_expires_at` are in the old ABI, so their new throws did not
   catch it. Nothing in the binding constructs a `JobRow` — it is only a
-  deserialization target — so `required` costs callers nothing.
+  deserialization target.
+- `JobRow` is public, so `required` is a source-breaking change for a
+  downstream caller who constructs one: `new JobRow { Id = 1 }` compiled
+  before and is now `CS9035: Required member 'JobRow.Payload' must be
+  set`. Nothing outside a decoder has a reason to build a `JobRow`, and
+  the package is pre-1.0, so this is the accepted cost of the loud
+  decode.
+- Against a 0.5.x extension, `required` moves the failure from a wrong
+  `Job.State` to a `JsonException` thrown inside `ClaimBatch` — after
+  the rows are claimed in the database, which is the same stranding
+  shape the `Job<TPayload>.Payload` fix above removes. It is still the
+  right trade: a version-mismatched core fails on the very first claim
+  and every claim after, so the worker never appears to run, whereas one
+  producer's mismatched payload is an ordinary production event a
+  healthy worker has to survive.
 - The README now names the `TypedQueue<T>` vs `Queue<T>` collision, shows
   the poison-payload worker loop, separates the four spellings of
   "payload" across the typed and untyped pairs, and says `GetJob` is not
