@@ -303,7 +303,10 @@ still emits the same JSON object, but Hash-only methods do not: `fetch`,
 `NameError` instead of returning `nil`, and `to_h` gives you Symbol keys,
 not String ones.
 
-One break is silent rather than loud: iteration. A `Struct`'s `each` and `map` yield the twelve values, not `[key, value]` pairs, so a block written `|name, value|` against the old `Hash` now gets a value and `nil` with no error. Iterate over `snapshot.to_h` instead.
+One break is silent rather than loud: iteration. A `Struct`'s `each` and
+`map` yield the twelve values, not `[key, value]` pairs, so a block
+written `|name, value|` against the old `Hash` now gets a value and `nil`
+with no error. Iterate over `snapshot.to_h` instead.
 
 Honker never inspects a payload. The shape is a contract between the app
 that enqueues and the app that claims, and both sides have to agree on it
