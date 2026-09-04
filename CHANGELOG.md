@@ -49,7 +49,10 @@
   (`snapshot["state"]`, `snapshot.dig("state")`), and `JSON.dump(snapshot)`
   still emits the same JSON object, but Hash-only methods do not: `fetch`,
   `key?` and `keys` raise `NoMethodError`, an unknown field name raises
-  `NameError` instead of returning `nil`, and `to_h` has Symbol keys.
+  `NameError` instead of returning `nil`, and `to_h` has Symbol keys. One
+  break is silent: `each` and `map` yield the twelve values, not
+  `[key, value]` pairs, so a `|name, value|` block gets a value and `nil`
+  with no error. Iterate over `to_h` instead.
 - `Job#queue` is a new alias for `Job#queue_name`, so the accessor name
   `JobSnapshot` uses works on a claimed job too.
 - Snapshot `payload` stays the raw JSON text the row stores, matching the

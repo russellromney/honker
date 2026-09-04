@@ -902,6 +902,11 @@ module Honker
   # same JSON object, but Hash-only methods do not: #fetch, #key? and
   # #keys raise NoMethodError, an unknown name raises NameError
   # instead of returning nil, and #to_h has Symbol keys, not String.
+  #
+  # One break is silent rather than loud: iteration. A Struct's #each
+  # and #map yield the twelve values, not [key, value] pairs, so a
+  # block written `|name, value|` against the old Hash now gets a
+  # value and nil with no error. Iterate over #to_h instead.
   JobSnapshot = Struct.new(
     :id, :queue, :payload, :state, :priority, :run_at, :worker_id,
     :claim_expires_at, :attempts, :max_attempts, :created_at, :expires_at

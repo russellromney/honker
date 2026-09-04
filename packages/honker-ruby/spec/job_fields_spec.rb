@@ -154,6 +154,25 @@ class HonkerJobFieldsTest < Minitest::Test
     assert_raises(NameError) { snap["claimed_at"] }
   end
 
+  # The one Hash break that does not raise. A Struct yields its values,
+  # so a block written `|name, value|` against the old Hash silently
+  # gets a value and nil. Pinned here so the docs cannot drift off it.
+  def test_snapshot_iteration_yields_values_not_key_value_pairs
+    id = @q.enqueue({ "x" => 1 })
+    snap = @q.get_job(id)
+
+    assert_equal snap.to_a, snap.map { |v| v }
+    assert_equal 12, snap.to_a.size
+
+    first_name, first_value = snap.each.first
+    assert_equal id, first_name, "the block's first argument is a value, not a field name"
+    assert_nil first_value, "there is no second argument to destructure"
+
+    # to_h is the way to iterate names and values.
+    assert_equal 12, snap.to_h.size
+    assert_equal :id, snap.to_h.keys.first
+  end
+
   # A snapshot names the queue #queue; a claimed Job named it
   # #queue_name. Both answer to both, so code written against one
   # works when handed the other.
