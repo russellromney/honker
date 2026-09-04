@@ -186,7 +186,7 @@ def test_extension_registers_notify_function(ext_db_path):
     conn.load_extension(_EXT_PATH)
 
     conn.execute("BEGIN IMMEDIATE")
-    row = conn.execute("SELECT notify('orders', 'hello')").fetchone()
+    row = conn.execute("SELECT notify('orders', '\"hello\"')").fetchone()
     assert row[0] >= 1  # returned inserted id
     conn.execute("COMMIT")
 
