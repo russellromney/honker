@@ -587,6 +587,7 @@ jobs:
           bundle exec ruby -Ilib spec/honker_spec.rb
           bundle exec ruby -Ilib spec/smoke_spec.rb
           bundle exec ruby -Ilib spec/job_fields_spec.rb
+          bundle exec ruby -Ilib spec/phase_mantle_spec.rb
           bundle exec ruby -Ilib spec/parity_spec.rb
           bundle exec ruby -Ilib spec/extension_resolution_spec.rb
           bundle exec ruby -Ilib spec/setup_helpers_spec.rb
