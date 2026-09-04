@@ -178,8 +178,10 @@ defmodule Honker do
 
   @doc """
   Persist a job result for later retrieval via `get_result/2`. `value`
-  must be a string — encode JSON yourself if you want structure. `ttl_s`
-  is seconds before `sweep_results/1` will delete it.
+  must be a string holding JSON text — honker rejects anything else, so
+  encode it yourself. A bare string needs quoting: pass
+  `Jason.encode!("done")` (`~s("done")`), not `"done"`. `ttl_s` is
+  seconds before `sweep_results/1` will delete it.
   """
   def save_result(%Database{conn: conn}, job_id, value, ttl_s) when is_binary(value) do
     case query_first(conn, "SELECT honker_result_save(?1, ?2, ?3)", [job_id, value, ttl_s]) do

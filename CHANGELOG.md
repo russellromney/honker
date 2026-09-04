@@ -40,11 +40,35 @@
   an M-series laptop, about 23.5 µs to 24.1 µs per enqueue against a 3.0 s
   floor. The enqueue cost is dominated by the SQLite insert and binding
   marshaling, not by the JSON check.
+- **Check `_honker_scheduler_tasks` before upgrading.** Existing rows are not
+  validated retroactively, and the two tables behave very differently. A
+  legacy `_honker_live` row is inert: it still claims, retries, and
+  dead-letters, and the decode failure lands on whichever consumer reads it. A
+  legacy `_honker_scheduler_tasks` row is not. `scheduler_tick` fires every due
+  schedule in one call, so one unfixable payload fails the whole tick — no
+  schedule advances its `next_fire_at` and **none of your other schedules
+  fire** until that row is fixed or removed. The tick error names the schedule
+  and queue so you can find it:
+
+  ```text
+  honker: payload must be valid JSON: expected ident at line 1 column 2
+    (schedule "nightly-report", queue "reports"); fix or remove the schedule
+    row, then tick again
+  ```
+
+  Repair it with `honker_scheduler_update(name, NULL, '<json>', ...)`, or drop
+  it with `honker_scheduler_unregister(name)`.
+- **`save_result` takes raw text in most bindings** and now requires that text
+  to be JSON. Rust, Go, Node, Bun, Ruby, Elixir, C++, JVM, and Kotlin all pass
+  the value through unserialized, unlike their `enqueue` / `publish` / `notify`
+  methods. `save_result(id, "done", ttl)` used to store `done` and now fails —
+  pass `'"done"'`. Python and .NET serialize for you and are unaffected.
 - The migration detection query in the guide,
-  `SELECT id FROM _honker_live WHERE NOT json_valid(payload)`, still does not
-  agree with honker exactly. `json_valid()` returns 1 for lone surrogates and
-  for `1e999`, so it will miss legacy rows that honker now rejects. To find
-  every row that will not decode, decode it.
+  `SELECT id FROM _honker_live WHERE NOT json_valid(payload)` (and the same
+  query over `_honker_scheduler_tasks`), still does not agree with honker
+  exactly. `json_valid()` returns 1 for lone surrogates, for `1e999`, and for
+  nesting between 129 and about 1000 levels, so it will miss legacy rows that
+  honker now rejects. To find every row that will not decode, decode it.
 
 ## 2026-08-27 — Node 0.5.1
 

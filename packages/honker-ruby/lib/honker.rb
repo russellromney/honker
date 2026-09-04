@@ -671,8 +671,9 @@ module Honker
     end
 
     # Persist a job result for later retrieval via `get_result`.
-    # `value` is stored verbatim — JSON-encode it yourself if you want
-    # to round-trip structured data.
+    # `value` is stored verbatim and must already be JSON text — honker
+    # rejects anything else. A bare string needs quoting: pass
+    # `"done".to_json` (`'"done"'`), not `"done"`.
     def save_result(job_id, value, ttl_s:)
       @db.get_first_row(
         "SELECT honker_result_save(?, ?, ?)",

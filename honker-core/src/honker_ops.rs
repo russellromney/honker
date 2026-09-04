@@ -1313,6 +1313,23 @@ fn scheduler_wake(_conn: &Connection) -> rusqlite::Result<()> {
 /// must be delivered.
 pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 
+/// Attach the schedule's identity to a payload rejection raised while
+/// firing it.
+///
+/// Only `UserFunctionError` is rewritten -- that is what
+/// [`super::validate_json_payload`] returns. A real SQLite failure
+/// (`SQLITE_BUSY`, disk I/O) passes through untouched so callers can still
+/// match on its code.
+fn name_scheduled_payload_error(name: &str, queue: &str, err: rusqlite::Error) -> rusqlite::Error {
+    match err {
+        rusqlite::Error::UserFunctionError(inner) => to_sql_err(format!(
+            "{inner} (schedule {name:?}, queue {queue:?}); fix or remove the \
+             schedule row, then tick again"
+        )),
+        other => other,
+    }
+}
+
 /// For each registered task whose `next_fire_at <= now_unix`,
 /// enqueue the payload into its queue and advance `next_fire_at`
 /// to the next boundary. Keeps advancing within one tick while
@@ -1361,6 +1378,12 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
             // max_attempts comes from the schedule row, not a constant.
+            // A schedule row written before the JSON payload contract can
+            // hold text `enqueue` now rejects. That fails the whole tick --
+            // no task advances, so one bad row stops every schedule. Failing
+            // is right (a silent skip would drop fires forever), but the bare
+            // validation message names no schedule, and the caller is a
+            // leader loop with no idea which row to fix. Name it.
             let job_id = enqueue(
                 conn,
                 &queue,
@@ -1370,7 +1393,8 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 priority,
                 max_attempts,
                 expires_s,
-            )?;
+            )
+            .map_err(|e| name_scheduled_payload_error(&name, &queue, e))?;
             out.push(json!({
                 "name": name,
                 "queue": queue,
@@ -2119,6 +2143,117 @@ mod payload_tests {
             )
             .unwrap();
         assert_eq!(stored, payload);
+    }
+
+    /// Existing rows are not validated retroactively, so a schedule
+    /// registered before this contract can still hold text `enqueue` now
+    /// rejects. Firing it fails the whole tick: `scheduler_tick` enqueues
+    /// every due task in one call, so nothing advances and no other
+    /// schedule fires until the bad row is fixed.
+    ///
+    /// Failing is the correct half -- skipping the row would drop its fires
+    /// silently forever. The part that has to hold is the message: a leader
+    /// loop sees only this string, so it must name the schedule to fix.
+    #[test]
+    fn a_legacy_schedule_payload_names_itself_when_it_stops_the_tick() {
+        let conn = db();
+        // 'aaa' sorts first, so the bad row is reached before the healthy one.
+        for (name, payload) in [
+            ("aaa-legacy", "not json"),
+            ("bbb-legacy-undecodable", r#""\ud800""#),
+        ] {
+            conn.execute(
+                "INSERT INTO _honker_scheduler_tasks
+                   (name, queue, cron_expr, payload, priority, next_fire_at,
+                    enabled, max_attempts)
+                 VALUES (?1, 'backups', '@every 1m', ?2, 0, 1, 1, 3)",
+                params![name, payload],
+            )
+            .unwrap();
+        }
+        conn.query_row(
+            "SELECT honker_scheduler_register('zzz-healthy', 'backups', '@every 1m', '{}', 0, NULL, 3)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at = 1 WHERE name = 'zzz-healthy'",
+            [],
+        )
+        .unwrap();
+
+        let err = conn
+            .query_row("SELECT honker_scheduler_tick(120)", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .expect_err("a legacy non-JSON schedule payload must fail the tick");
+        let text = err.to_string();
+        assert!(
+            text.contains("honker: payload must be valid JSON"),
+            "expected the payload contract error, got: {err}"
+        );
+        assert!(
+            text.contains("\"aaa-legacy\""),
+            "the error must name the schedule the caller has to fix, got: {err}"
+        );
+        assert!(
+            text.contains("\"backups\""),
+            "the error must name the schedule's queue, got: {err}"
+        );
+
+        // The blast radius is the whole tick, not just the bad row. Pin it so
+        // a change to skip-and-continue has to be deliberate.
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live, 0, "a failed tick must not half-fire other schedules");
+        let unadvanced: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_scheduler_tasks WHERE next_fire_at = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unadvanced, 3, "no schedule advances while the tick fails");
+
+        // Removing the bad rows through the public API frees the scheduler.
+        for name in ["aaa-legacy", "bbb-legacy-undecodable"] {
+            conn.query_row("SELECT honker_scheduler_unregister(?1)", [name], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        }
+        conn.query_row("SELECT honker_scheduler_tick(120)", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .expect("the healthy schedule fires once the bad rows are gone");
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert!(live > 0, "the healthy schedule must fire after the fix");
+    }
+
+    /// A real SQLite failure inside a scheduled fire keeps its own error, so
+    /// callers can still match on the code. Only the payload rejection is
+    /// rewritten to carry the schedule's name.
+    #[test]
+    fn naming_a_scheduled_payload_error_leaves_sqlite_errors_alone() {
+        let sqlite_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            Some("database is locked".into()),
+        );
+        let passed_through = name_scheduled_payload_error("nightly", "backups", sqlite_err);
+        assert!(
+            matches!(passed_through, rusqlite::Error::SqliteFailure(..)),
+            "a SQLite failure must not be flattened into a user-function error"
+        );
+        let payload_err = super::super::validate_json_payload("not json").unwrap_err();
+        let named = name_scheduled_payload_error("nightly", "backups", payload_err);
+        assert!(
+            named.to_string().contains("\"nightly\""),
+            "a payload rejection must gain the schedule name, got: {named}"
+        );
     }
 
     #[test]
