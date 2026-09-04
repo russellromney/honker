@@ -9,8 +9,7 @@
 //!
 //!     .load ./libhonker_ext
 //!     SELECT honker_bootstrap();
-//!     SELECT honker_enqueue('emails', '{"to": "alice"}',
-//!                           NULL, NULL, 0, 3, NULL);
+//!     SELECT honker_enqueue('emails', '{"to":"alice"}', NULL, NULL, 0, 3, NULL);
 //!     SELECT honker_claim_batch('emails', 'worker-1', 32, 300);
 //!     SELECT honker_ack_batch('[1,2,3]', 'worker-1');
 //!     SELECT notify('orders', '{"id": 42}');
