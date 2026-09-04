@@ -502,6 +502,20 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         cancel(&db, job_id).map_err(to_sql_err)
     })?;
 
+    // honker_cancel(queue, job_id) -> 1 if a pending/processing row in
+    // THAT queue was removed, 0 otherwise. Registered under the same
+    // name at a different arity: SQLite dispatches on (name, nArg), so
+    // this queue-scoped form and the global 1-arg form above coexist on
+    // one connection. Bindings move to this form per-package without a
+    // lockstep release; see `has_queue_scoped_cancel` for the
+    // connect-time probe that tells them which forms are loaded.
+    conn.create_scalar_function("honker_cancel", 2, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let queue: String = ctx.get(0)?;
+        let job_id: i64 = arg_i64(ctx, 1)?;
+        let db = unsafe { ctx.get_connection() }?;
+        cancel_in_queue(&db, &queue, job_id).map_err(to_sql_err)
+    })?;
+
     // honker_get_job(job_id) -> JSON object on hit, empty string on miss.
     conn.create_scalar_function("honker_get_job", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
         let job_id: i64 = arg_i64(ctx, 0)?;
@@ -971,6 +985,60 @@ pub fn cancel(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
         rusqlite::params![job_id],
     )?;
     Ok(n as i64)
+}
+
+/// Cancel a job by id, but only if it belongs to `queue`. Same
+/// semantics as [`cancel`] otherwise: 1 if a pending or processing row
+/// was removed, 0 otherwise, idempotent.
+///
+/// A job in another queue is a miss, not an error — the caller gets 0,
+/// the same answer it gets for an id that was already ack'd. That
+/// matches how a queue handle treats a foreign id everywhere else.
+///
+/// The queue check is part of the DELETE, not a read before it. A
+/// `SELECT queue` followed by a `DELETE` leaves a window where a
+/// concurrent claim can change the row between the two statements; one
+/// statement has no such window.
+pub fn cancel_in_queue(conn: &Connection, queue: &str, job_id: i64) -> rusqlite::Result<i64> {
+    let n = conn.execute(
+        "DELETE FROM _honker_live
+          WHERE queue = ?1 AND id = ?2 AND state IN ('pending', 'processing')",
+        rusqlite::params![queue, job_id],
+    )?;
+    Ok(n as i64)
+}
+
+/// SQL that answers "does the loaded honker extension have the
+/// queue-scoped `honker_cancel(queue, job_id)`?" — returns 1 or 0.
+///
+/// Calling `honker_cancel` at an arity the loaded extension does not
+/// have is a hard SQLite error ("wrong number of arguments"), not a
+/// fallback, and there is no `honker_version()` to ask first. A binding
+/// built for the 2-arg form and running against an older vendored
+/// `libhonker_ext` would therefore fail at cancel time in production.
+/// `pragma_function_list` reports each arity as its own row, so this
+/// one cheap query at connect time turns that into a startup check.
+///
+/// Bindings that talk to the extension over SQL (Go, Ruby, .NET, C++,
+/// Elixir, Bun) run this string verbatim; Rust-side bindings can call
+/// [`has_queue_scoped_cancel`] instead.
+///
+/// If the query itself raises, that is "cannot tell", not "absent" —
+/// a SQLite built with SQLITE_OMIT_INTROSPECTION_PRAGMAS has no
+/// `pragma_function_list` to read. Surface the error. A binding that
+/// rescues it into `false` reports an old extension while running a
+/// new one, which is the exact failure this probe exists to prevent.
+pub const CANCEL_QUEUE_SCOPED_PROBE_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM pragma_function_list WHERE name = 'honker_cancel' AND narg = 2)";
+
+/// Run [`CANCEL_QUEUE_SCOPED_PROBE_SQL`] on `conn`.
+///
+/// Errors are propagated, not flattened into `false`: a SQLite build
+/// compiled without the introspection pragmas cannot answer this
+/// question, and reporting "no queue-scoped cancel" for "cannot tell"
+/// would send a binding down the wrong migration path silently.
+pub fn has_queue_scoped_cancel(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(CANCEL_QUEUE_SCOPED_PROBE_SQL, [], |r| r.get(0))
 }
 
 /// Read a single job row by id. Returns a JSON object on success or
@@ -1887,5 +1955,303 @@ mod real_arg_tests {
         assert!(probe(f64::NAN).is_err(), "NaN must reject");
         // Negative zero is whole and must coerce to 0, not error.
         assert!(probe(-0.0).is_ok(), "-0.0 must pass");
+    }
+}
+
+// Queue-scoped cancel (issue #134). `honker_cancel` carries a global
+// 1-arg form and a queue-scoped 2-arg form on the same connection while
+// bindings migrate, so these tests cover both arities together: the
+// scoped form must refuse a foreign queue without touching the row, and
+// the global form must keep its current meaning exactly.
+#[cfg(test)]
+mod cancel_scoping {
+    use crate::{
+        CANCEL_QUEUE_SCOPED_PROBE_SQL, attach_honker_functions, bootstrap_honker_schema,
+        has_queue_scoped_cancel,
+    };
+    use rusqlite::Connection;
+    use rusqlite::OptionalExtension;
+    use rusqlite::functions::FunctionFlags;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        attach_honker_functions(&conn).unwrap();
+        bootstrap_honker_schema(&conn).unwrap();
+        conn
+    }
+
+    fn enqueue(conn: &Connection, queue: &str) -> i64 {
+        conn.query_row(
+            "SELECT honker_enqueue(?1, '{}', NULL, NULL, 0, 3, NULL)",
+            [queue],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The queue a live row sits in, or `None` if the row is gone.
+    /// Distinguishing "still there" from "deleted" is the whole point of
+    /// the wrong-queue tests, so they assert on this, not just on the
+    /// return count.
+    fn live_queue(conn: &Connection, id: i64) -> Option<String> {
+        // `.optional()` and not `.ok()`: `.ok()` turns EVERY error into
+        // None, so a typo'd table name or a schema change would make
+        // "the row is gone" assertions below pass without the cancel
+        // having done anything. Only QueryReturnedNoRows means gone.
+        conn.query_row("SELECT queue FROM _honker_live WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .unwrap()
+    }
+
+    /// Both arities are callable on the SAME connection, under the SAME
+    /// name. This is the migration story: 1-arg callers keep working
+    /// while bindings move to the 2-arg form one release at a time.
+    #[test]
+    fn both_arities_coexist_on_one_connection() {
+        let conn = db();
+        let a = enqueue(&conn, "emails");
+        let b = enqueue(&conn, "sms");
+
+        let one_arg: i64 = conn
+            .query_row("SELECT honker_cancel(?1)", [a], |r| r.get(0))
+            .unwrap();
+        assert_eq!(one_arg, 1, "1-arg global cancel still resolves");
+
+        let two_arg: i64 = conn
+            .query_row("SELECT honker_cancel('sms', ?1)", [b], |r| r.get(0))
+            .unwrap();
+        assert_eq!(two_arg, 1, "2-arg scoped cancel resolves on the same conn");
+    }
+
+    /// The defect this closes: a handle for one queue must not delete
+    /// another queue's row, and the row must survive the attempt.
+    #[test]
+    fn wrong_queue_cancels_nothing_and_leaves_the_row() {
+        let conn = db();
+        let sms_id = enqueue(&conn, "sms");
+
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel('emails', ?1)", [sms_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "emails handle must not cancel an sms job");
+        assert_eq!(
+            live_queue(&conn, sms_id).as_deref(),
+            Some("sms"),
+            "the sms row must still be live after a foreign-queue cancel"
+        );
+
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel('sms', ?1)", [sms_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the owning queue can cancel it");
+        assert_eq!(live_queue(&conn, sms_id), None, "the row is gone");
+    }
+
+    /// Scoping must hold for a claimed (processing) row too, not just a
+    /// pending one — that is the row a racing worker is holding, and the
+    /// reason the queue check is inside the DELETE.
+    #[test]
+    fn scoping_holds_for_processing_rows() {
+        let conn = db();
+        let sms_id = enqueue(&conn, "sms");
+        let _: String = conn
+            .query_row("SELECT honker_claim_batch('sms', 'w1', 8, 300)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM _honker_live WHERE id = ?1",
+                [sms_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "processing");
+
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel('emails', ?1)", [sms_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "wrong queue must not cancel a processing row");
+        assert_eq!(
+            live_queue(&conn, sms_id).as_deref(),
+            Some("sms"),
+            "the processing sms row must still be live"
+        );
+
+        // The owning queue does reach the claimed row. This half is
+        // what pins the 2-arg form to the same states as the 1-arg
+        // form: without it, narrowing the scoped DELETE to
+        // `state = 'pending'` leaves every other test in this module
+        // passing, and the two arities silently disagree about
+        // processing rows.
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel('sms', ?1)", [sms_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the owning queue cancels a processing row");
+        assert_eq!(
+            live_queue(&conn, sms_id),
+            None,
+            "the processing row is gone after its own queue cancels it"
+        );
+    }
+
+    /// The 1-arg form keeps its shipped meaning: global, ignores the
+    /// queue. It becomes the documented `Database.cancel(id)` form. If
+    /// this ever fails, the migration broke every existing caller.
+    #[test]
+    fn one_arg_form_is_still_global() {
+        let conn = db();
+        let sms_id = enqueue(&conn, "sms");
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel(?1)", [sms_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "1-arg cancel reaches a job in any queue");
+        assert_eq!(live_queue(&conn, sms_id), None);
+    }
+
+    /// The 1-arg form's other shipped promise, the one its own doc
+    /// comment makes: it removes a claimed (processing) row, not just a
+    /// pending one. Nothing else in honker-core covered that, so the
+    /// two arities could have drifted apart on state — one keeping
+    /// 'processing' in its IN-list, the other losing it — with every
+    /// other test here still green.
+    #[test]
+    fn one_arg_form_cancels_a_processing_row() {
+        let conn = db();
+        let id = enqueue(&conn, "sms");
+        let _: String = conn
+            .query_row("SELECT honker_claim_batch('sms', 'w1', 8, 300)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let state: String = conn
+            .query_row("SELECT state FROM _honker_live WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "processing");
+
+        let n: i64 = conn
+            .query_row("SELECT honker_cancel(?1)", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "1-arg cancel still reaches a claimed row");
+        assert_eq!(live_queue(&conn, id), None);
+    }
+
+    /// Idempotence and the missing-id case at the new arity: a second
+    /// cancel and an unknown id both return 0, same as the 1-arg form.
+    #[test]
+    fn repeat_and_missing_return_zero() {
+        let conn = db();
+        let id = enqueue(&conn, "emails");
+        let first: i64 = conn
+            .query_row("SELECT honker_cancel('emails', ?1)", [id], |r| r.get(0))
+            .unwrap();
+        let second: i64 = conn
+            .query_row("SELECT honker_cancel('emails', ?1)", [id], |r| r.get(0))
+            .unwrap();
+        let missing: i64 = conn
+            .query_row("SELECT honker_cancel('emails', 987654)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((first, second, missing), (1, 0, 0));
+    }
+
+    /// SQLite dispatches on (name, arity), so a wrong argument count is
+    /// a hard error rather than a silent fallback to the other form.
+    /// That is exactly why the capability probe below has to exist.
+    #[test]
+    fn unregistered_arity_is_an_error() {
+        let conn = db();
+        let err = conn
+            .query_row("SELECT honker_cancel('emails', 1, 2)", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wrong number of arguments"),
+            "expected an arity error, got: {err}"
+        );
+    }
+
+    /// A connection with the current functions attached reports the
+    /// queue-scoped form as present, through both the exported SQL
+    /// string and the Rust helper.
+    #[test]
+    fn probe_reports_true_with_the_two_arg_form() {
+        let conn = db();
+        assert!(
+            has_queue_scoped_cancel(&conn).unwrap(),
+            "helper must see honker_cancel/2 on a fully attached connection"
+        );
+        let raw: i64 = conn
+            .query_row(CANCEL_QUEUE_SCOPED_PROBE_SQL, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, 1, "the exported probe SQL must return 1");
+    }
+
+    /// The case the probe exists for: an older vendored extension that
+    /// registered only the global 1-arg `honker_cancel`. Registering
+    /// arity 1 by hand reproduces that connection exactly — the name is
+    /// present, the arity is not — and the probe must say false rather
+    /// than being fooled by the name.
+    #[test]
+    fn probe_reports_false_without_the_two_arg_form() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.create_scalar_function("honker_cancel", 1, FunctionFlags::SQLITE_UTF8, |_ctx| {
+            Ok(0i64)
+        })
+        .unwrap();
+
+        let present: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_function_list \
+                 WHERE name = 'honker_cancel' AND narg = 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "precondition: the 1-arg form is registered");
+
+        assert!(
+            !has_queue_scoped_cancel(&conn).unwrap(),
+            "helper must not report a queue-scoped cancel on an old extension"
+        );
+        let raw: i64 = conn
+            .query_row(CANCEL_QUEUE_SCOPED_PROBE_SQL, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, 0, "the exported probe SQL must return 0");
+    }
+
+    /// "Cannot tell" must not collapse into "absent". A real table
+    /// named `pragma_function_list` shadows the eponymous pragma table
+    /// on this connection, so the probe query no longer resolves —
+    /// the same shape a SQLite built with
+    /// SQLITE_OMIT_INTROSPECTION_PRAGMAS presents, where the pragma
+    /// table is not there at all.
+    ///
+    /// This is the test for the claim the doc comment makes. Without
+    /// it, `has_queue_scoped_cancel` could be rewritten to end in
+    /// `.unwrap_or(false)` and every other test in this module would
+    /// still pass — while a binding on a new extension got told the
+    /// extension was old and took the wrong migration path.
+    #[test]
+    fn probe_error_is_not_flattened_to_false() {
+        let conn = db();
+        assert!(
+            has_queue_scoped_cancel(&conn).unwrap(),
+            "precondition: this connection answers the probe with true"
+        );
+
+        conn.execute_batch("CREATE TABLE pragma_function_list (x)")
+            .unwrap();
+
+        let err = has_queue_scoped_cancel(&conn)
+            .expect_err("an unanswerable probe must be an Err, never Ok(false)");
+        assert!(
+            err.to_string().contains("no such column"),
+            "expected the probe query itself to fail, got: {err}"
+        );
     }
 }

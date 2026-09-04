@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## Unreleased — queue-scoped cancel in core (issue #134)
+
+- `honker_cancel(queue, job_id)` joins the existing `honker_cancel(job_id)`.
+  The 2-arg form only removes a pending or processing row that is in that
+  queue; a job in another queue is a miss and returns 0, the same answer an
+  already-ack'd id gives. The queue check is part of the DELETE, not a read
+  before it — a `SELECT queue` followed by a `DELETE` leaves a window for a
+  concurrent claim to change the row between the two statements.
+- The 1-arg form is unchanged and stays: it is the global cancel that
+  `Database.cancel(id)` will use. SQLite dispatches on (name, arity), so both
+  forms live on one connection and bindings can move to the scoped form one
+  package at a time instead of in lockstep.
+- New connect-time capability probe, `honker_core::has_queue_scoped_cancel`
+  and the `CANCEL_QUEUE_SCOPED_PROBE_SQL` string behind it. Calling
+  `honker_cancel` at an arity the loaded extension does not have is a hard
+  SQLite error, not a fallback, and there is no `honker_version()` to ask
+  first — so a binding built for the 2-arg form running against an older
+  vendored `libhonker_ext` would fail at cancel time in production.
+  `pragma_function_list` reports each arity as its own row, so one cheap
+  query at startup turns that into a connect-time check. Bindings that talk
+  to the extension over SQL run the string; Rust-side bindings call the
+  helper. The probe propagates errors rather than reporting "absent" for
+  "cannot tell".
+- Core only. No binding calls the new arity yet, so no existing behavior
+  changes: every current caller keeps hitting `honker_cancel(job_id)`.
+- Tests cover both arities on one connection, the wrong-queue no-op on
+  pending and processing rows (asserting the row is still live afterwards),
+  the owning queue cancelling a claimed row at both arities, idempotence,
+  the arity error, and the probe with and without the 2-arg form,
+  including that an unanswerable probe is an error and not a `false` —
+  in honker-core against rusqlite, and again through the real
+  `.load libhonker_ext` path in `tests/test_extension_interop.py`.
+- The shared ORM surface (`scripts/proof/orm/surface.json`, replayed by
+  every documented ORM recipe in 11 languages) gains the scoped cancel
+  and the capability probe. That is what proves the new arity and
+  `pragma_function_list` work through each binding's own SQLite build,
+  not just through rusqlite and CPython's.
+
 ## 2026-08-27 — Node 0.5.1
 
 - Node `@russellthehippo/honker-node`: 0.5.1, with the four

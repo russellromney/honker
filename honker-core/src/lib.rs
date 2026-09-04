@@ -42,6 +42,11 @@ mod kernel_watcher;
 mod shm_watcher;
 
 pub use honker_ops::attach_honker_functions;
+// Connect-time capability probe for the queue-scoped
+// `honker_cancel(queue, job_id)`. Bindings call this (or run the SQL
+// string themselves) to detect a vendored extension that only has the
+// older global 1-arg form.
+pub use honker_ops::{CANCEL_QUEUE_SCOPED_PROBE_SQL, has_queue_scoped_cancel};
 // Shared by the loadable extension's own watcher SQL functions so every
 // honker_* function coerces integer arguments the same way.
 pub use honker_ops::{arg_i64, arg_opt_i64};
