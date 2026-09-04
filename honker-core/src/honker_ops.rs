@@ -113,6 +113,8 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 ///     error *and* a connection silently left mid-transaction. Bindings
 ///     hold long-lived connections; every later call would otherwise
 ///     join that transaction.
+///   * A panicking `body` unwinds past every one of those paths, so the
+///     undo also hangs off a drop guard. See [`UnwindUndo`].
 fn in_savepoint<T>(
     conn: &Connection,
     name: &str,
@@ -122,7 +124,13 @@ fn in_savepoint<T>(
     // own it and nobody else's work is inside it.
     let owns_transaction = conn.is_autocommit();
     conn.execute_batch(&format!("SAVEPOINT {name}"))?;
-    match body() {
+    let mut guard = UnwindUndo {
+        conn,
+        name,
+        owns_transaction,
+        armed: true,
+    };
+    let result = match body() {
         Ok(value) => match conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
             Ok(()) => Ok(value),
             // RELEASE of the outermost savepoint is the COMMIT. If it
@@ -132,6 +140,49 @@ fn in_savepoint<T>(
             Err(release_err) => Err(undo_savepoint(conn, name, owns_transaction, release_err)),
         },
         Err(body_err) => Err(undo_savepoint(conn, name, owns_transaction, body_err)),
+    };
+    // Every path above already left the connection in a known state, so
+    // the guard has nothing left to do.
+    guard.armed = false;
+    result
+}
+
+/// Undoes [`in_savepoint`]'s frame when `body` unwinds instead of
+/// returning `Err`. Disarmed on every ordinary path.
+///
+/// Without it a panic skips the undo entirely. Measured: the DELETE
+/// stayed applied, `is_autocommit()` was left false, and the next
+/// honker call on that connection silently joined the leaked
+/// transaction and returned `Ok(0)` — a miss, not an error. rusqlite
+/// catches a panic raised inside a scalar function and hands the caller
+/// an "unwinding panic" error, so the connection survives to be reused:
+/// through `SELECT honker_*(...)` the frame was still on the stack
+/// afterwards, on the long-lived connection every binding holds.
+struct UnwindUndo<'a> {
+    conn: &'a Connection,
+    name: &'a str,
+    owns_transaction: bool,
+    armed: bool,
+}
+
+impl Drop for UnwindUndo<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Only reached while unwinding, so there is no error to return
+        // and no second panic to raise. Undo the frame the same way the
+        // error path does; if that fails, the connection really is in an
+        // unknown state and stderr is the only channel left.
+        let failures = undo_savepoint_frame(self.conn, self.name, self.owns_transaction);
+        if !failures.is_empty() {
+            eprintln!(
+                "honker: error: undoing SAVEPOINT {} after a panic left the \
+                 connection in an unknown state: {}",
+                self.name,
+                failures.join("; ")
+            );
+        }
     }
 }
 
@@ -143,15 +194,32 @@ fn undo_savepoint(
     owns_transaction: bool,
     cause: rusqlite::Error,
 ) -> rusqlite::Error {
+    let failures = undo_savepoint_frame(conn, name, owns_transaction);
+    if failures.is_empty() {
+        return cause;
+    }
+    // Never swallow a failed undo: the connection is in an unknown state
+    // and that has to be loud. Keep the cause's text intact — callers
+    // and tests match on it — and append what else went wrong.
+    to_sql_err(format!(
+        "{cause}; additionally, undoing SAVEPOINT {name} left the connection \
+         in an unknown state: {}",
+        failures.join("; ")
+    ))
+}
+
+/// Roll the frame back and pop it. Returns what went wrong while doing
+/// so; empty means the connection is back in a known state.
+fn undo_savepoint_frame(conn: &Connection, name: &str, owns_transaction: bool) -> Vec<String> {
+    let mut failures: Vec<String> = Vec::new();
+
     if conn.is_autocommit() {
         // SQLite already rolled the whole transaction back on its own —
         // an ABORT, SQLITE_FULL or an I/O error does that. There is no
         // savepoint left to roll back to, and issuing one would turn a
         // clean state into a bogus second error.
-        return cause;
+        return failures;
     }
-
-    let mut failures: Vec<String> = Vec::new();
 
     // Undo our own frame and pop it, leaving any outer transaction the
     // caller opened untouched. This is also the form that is legal from
@@ -182,17 +250,7 @@ fn undo_savepoint(
         }
     }
 
-    if failures.is_empty() {
-        return cause;
-    }
-    // Never swallow a failed undo: the connection is in an unknown state
-    // and that has to be loud. Keep the cause's text intact — callers
-    // and tests match on it — and append what else went wrong.
-    to_sql_err(format!(
-        "{cause}; additionally, undoing SAVEPOINT {name} left the connection \
-         in an unknown state: {}",
-        failures.join("; ")
-    ))
+    failures
 }
 
 /// Register all `honker_*` honker scalar functions on `conn`. Idempotent
@@ -2634,6 +2692,126 @@ mod optional_error_tests {
             "a failed rollback must be reported, not discarded, got: {msg}"
         );
         conn.execute_batch("ROLLBACK").unwrap();
+    }
+
+    // A panic unwinds past every `match` arm in in_savepoint, so the
+    // undo cannot live only on the error path. Measured without the
+    // drop guard: the DELETE stayed applied (live=0), is_autocommit()
+    // was left false, and the next fail() on that connection returned
+    // Ok(0) — a silent miss from inside the leaked transaction, which is
+    // the exact failure class this PR exists to close.
+    #[test]
+    fn in_savepoint_undoes_its_work_when_the_body_panics() {
+        let conn = db();
+        let id = claimed_job(&conn);
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            in_savepoint::<()>(&conn, "honker_panic_probe", || {
+                conn.execute("DELETE FROM _honker_live WHERE id = ?1", [id])
+                    .unwrap();
+                panic!("body panicked");
+            })
+        }));
+        assert!(caught.is_err(), "the panic must still reach the caller");
+
+        assert!(
+            conn.is_autocommit(),
+            "a panicking body must not leave the connection inside the \
+             transaction in_savepoint opened"
+        );
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "a panicking body must not leave its DELETE applied"
+        );
+        assert!(
+            conn.execute_batch("ROLLBACK TO SAVEPOINT honker_panic_probe")
+                .is_err(),
+            "the frame must be popped, not left on the savepoint stack"
+        );
+        // The connection has to still be usable, not silently inside a
+        // transaction that swallows the next call.
+        assert_eq!(
+            fail(&conn, id, "w1", "after the panic").unwrap(),
+            1,
+            "the next call must act on the job, not return a silent miss \
+             from inside a leaked transaction"
+        );
+        assert_eq!(dead_count(&conn, id), 1);
+    }
+
+    // Same thing on the path bindings take. rusqlite turns a panic
+    // inside a scalar function into an "unwinding panic" error and hands
+    // the connection back, so the connection outlives the panic and a
+    // leaked frame would sit on it for every later call.
+    #[test]
+    fn a_panicking_savepoint_body_leaves_no_frame_on_the_scalar_path() {
+        let conn = db();
+        conn.create_scalar_function(
+            "honker_test_panic_in_savepoint",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |ctx| {
+                let db = unsafe { ctx.get_connection() }?;
+                in_savepoint::<i64>(&db, "honker_panic_probe_sql", || panic!("inside the udf"))
+            },
+        )
+        .unwrap();
+
+        let err = conn
+            .query_row("SELECT honker_test_panic_in_savepoint()", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect_err("a panicking body must surface as an error, not a value");
+        assert!(
+            err.to_string().contains("panic"),
+            "expected the panic to be reported, got: {err}"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "the caller's long-lived connection must not be left inside a \
+             transaction the scalar function opened"
+        );
+        assert!(
+            conn.execute_batch("ROLLBACK TO SAVEPOINT honker_panic_probe_sql")
+                .is_err(),
+            "no savepoint frame may be left on the caller's connection"
+        );
+    }
+
+    // The `is_autocommit()` short-circuit in undo_savepoint_frame:
+    // RAISE(ROLLBACK) makes SQLite roll the whole transaction back
+    // itself, so there is no frame left to roll back to. The cause has
+    // to reach the caller unchanged rather than wearing a bogus
+    // "no such savepoint" clause.
+    #[test]
+    fn a_self_rolled_back_transaction_returns_the_cause_unchanged() {
+        let conn = db();
+        let id = claimed_job(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER test_rollback_dead BEFORE INSERT ON _honker_dead
+             BEGIN SELECT RAISE(ROLLBACK, 'dead insert rolled back'); END",
+        )
+        .unwrap();
+
+        let err = fail(&conn, id, "w1", "boom").expect_err("the ABORT must reach the caller");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dead insert rolled back"),
+            "the cause must reach the caller, got: {msg}"
+        );
+        assert!(
+            !msg.contains("unknown state"),
+            "SQLite had already rolled back, so nothing was left in an \
+             unknown state; the error must not claim otherwise: {msg}"
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            live_count(&conn, id),
+            1,
+            "the job must survive the rolled-back dead-letter move"
+        );
+        assert_eq!(dead_count(&conn, id), 0);
     }
 
     // Defect 5 from the review: RELEASE of the outermost savepoint is
