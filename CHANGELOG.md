@@ -30,10 +30,17 @@
   "duplicate column" error when a concurrent bootstrap wins the race.
   `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that
   already exists, which is what the migration test pins.
+- No language binding maps `claimed_at` onto its job type yet, so for
+  now it is read in SQL. #136 tracks adding it to the full job shape
+  per binding.
 - Tests: NULL before first claim, first claim, heartbeat-does-not-move,
-  retry clears, reclaim resets, plus a migration test proving a
-  pre-column database gains the column and keeps its rows with
-  `claimed_at` NULL rather than a backfilled timestamp.
+  retry clears, reclaim resets to the reclaim time (bounded by a clock
+  read taken either side of the reclaim, not just "moved off the old
+  value"), ack and fail both remove the row, an expired claim keeps
+  `claimed_at` alongside the rest of the stale claim, plus a migration
+  test proving a pre-column database gains the column, keeps its rows
+  with `claimed_at` NULL rather than a backfilled timestamp, and ends
+  up with the same columns in the same order as a fresh database.
 
 ## Unreleased — Core SQLite error propagation
 
