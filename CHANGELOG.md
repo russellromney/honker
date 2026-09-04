@@ -1,5 +1,59 @@
 # CHANGELOG
 
+## Unreleased — Core SQLite error propagation
+
+- `honker-core` no longer discards SQLite errors in five lookups.
+  `retry`, `fail`, `get_job`, `lock_acquire`, and `result_get` ended in
+  `.ok()`, which mapped every error to "no row", not just
+  `QueryReturnedNoRows`. A broken stored value turned into a silent
+  no-op: `retry`/`fail` reported "not our claim", `get_job` reported a
+  missing job, `lock_acquire` reported the lock as held so no leader
+  could ever start. All five now use `OptionalExtension::optional()?`.
+- `fail()` could lose a job outright. It runs
+  `DELETE FROM _honker_live ... RETURNING`, so the row is already gone
+  when the row mapper decodes it. Measured: propagating the mapper's
+  error does **not** undo that DELETE — the job ended up in neither
+  `_honker_live` nor `_honker_dead`. The delete-decode-insert now runs
+  inside a `SAVEPOINT honker_fail` that rolls back on any error, so a
+  failed `fail()` leaves the job claimable instead of destroyed.
+  SAVEPOINT rather than BEGIN/COMMIT so it nests under a caller's
+  transaction and rolls back only its own work.
+- The same delete-then-more-work pattern was live at three more sites,
+  and all three were measured losing the job the same way (`live=0,
+  dead=0`) before the fix:
+  - `dead_letter_exhausted_claimable`, reached by **every ordinary
+    claim** — no `fail()` call needed. It deletes the whole matching set
+    before decoding any of it, so one bad `attempts` value lost every
+    job beside it too.
+  - `retry()`'s dead-letter branch — `DELETE` then `INSERT` as two
+    statements. A failing `_honker_dead` INSERT destroyed the job.
+  - `sweep_expired` — same `DELETE ... RETURNING` then decode then
+    INSERT shape.
+- The savepoint wrapper is now one shared helper, `in_savepoint`, used
+  at all four sites instead of copied four times. Two defects in the
+  original copy are fixed in it:
+  - The rollback result is no longer discarded. `let _ =
+    conn.execute_batch("ROLLBACK TO SAVEPOINT ...")` hid exactly the
+    kind of error this change exists to surface. A failed undo is now
+    reported, with the original cause kept intact in the message.
+  - A failed `RELEASE` no longer strands the caller inside the
+    transaction the savepoint opened. `RELEASE` of the outermost
+    savepoint is the COMMIT, so it can fail — measured on a
+    rollback-journal database with a concurrent reader: the caller got
+    `database is locked` **and** a connection with
+    `is_autocommit() == false` whose own reads claimed the job had been
+    dead-lettered. Bindings hold long-lived connections, so every later
+    call joined that transaction. The helper now ends it.
+- `ack_batch` and `claim_batch`'s claiming UPDATE deliberately stay
+  savepoint-free; both now carry a comment saying why.
+- 27 regression tests. At each of the five `.ok()` sites: a genuine miss
+  and a broken stored type. At each of the four savepoint sites: the
+  live row survives a decode failure and a failing `_honker_dead`
+  INSERT, and a genuine miss still returns 0/None. Plus the
+  `SELECT honker_*(...)` scalar-function path — the only one bindings
+  and ORM users take, and previously untested — for `fail`,
+  `claim_batch`, and `sweep_expired`.
+
 ## 2026-08-27 — Node 0.5.1
 
 - Node `@russellthehippo/honker-node`: 0.5.1, with the four
