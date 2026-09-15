@@ -943,9 +943,8 @@ pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite
 ///
 /// Returns 0 if no such future deadline exists.
 pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
-    Ok(conn
-        .query_row(
-            "SELECT COALESCE(MIN(deadline), 0)
+    conn.query_row(
+        "SELECT COALESCE(MIN(deadline), 0)
              FROM (
                SELECT MIN(run_at) AS deadline
                FROM _honker_live
@@ -963,10 +962,9 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
                  AND (expires_at IS NULL OR expires_at > unixepoch())
                  AND claim_expires_at >= unixepoch()
              )",
-            rusqlite::params![queue],
-            |r| r.get(0),
-        )
-        .unwrap_or(0))
+        rusqlite::params![queue],
+        |r| r.get(0),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -1654,13 +1652,11 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
 }
 
 pub fn scheduler_soonest(conn: &Connection) -> rusqlite::Result<i64> {
-    Ok(conn
-        .query_row(
-            "SELECT COALESCE(MIN(next_fire_at), 0) FROM _honker_scheduler_tasks WHERE enabled = 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0))
+    conn.query_row(
+        "SELECT COALESCE(MIN(next_fire_at), 0) FROM _honker_scheduler_tasks WHERE enabled = 1",
+        [],
+        |r| r.get(0),
+    )
 }
 
 /// Toggle `enabled` on a registered schedule. Returns 1 if updated, 0
@@ -1772,7 +1768,8 @@ pub fn scheduler_update(
             rusqlite::params![name],
             |_| Ok(true),
         )
-        .unwrap_or(false);
+        .optional()?
+        .is_some();
     if !exists {
         return Ok(0);
     }
@@ -1986,6 +1983,7 @@ pub fn stream_get_offset(conn: &Connection, consumer: &str, topic: &str) -> rusq
             rusqlite::params![consumer, topic],
             |r| r.get(0),
         )
+        .optional()?
         .unwrap_or(0))
 }
 

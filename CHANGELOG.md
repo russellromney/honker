@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## Unreleased — remaining core lookup errors
+
+- Queue deadlines, scheduler deadlines, scheduler updates, and stream checkpoint
+  reads now report database errors instead of returning zero. Genuine absent
+  rows/deadlines still return zero. A corrupt checkpoint is not a new consumer.
+
 ## Unreleased — `claimed_at` on `_honker_live`
 
 - New nullable `claimed_at INTEGER` column on `_honker_live`: when the
