@@ -530,6 +530,9 @@ jobs:
           dotnet-version: "10.0.x"
       - uses: mlugg/setup-zig@v2
         with:
+          # honker.zig uses @cImport, which Zig 0.17 removed. Pin until the
+          # C++ binding moves to the build system's translate-c.
+          version: 0.16.0
           use-cache: false
       - uses: oven-sh/setup-bun@v2
       - uses: ruby/setup-ruby@v1
