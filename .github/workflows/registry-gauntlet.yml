@@ -95,6 +95,9 @@ jobs:
           elixir-version: "1.19"
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2
         with:
+          # honker.zig uses @cImport, which Zig 0.17 removed. Pin until the
+          # C++ binding moves to the build system's translate-c.
+          version: 0.16.0
           use-cache: false
 
       - name: Install native consumer dependencies
