@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## Unreleased — retry claim ownership
+
+- `honker_retry` checks ownership in the same statement that changes the
+  job. Before, it read the row and then wrote it in a separate statement,
+  so another connection could cancel or reclaim the job in between. Retry
+  then overwrote the new worker's claim, or moved a cancelled job into
+  `_honker_dead`.
+- Pending branch: one `UPDATE` guarded by worker, `state = 'processing'`,
+  an unexpired lease and `attempts < max_attempts`. It uses no savepoint,
+  so it still works inside triggers and `INSERT ... SELECT`.
+- Exhausted branch: a guarded `DELETE ... RETURNING` and the
+  `_honker_dead` insert in one savepoint, the same shape as `fail()`. A
+  dead row is written only from a row that DELETE removed.
+  A short read after the failed UPDATE decides whether to open that
+  savepoint, so a miss opens none. The DELETE rechecks every guard.
+- A claim that was cancelled, reclaimed or expired returns 0, as before.
+  Retry's first statement is a write, so it never holds an old read
+  snapshot. Commits from other connections, including unrelated ones, do
+  not cause `database is locked` errors; busy_timeout covers waiting for
+  the lock.
+
 ## Unreleased — `claimed_at` on `_honker_live`
 
 - New nullable `claimed_at INTEGER` column on `_honker_live`: when the
