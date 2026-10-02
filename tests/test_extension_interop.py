@@ -885,3 +885,85 @@ def test_load_extension_names_the_real_problem_when_unsupported():
     message = str(excinfo.value)
     assert "SQLITE_ENABLE_LOAD_EXTENSION" in message
     assert "honker.open()" in message
+
+
+# --- queue-scoped cancel (issue #134) -------------------------------
+#
+# `honker_cancel` carries a global 1-arg form and a queue-scoped 2-arg
+# form. honker-core proves the semantics against rusqlite directly;
+# these two prove the same functions are really there over the
+# `.load libhonker_ext` path, which is how Go, Ruby, .NET, C++, Elixir
+# and Bun get them.
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_cancel_carries_both_arities(ext_db_path):
+    """Through the loaded extension: the 2-arg form refuses a job in
+    another queue and leaves the row alone, cancels one in its own
+    queue, and the 1-arg form still reaches any queue."""
+    conn = _open_ext(ext_db_path)
+    sms_id = conn.execute(
+        "SELECT honker_enqueue('sms', '{}', NULL, NULL, 0, 3, NULL)"
+    ).fetchone()[0]
+    email_id = conn.execute(
+        "SELECT honker_enqueue('emails', '{}', NULL, NULL, 0, 3, NULL)"
+    ).fetchone()[0]
+    conn.commit()
+
+    # Wrong queue: no-op, and the row is still live afterwards.
+    assert conn.execute(
+        "SELECT honker_cancel('emails', ?)", [sms_id]
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT queue FROM _honker_live WHERE id=?", [sms_id]
+    ).fetchone() == ("sms",)
+
+    # Own queue: cancels, and the row is gone.
+    assert conn.execute(
+        "SELECT honker_cancel('sms', ?)", [sms_id]
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT queue FROM _honker_live WHERE id=?", [sms_id]
+    ).fetchone() is None
+
+    # The 1-arg form is unchanged: global, no queue argument.
+    assert conn.execute(
+        "SELECT honker_cancel(?)", [email_id]
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT queue FROM _honker_live WHERE id=?", [email_id]
+    ).fetchone() is None
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_capability_probe_detects_the_two_arg_cancel(ext_db_path):
+    """The connect-time probe a binding runs before trusting the 2-arg
+    form. Calling `honker_cancel` at an arity the loaded extension does
+    not have is a hard error, so a binding vendoring an older
+    libhonker_ext needs to find out at connect time, not at cancel time.
+
+    `pragma_function_list` reports each arity as its own row. The
+    negative case registers a 1-arg `honker_cancel` and nothing else,
+    standing in for that older extension: same name, missing arity."""
+    probe = (
+        "SELECT EXISTS(SELECT 1 FROM pragma_function_list "
+        "WHERE name = 'honker_cancel' AND narg = 2)"
+    )
+
+    conn = _open_ext(ext_db_path)
+    assert conn.execute(probe).fetchone()[0] == 1
+    conn.close()
+
+    old = sqlite3.connect(":memory:")
+    old.create_function("honker_cancel", 1, lambda job_id: 0)
+    assert old.execute(
+        "SELECT EXISTS(SELECT 1 FROM pragma_function_list "
+        "WHERE name = 'honker_cancel' AND narg = 1)"
+    ).fetchone()[0] == 1, "precondition: the 1-arg form is registered"
+    assert old.execute(probe).fetchone()[0] == 0
+    # And the arity mismatch it protects against is a hard error.
+    with pytest.raises(sqlite3.OperationalError, match="wrong number of arguments"):
+        old.execute("SELECT honker_cancel('emails', 1)")
+    old.close()
