@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## Unreleased — SQL call context for protected job transitions
+
+- `honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a
+  `honker_retry` that dead-letters the job must run as a separate SELECT
+  after write/RETURNING cursors are finished. They are not supported inside
+  triggers or write statements. A `honker_retry` that returns the job to
+  pending has no savepoint and is not restricted.
+- The error now names the function the caller used and explains how to call
+  it, instead of only saying that SQL statements are in progress.
+- Explicit caller transactions remain supported; the docs recommend
+  `BEGIN IMMEDIATE`.
+- Do not remove savepoint protection to restore old invocation patterns: it
+  prevents failed transitions from silently losing jobs.
+
 ## Unreleased — retry claim ownership
 
 - `honker_retry` checks ownership in the same statement that changes the

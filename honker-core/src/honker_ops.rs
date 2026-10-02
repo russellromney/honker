@@ -100,6 +100,11 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 /// caller's statement and the caller may already hold a transaction.
 /// SAVEPOINT nests; BEGIN does not.
 ///
+/// `name` is the public SQL function that needs the savepoint, such as
+/// `honker_claim_batch`. When SQLite refuses the savepoint because a
+/// write statement is still active, the error tells the caller how to
+/// call that function instead.
+///
 /// The error handling is the point, so it is spelled out:
 ///
 ///   * The undo result is never discarded. A connection left in an
@@ -123,7 +128,28 @@ fn in_savepoint<T>(
     // True means this SAVEPOINT is what opens the transaction, so we
     // own it and nobody else's work is inside it.
     let owns_transaction = conn.is_autocommit();
-    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    conn.execute_batch(&format!("SAVEPOINT {name}"))
+        .map_err(|err| {
+            // SQLite cannot create a savepoint while a write statement is active.
+            // Keep SQLite's message and add how to call the operation instead.
+            // `name` is the public SQL function the caller used.
+            match err {
+                rusqlite::Error::SqliteFailure(code, Some(message))
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy
+                        && message == "cannot open savepoint - SQL statements in progress" =>
+                {
+                    rusqlite::Error::SqliteFailure(
+                        code,
+                        Some(format!(
+                            "{message}; honker: {name} requires a separate SELECT after you \
+                     finish all write/RETURNING cursors; do not call it from a trigger \
+                     or write statement. An explicit surrounding transaction is supported"
+                        )),
+                    )
+                }
+                other => other,
+            }
+        })?;
     let mut guard = UnwindUndo {
         conn,
         name,
@@ -779,7 +805,8 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
 /// DELETE matched (live=0, dead=0 for all of them). This one runs on
 /// every ordinary claim, so it is the most reachable of the five.
 fn dead_letter_exhausted_claimable(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
-    in_savepoint(conn, "honker_dead_letter_claimable", || {
+    // Named after the public function: a call-context error shows this name.
+    in_savepoint(conn, "honker_claim_batch", || {
         dead_letter_exhausted_claimable_inner(conn, queue)
     })
 }
