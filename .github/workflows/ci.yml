@@ -761,6 +761,36 @@ jobs:
           HONKER_TEST_DB="$RUNNER_TEMP/orm-kotlin.db" \
             mvn -B -q compile exec:java -Dexec.mainClass=dev.honker.ormproof.ExposedProof
 
+  claimed-at-upgrade:
+    name: upgrade · legacy and current claim timestamps
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build current and pinned pre-column extensions
+        env:
+          LEGACY_COMMIT: c18c263af2d94ca56ff0f9a7174bf7d1c1fc9b52
+        run: |
+          cargo build --release --locked -p honker-extension
+          mkdir -p "$RUNNER_TEMP/honker-current" "$RUNNER_TEMP/honker-legacy-source" "$RUNNER_TEMP/honker-legacy"
+          cp target/release/libhonker_ext.so "$RUNNER_TEMP/honker-current/"
+          git fetch --no-tags --depth=1 origin "$LEGACY_COMMIT"
+          git archive "$LEGACY_COMMIT" | tar -x -C "$RUNNER_TEMP/honker-legacy-source"
+          # The archived sources have older mtimes and the same crate versions.
+          # A shared target can incorrectly reuse the current extension as legacy.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/honker-legacy-target" cargo build --release --locked -p honker-extension --manifest-path "$RUNNER_TEMP/honker-legacy-source/Cargo.toml"
+          cp "$RUNNER_TEMP/honker-legacy-target/release/libhonker_ext.so" "$RUNNER_TEMP/honker-legacy/"
+      - name: Prove supported cutover and mixed-version recovery
+        run: |
+          python3 scripts/proof/claimed-at-upgrade.py --legacy-extension "$RUNNER_TEMP/honker-legacy/libhonker_ext.so" --extension "$RUNNER_TEMP/honker-current/libhonker_ext.so"
+
   ci-ok:
     # THE required status check for everything in *this* workflow.
     #
@@ -795,6 +825,7 @@ jobs:
     needs:
       - lint
       - rust
+      - claimed-at-upgrade
       - perf-regression
       - wake-latency
       - python

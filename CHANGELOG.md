@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## Unreleased — claim timestamp upgrade procedure
+
+- Upgrade all Honker processes sharing a database before relying on `claimed_at`.
+  Mixed old/new workers can retain an earlier attempt's timestamp. The README
+  now describes a stop/upgrade/resume cutover and a maintenance-only reset to
+  unknown timestamps if mixed workers already ran. Job state and leases survive.
+- CI checks the procedure against the actual pre-column extension and the
+  current extension. Legacy in-flight claims remain unknown until a new claim.
+
 ## Unreleased — `claimed_at` on `_honker_live`
 
 - New nullable `claimed_at INTEGER` column on `_honker_live`: when the
