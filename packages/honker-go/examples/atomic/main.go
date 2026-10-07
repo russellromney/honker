@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	honker "github.com/russellromney/honker-go"
+	honker "github.com/russellromney/honker/packages/honker-go"
 )
 
 func findExtension() string {

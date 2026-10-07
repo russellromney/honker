@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
-	honker "github.com/russellromney/honker-go"
+	honker "github.com/russellromney/honker/packages/honker-go"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )

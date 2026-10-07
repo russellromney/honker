@@ -10,9 +10,9 @@ If you want to *use* Honker:
 | Rust | `honker` on crates.io | [packages/honker-rs](https://github.com/russellromney/honker/tree/main/packages/honker-rs) |
 | Python | `pip install honker` | [packages/honker](https://github.com/russellromney/honker/tree/main/packages/honker) |
 | Node | `@honker/node` on npm | [packages/honker-node](https://github.com/russellromney/honker/tree/main/packages/honker-node) |
-| Go | `go get github.com/russellromney/honker-go` | [packages/honker-go](https://github.com/russellromney/honker/tree/main/packages/honker-go) |
+| Go | `go get github.com/russellromney/honker/packages/honker-go` | [packages/honker-go](https://github.com/russellromney/honker/tree/main/packages/honker-go) |
 | Ruby | `gem install honker` | [packages/honker-ruby](https://github.com/russellromney/honker/tree/main/packages/honker-ruby) |
-| Elixir | `{:honker, "~> 0.1"}` | [packages/honker-ex](https://github.com/russellromney/honker/tree/main/packages/honker-ex) |
+| Elixir | `{:honker, "~> 0.6"}` | [packages/honker-ex](https://github.com/russellromney/honker/tree/main/packages/honker-ex) |
 | Bun | `bun add honker-bun` | [packages/honker-bun](https://github.com/russellromney/honker/tree/main/packages/honker-bun) |
 
 ## What this crate provides
