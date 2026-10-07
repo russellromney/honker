@@ -36,7 +36,7 @@ on:
         required: false
         default: ""
       go_ref:
-        description: "Go module ref for github.com/russellromney/honker-go"
+        description: "Go module ref for github.com/russellromney/honker/packages/honker-go"
         required: false
         default: "latest"
       cpp_ref:

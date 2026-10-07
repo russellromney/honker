@@ -12,7 +12,7 @@ Full docs:
 ```elixir
 def deps do
   [
-    {:honker, "~> 0.1"}
+    {:honker, "~> 0.6"}
   ]
 end
 ```

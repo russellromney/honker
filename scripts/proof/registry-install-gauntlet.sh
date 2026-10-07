@@ -480,7 +480,7 @@ mkdir -p "$TMP/go"
 (
   cd "$TMP/go"
   go mod init honker-go-gauntlet >/dev/null
-  go get "github.com/russellromney/honker-go@$HONKER_GO_REF" >/dev/null
+  go get "github.com/russellromney/honker/packages/honker-go@$HONKER_GO_REF" >/dev/null
   cat > main.go <<'GO'
 package main
 
@@ -490,7 +490,7 @@ import (
 	"os"
 	"path/filepath"
 
-	honker "github.com/russellromney/honker-go"
+	honker "github.com/russellromney/honker/packages/honker-go"
 )
 
 func must(err error) {

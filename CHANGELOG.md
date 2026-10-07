@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## Unreleased — Go module path moved; package links fixed (BREAKING for Go; issue #182)
+
+**BREAKING for Go: new import path.** The Go module is now
+`github.com/russellromney/honker/packages/honker-go`. The old path,
+`github.com/russellromney/honker-go`, points to an archived repo whose
+code stopped in May 2026, so `go get` on it never received later
+changes. Change your imports and run `go get
+github.com/russellromney/honker/packages/honker-go`. The package name is
+still `honker`. The old path stays installable at its last version and
+is marked deprecated.
+
+- Go releases are tags named `packages/honker-go/vX.Y.Z`
+  (CONTRIBUTING.md).
+- The `honker` crate's `repository` now points to this repo instead of
+  the archived `honker-rs` repo. crates.io shows the new link from the
+  next release.
+- The `honker-core` README links each binding's folder in this repo
+  instead of the archived per-binding repos.
+- The Elixir install example asks for `~> 0.6` instead of `~> 0.1`.
+
 ## Unreleased — atomic scheduler tick (issue #173)
 
 - `honker_scheduler_tick` runs in one savepoint, and its first statement

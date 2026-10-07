@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/russellromney/honker-go"
+	"github.com/russellromney/honker/packages/honker-go"
 )
 
 func main() {

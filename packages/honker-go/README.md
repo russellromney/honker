@@ -10,8 +10,13 @@ Full docs:
 ## Install
 
 ```bash
-go get github.com/russellromney/honker-go
+go get github.com/russellromney/honker/packages/honker-go
 ```
+
+The module used to be `github.com/russellromney/honker-go`. That repo is
+archived and its code stopped at May 2026. Change your imports to
+`github.com/russellromney/honker/packages/honker-go`; the package name
+is still `honker`.
 
 You also need the Honker SQLite extension from the main repo.
 

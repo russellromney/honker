@@ -41,6 +41,17 @@ GitHub Actions (`.github/workflows/release-crates.yml`) picks up tags matching `
 
 Each language binding lives in `packages/` in this repo. Bindings with dedicated release workflows use ecosystem-specific tag prefixes; `honker-rs`, Go, C++, JVM, and Kotlin do not yet have dedicated proof workflows.
 
+Go has no registry: a Go release is a tag that names the module's
+folder. To release the Go binding at 0.6.0:
+
+```bash
+git tag packages/honker-go/v0.6.0
+git push origin packages/honker-go/v0.6.0
+```
+
+Without that tag, `go get .../packages/honker-go@latest` resolves to
+the newest commit on `main`.
+
 ## Making changes
 
 - PRs welcome; CI must be green before merge.

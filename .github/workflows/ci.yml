@@ -649,7 +649,7 @@ jobs:
 
           go 1.25
           GOMOD
-          go mod edit -replace github.com/russellromney/honker-go="$GITHUB_WORKSPACE/packages/honker-go"
+          go mod edit -replace github.com/russellromney/honker/packages/honker-go="$GITHUB_WORKSPACE/packages/honker-go"
           go mod tidy
           HONKER_TEST_DB="$work/orm.db" HONKER_ORM_SURFACE="$work/surface.json" go run .
 
