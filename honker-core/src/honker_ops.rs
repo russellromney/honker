@@ -82,9 +82,87 @@ fn real_to_i64(f: f64, idx: usize) -> rusqlite::Result<i64> {
     )))
 }
 
-/// Wrap a Displayable error for SQLite scalar-function returns.
-fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
+/// Turn an error into what a `honker_*` SQL function returns.
+///
+/// A lock conflict (SQLITE_BUSY, SQLITE_LOCKED and their extended
+/// codes) keeps its SQLite code, so the caller's `sqlite3_step` returns
+/// 5 or 6 and any client retry loop works. Everything else becomes
+/// SQLITE_ERROR (1) with its message, as before.
+///
+/// The transient form carries no message on purpose. rusqlite reports
+/// a function error with `sqlite3_result_error_code(code)` and then, if
+/// there is a message, `sqlite3_result_error(msg)`, and the second call
+/// sets the code back to SQLITE_ERROR. With no message SQLite fills in
+/// its own text for the code ("database is locked").
+fn to_sql_err<E: SqlFnError>(e: E) -> rusqlite::Error {
+    e.into_sql_fn_error()
+}
+
+/// Map a `rusqlite::Error` raised inside a `honker_*` SQL function to
+/// the error the function returns. See [`to_sql_err`].
+pub(crate) fn sql_fn_error(e: rusqlite::Error) -> rusqlite::Error {
+    match transient_code(&e) {
+        Some(code) => rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+        None => message_err(e),
+    }
+}
+
+/// The extended code of a lock conflict a caller can retry, or None.
+///
+/// SQLite also returns SQLITE_BUSY for "cannot open savepoint - SQL
+/// statements in progress" (and the release/commit variants). Waiting
+/// does not fix that one: the caller has to restructure the call (#167).
+/// So it stays SQLITE_ERROR with its message.
+fn transient_code(e: &rusqlite::Error) -> Option<std::os::raw::c_int> {
+    match e {
+        rusqlite::Error::SqliteFailure(err, msg)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) && !msg
+                .as_deref()
+                .is_some_and(|m| m.contains("SQL statements in progress")) =>
+        {
+            Some(err.extended_code)
+        }
+        _ => None,
+    }
+}
+
+fn message_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
     rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(e.to_string())))
+}
+
+/// What [`to_sql_err`] accepts: SQLite errors, which may be transient,
+/// and plain messages, which never are.
+trait SqlFnError {
+    fn into_sql_fn_error(self) -> rusqlite::Error;
+}
+
+impl SqlFnError for rusqlite::Error {
+    fn into_sql_fn_error(self) -> rusqlite::Error {
+        sql_fn_error(self)
+    }
+}
+
+impl SqlFnError for super::Error {
+    fn into_sql_fn_error(self) -> rusqlite::Error {
+        match self {
+            super::Error::Sqlite(e) => sql_fn_error(e),
+        }
+    }
+}
+
+impl SqlFnError for String {
+    fn into_sql_fn_error(self) -> rusqlite::Error {
+        message_err(self)
+    }
+}
+
+impl SqlFnError for &str {
+    fn into_sql_fn_error(self) -> rusqlite::Error {
+        message_err(self)
+    }
 }
 
 /// Run `body` inside `SAVEPOINT <name>` and undo it if anything fails.

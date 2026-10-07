@@ -35,6 +35,8 @@
 //! objects — stays in the respective binding crate.
 
 #[cfg(test)]
+mod busy_code_tests;
+#[cfg(test)]
 mod claim_v2_tests;
 pub mod cron;
 #[cfg(test)]
@@ -336,11 +338,11 @@ pub fn attach_notify(conn: &Connection) -> Result<(), Error> {
         let channel: String = ctx.get(0)?;
         let payload: String = ctx.get(1)?;
         let db = unsafe { ctx.get_connection() }?;
-        let mut ins = db.prepare_cached(
-            "INSERT INTO _honker_notifications (channel, payload) VALUES (?1, ?2)",
-        )?;
-        let id = ins.insert(rusqlite::params![channel, payload])?;
-        Ok(id)
+        // A lock conflict keeps its SQLITE_BUSY / SQLITE_LOCKED code; see
+        // `honker_ops::sql_fn_error`.
+        db.prepare_cached("INSERT INTO _honker_notifications (channel, payload) VALUES (?1, ?2)")
+            .and_then(|mut ins| ins.insert(rusqlite::params![channel, payload]))
+            .map_err(honker_ops::sql_fn_error)
     })?;
 
     Ok(())

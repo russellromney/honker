@@ -298,6 +298,18 @@ jobs:
         run: |
           uv run --no-project --managed-python --python "${{ matrix.python-version }}" --with pytest \
             python -m pytest tests/test_lifecycle_torture.py -o addopts="" -q -rsxX --tb=short
+      # SQLite result codes from honker functions through the raw
+      # extension (SQLITE_BUSY / SQLITE_LOCKED, not SQLITE_ERROR). The
+      # pytest run above skips it where the interpreter cannot load
+      # extensions (macOS setup-python); uv's managed CPython can, and
+      # HONKER_REQUIRE_EXTENSION=1 makes a missing extension a failure.
+      - name: Extension error codes (raw extension, separate process)
+        shell: bash
+        env:
+          HONKER_REQUIRE_EXTENSION: "1"
+        run: |
+          uv run --no-project --managed-python --python "${{ matrix.python-version }}" --with pytest \
+            python -m pytest tests/test_extension_error_codes.py -o addopts="" -q -rsxX --tb=short
       - name: Prove the documented Python ORM recipes
         shell: bash
         run: |

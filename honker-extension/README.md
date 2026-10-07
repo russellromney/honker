@@ -107,3 +107,29 @@ COMMIT;
 The application must roll back the transaction on an error. Versions
 before savepoint-protected job transitions accepted these calls inside DML;
 keep them as separate statements instead.
+
+### Error codes
+
+A lock conflict inside a `honker_*` function (or `notify`) returns its
+SQLite code from `sqlite3_step`: `SQLITE_BUSY` (5) when another
+connection holds the lock past `busy_timeout`, `SQLITE_LOCKED` (6) for a
+shared-cache table lock. The extended code is kept, for example
+`SQLITE_BUSY_SNAPSHOT` (517) when a read transaction cannot be upgraded
+to a write. These are transient: roll back if you are in a transaction,
+then retry the call. Python's `sqlite3` raises `OperationalError` with
+`sqlite_errorcode == 5`; other drivers expose the same code in their own
+error type.
+
+The message for these is SQLite's own text for the code ("database is
+locked", "database table is locked"). SQLite resets a function's error
+code to `SQLITE_ERROR` when the function also sets a message, so the
+code wins.
+
+Every other error from a honker function is `SQLITE_ERROR` (1) with a
+message. That includes the call-context error above ("cannot open
+savepoint - SQL statements in progress; honker: ... requires a separate
+SELECT"): SQLite raises it as `SQLITE_BUSY`, but waiting cannot fix it,
+so honker reports it as `SQLITE_ERROR`.
+
+Versions before this change returned `SQLITE_ERROR` with the message
+"database is locked" for lock conflicts too.
