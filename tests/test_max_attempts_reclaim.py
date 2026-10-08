@@ -7,7 +7,10 @@ visibility-timeout reclaim bumped attempts past the budget with
 no dead-letter path.
 """
 
+import pytest
+
 import honker
+from honker import Scheduler, every_s
 
 
 def test_reclaim_past_max_attempts_moves_to_dead(db_path):
@@ -168,3 +171,57 @@ def test_queue_next_claim_at_ignores_exhausted_rows(db_path):
         )
 
     assert q._next_claim_at() == 0
+
+
+# ---------- max_attempts >= 1 (#180) ----------
+#
+# Core rejects max_attempts < 1. Before #180 the same input silently
+# dead-lettered the job without running it. These pin where a Python
+# user sees the error today.
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_max_attempts_below_one_is_rejected_at_enqueue(db_path, bad):
+    db = honker.open(db_path)
+    zero = db.queue(f"zero{bad}", max_attempts=bad)
+    with pytest.raises(RuntimeError, match="max_attempts must be at least 1"):
+        zero.enqueue({"n": 1})
+    q = db.queue("ok")
+    with pytest.raises(RuntimeError, match="max_attempts must be at least 1"):
+        q.enqueue({"n": 1}, max_attempts=bad)
+
+    task = q.task(name=f"retries_{bad}", retries=bad)(lambda: None)
+    with pytest.raises(RuntimeError, match="max_attempts must be at least 1"):
+        task()
+
+    # Nothing was written by any of the rejected calls.
+    assert db.query("SELECT COUNT(*) AS c FROM _honker_jobs")[0]["c"] == 0
+
+
+def test_scheduler_rejects_max_attempts_below_one(db_path):
+    db = honker.open(db_path)
+    sched = Scheduler(db)
+    with pytest.raises(RuntimeError, match="max_attempts must be at least 1"):
+        sched.add(name="bad", queue="q", schedule=every_s(1), max_attempts=0)
+    assert sched.list() == []
+    sched.add(name="good", queue="q", schedule=every_s(1), max_attempts=2)
+    with pytest.raises(RuntimeError, match="max_attempts must be at least 1"):
+        sched.update("good", max_attempts=0)
+    assert [t["max_attempts"] for t in sched.list()] == [2]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Declaring Queue(max_attempts=0) or @task(retries=0) is accepted; the "
+        "error only appears at enqueue time, as a RuntimeError. The binding "
+        "should raise ValueError at declaration (#185)."
+    ),
+)
+def test_max_attempts_below_one_is_rejected_at_declaration(db_path):
+    db = honker.open(db_path)
+    with pytest.raises(ValueError):
+        db.queue("zero", max_attempts=0)
+    q = db.queue("ok")
+    with pytest.raises(ValueError):
+        q.task(name="retries_zero", retries=0)(lambda: None)

@@ -3,6 +3,7 @@
 See #63: nested schema-init used to hang forever on the single writer slot.
 """
 
+import json
 import threading
 import time
 
@@ -153,3 +154,40 @@ def test_issue_63_repro_raises_not_hangs(db_path):
         with pytest.raises(RuntimeError, match="cannot construct Queue"):
             q = db.queue("brand_new_name")
             q.enqueue({"x": 1}, tx=tx)
+
+
+@pytest.mark.parametrize("shape", ["trigger", "insert_select"])
+def test_claim_inside_a_write_statement_names_the_function_and_changes_nothing(
+    db_path, shape
+):
+    """#167: honker_claim_batch needs its own savepoint, which SQLite
+    refuses inside a trigger or an INSERT ... SELECT. The error must say
+    which function and how to call it, and nothing may change."""
+    db = honker.open(db_path)
+    q = db.queue("trig")
+    jid = q.enqueue({"n": 1})
+    with db.transaction() as tx:
+        tx.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+        tx.execute("CREATE TABLE claims (rows TEXT)")
+        if shape == "trigger":
+            tx.execute(
+                "CREATE TRIGGER claim_on_order AFTER INSERT ON orders BEGIN "
+                "SELECT honker_claim_batch('trig', 'trigger-worker', 1, 60); END"
+            )
+
+    with pytest.raises(Exception, match="honker_claim_batch requires a separate SELECT"):
+        with db.transaction() as tx:
+            tx.execute("INSERT INTO orders VALUES (1)")
+            if shape == "insert_select":
+                tx.execute(
+                    "INSERT INTO claims SELECT honker_claim_batch('trig', 'w', 1, 60)"
+                )
+
+    assert q.get_job(jid)["state"] == "pending"
+    assert db.query("SELECT COUNT(*) AS c FROM orders")[0]["c"] == 0
+    # The supported shape: a separate SELECT in the same transaction.
+    with db.transaction() as tx:
+        tx.execute("DROP TRIGGER IF EXISTS claim_on_order")
+        tx.execute("INSERT INTO orders VALUES (2)")
+        rows = tx.query("SELECT honker_claim_batch('trig', 'w', 1, 60) AS r")
+    assert [r["id"] for r in json.loads(rows[0]["r"])] == [jid]
