@@ -41,23 +41,27 @@
   floor. The enqueue cost is dominated by the SQLite insert and binding
   marshaling, not by the JSON check.
 - **Check `_honker_scheduler_tasks` before upgrading.** Existing rows are not
-  validated retroactively, and the two tables behave very differently. A
-  legacy `_honker_live` row is inert: it still claims, retries, and
-  dead-letters, and the decode failure lands on whichever consumer reads it. A
-  legacy `_honker_scheduler_tasks` row is not. `scheduler_tick` fires every due
-  schedule in one call, so one unfixable payload fails the whole tick — no
-  schedule advances its `next_fire_at` and **none of your other schedules
-  fire** until that row is fixed or removed. The tick error names the schedule
-  and queue so you can find it:
+  validated retroactively. A legacy `_honker_live` row is inert: it still
+  claims, retries, and dead-letters, and the decode failure lands on whichever
+  consumer reads it. A legacy `_honker_scheduler_tasks` row cannot be fired
+  any more, because the tick's enqueue validates the stored payload.
+  `honker_scheduler_tick` does not enqueue it and does not fail: each due
+  boundary of that schedule becomes one `_honker_dead` row (queue, payload,
+  `run_at` = the boundary, `attempts` = 0), and its `next_fire_at` advances
+  like any other schedule's. Every other schedule in the same tick fires
+  normally, and nothing is fired or reported twice. The tick's return value
+  lists enqueued jobs only, as before. `last_error` names the schedule:
 
   ```text
   honker: payload must be valid JSON: expected ident at line 1 column 2
-    (schedule "nightly-report", queue "reports"); fix or remove the schedule
-    row, then tick again
+    (schedule "nightly-report"); fire not enqueued, fix the payload with
+    honker_scheduler_update
   ```
 
-  Repair it with `honker_scheduler_update(name, NULL, '<json>', ...)`, or drop
-  it with `honker_scheduler_unregister(name)`.
+  Watch `_honker_dead` for these, or find them up front with the query below.
+  Repair a row with `honker_scheduler_update(name, NULL, '<json>', ...)`, or
+  drop it with `honker_scheduler_unregister(name)`. Boundaries that passed
+  while the payload was bad are not replayed.
 - **`save_result` takes raw text in most bindings** and now requires that text
   to be JSON. Rust, Go, Node, Bun, Ruby, Elixir, C++, JVM, and Kotlin all pass
   the value through unserialized, unlike their `enqueue` / `publish` / `notify`
@@ -69,6 +73,293 @@
   exactly. `json_valid()` returns 1 for lone surrogates, for `1e999`, and for
   nesting between 129 and about 1000 levels, so it will miss legacy rows that
   honker now rejects. To find every row that will not decode, decode it.
+
+## Unreleased — atomic scheduler tick (issue #173)
+
+- `honker_scheduler_tick` runs in one savepoint, and its first statement
+  is a write that takes the write lock and returns the due schedules
+  (`UPDATE _honker_scheduler_tasks SET next_fire_at = next_fire_at ...
+  RETURNING`). It then enqueues and advances `next_fire_at` under that
+  lock. Before, it read the due schedules first:
+  - Two ticks in autocommit could enqueue the same boundary twice. Two
+    processes ticking `@every 1s` for 10 s enqueued every boundary twice.
+  - Inside a deferred transaction, a commit from another connection
+    between the read and the first enqueue failed the tick with
+    "database is locked" (SQLITE_BUSY_SNAPSHOT).
+  - A failure part-way through an autocommit tick left the jobs it had
+    enqueued without advancing `next_fire_at`, so the next tick enqueued
+    them again.
+- A failed tick now changes nothing and returns the error. Inside a
+  caller's transaction it rolls back to its savepoint only.
+- Every job one tick enqueues gets the same `run_at` (one clock reading).
+- The fires in the result are ordered by schedule name, then `fire_at`.
+- `honker_scheduler_tick` now must run as a separate SELECT, like
+  `honker_claim_batch`: not inside a trigger, an INSERT/UPDATE/DELETE or
+  a RETURNING expression.
+- The catch-up cap (`SCHEDULER_MAX_CATCHUP_FIRES`, 64) and the result
+  format are unchanged. Bindings no longer need a transaction around the
+  tick.
+
+## Unreleased — claim v2: `scheduled` state, eager expiry (BREAKING; issue #177)
+
+**BREAKING: new job state value. Stop all workers to upgrade.** Old
+builds never claim a `scheduled` job and write future jobs as `pending`.
+Stop every Honker process on the database, upgrade all of them, run the
+normal bootstrap, then resume (README, "Upgrading to the `scheduled`
+state").
+
+- New state `scheduled` for jobs whose `run_at` is in the future.
+  `honker_enqueue` writes it for a future `run_at`, and `honker_retry`
+  writes it for `delay_s > 0`; otherwise `pending`. `honker_get_job`
+  reports it, and both `honker_cancel` arities accept it.
+- `honker_claim_batch` reads the clock once and binds it into every
+  step. Before claiming, it does three steps, each capped at 1000 rows
+  (`CLAIM_HOUSEKEEPING_LIMIT`): promote due `scheduled` rows, move expired
+  jobs to `_honker_dead`, and move lapsed leases with no attempts left to
+  `_honker_dead` with `'max attempts exceeded'`.
+- Fix #177: an expired job whose lease lapsed is moved to `_honker_dead`
+  with `'expired'` by the next claim or by `honker_sweep_expired`.
+  Before, a job that expired while in flight stayed `processing` forever.
+  A job with a valid lease is left to its worker.
+- A lapsed lease stays `processing` until it is reclaimed, so a fenced
+  late ack (#176) still completes it until then.
+- Claim latency no longer grows with backlog. The claim reads the new
+  ready index (`state = 'pending'`) plus lapsed leases. Measured through
+  the extension, p50 per claim with 1k vs 50k rows of backlog: due
+  0.74/0.73 ms, in flight 0.82/0.75 ms, delayed higher-priority
+  1.06/0.71 ms, expired higher-priority 0.84/0.81 ms. Main before this
+  change: 16–26 ms at 50k.
+- Indexes: new `_honker_live_ready`, `_honker_live_scheduled` and
+  `_honker_live_expiry`; `_honker_live_claim` and
+  `_honker_live_pending_deadline` are dropped.
+- `max_attempts` must be at least 1. `honker_enqueue`,
+  `honker_scheduler_register` and `honker_scheduler_update` return an
+  error for 0 or negative values. Before, enqueue accepted them (the job
+  was dead on its first claim) and the scheduler clamped them to 1.
+- `honker_queue_next_claim_at` accounts for `scheduled` rows and leases;
+  it no longer reports exhausted lapsed leases.
+- Bootstrap migrates an older database once, in one savepoint, and is
+  safe when several processes bootstrap at once: future `pending` rows
+  become `scheduled`, exhausted `pending` rows move to `_honker_dead`, and
+  the old indexes are dropped.
+- Proof: `honker-core/src/claim_v2_tests.rs`; separate-process tests
+  through the extension in `tests/test_extension_interop.py`; a claim
+  latency floor in `tests/test_performance_floors.py`;
+  `scripts/proof/claim-v2-upgrade.py` (CI job `claim-v2-upgrade`) against
+  a real 28587ee build, including eight processes bootstrapping at once;
+  the lifecycle torture test's expiry invariant is no longer xfail.
+
+## Unreleased — fenced ack/retry/fail/heartbeat (issue #176)
+
+- New SQL arities that take the claim's `attempts` as a fencing token:
+  `honker_ack(id, worker_id, attempt)`, `honker_retry(id, worker_id,
+  delay_s, error, attempt)`, `honker_fail(id, worker_id, error, attempt)`
+  and `honker_heartbeat(id, worker_id, extend_s, attempt)`.
+  `honker_ack_batch` also accepts `[id, attempt]` pairs; plain ids keep the
+  old guard, and both kinds may be mixed in one call. Rust:
+  `ack_fenced`, `retry_fenced`, `fail_fenced`, `heartbeat_fenced`.
+- The fenced guard is `id + worker_id + attempts = attempt + state =
+  'processing'`, with no lease check. A reclaim bumps `attempts`, and
+  dead-letter, expiry and cancel remove the row. So a stale handler that
+  shares the new holder's worker id gets 0, and a late handler whose job
+  nobody reclaimed still completes. A fenced heartbeat sets
+  `claim_expires_at = now + extend_s`, reviving a lapsed lease that nobody
+  reclaimed.
+- Fenced retry stays write-first, like the unfenced one: one guarded
+  UPDATE for the pending branch, and a guarded `DELETE ... RETURNING` plus
+  the `_honker_dead` insert in one savepoint for the dead branch.
+- The existing arities are unchanged and are now documented as unfenced.
+  No binding changes here: bindings adopt the fenced forms by passing
+  `job.attempts`, so `job.ack()` and friends keep their signatures.
+- Proof: `honker-core/src/fencing_tests.rs`; separate-process tests through
+  the loadable extension in `tests/test_extension_interop.py`; and the
+  lifecycle torture test now drives the fenced forms, so its fencing
+  invariant passes and is no longer xfail. `HONKER_TORTURE_FENCED=0` still
+  runs the legacy forms, where that invariant is xfail.
+
+## Unreleased — queue-scoped cancel in core (issue #134)
+
+- `honker_cancel(queue, job_id)` joins the existing `honker_cancel(job_id)`.
+  The 2-arg form only removes a pending or processing row that is in that
+  queue; a job in another queue is a miss and returns 0, the same answer an
+  already-ack'd id gives. The queue check is part of the DELETE, not a read
+  before it — a `SELECT queue` followed by a `DELETE` leaves a window for a
+  concurrent claim to change the row between the two statements.
+- The 1-arg form is unchanged and stays: it is the global cancel that
+  `Database.cancel(id)` will use. SQLite dispatches on (name, arity), so both
+  forms live on one connection and bindings can move to the scoped form one
+  package at a time instead of in lockstep.
+- New connect-time capability probe, `honker_core::has_queue_scoped_cancel`
+  and the `CANCEL_QUEUE_SCOPED_PROBE_SQL` string behind it. Calling
+  `honker_cancel` at an arity the loaded extension does not have is a hard
+  SQLite error, not a fallback, and there is no `honker_version()` to ask
+  first — so a binding built for the 2-arg form running against an older
+  vendored `libhonker_ext` would fail at cancel time in production.
+  `pragma_function_list` reports each arity as its own row, so one cheap
+  query at startup turns that into a connect-time check. Bindings that talk
+  to the extension over SQL run the string; Rust-side bindings call the
+  helper. The probe propagates errors rather than reporting "absent" for
+  "cannot tell".
+- Core only. No binding calls the new arity yet, so no existing behavior
+  changes: every current caller keeps hitting `honker_cancel(job_id)`.
+- Tests cover both arities on one connection, the wrong-queue no-op on
+  pending and processing rows (asserting the row is still live afterwards),
+  the owning queue cancelling a claimed row at both arities, idempotence,
+  the arity error, and the probe with and without the 2-arg form,
+  including that an unanswerable probe is an error and not a `false` —
+  in honker-core against rusqlite, and again through the real
+  `.load libhonker_ext` path in `tests/test_extension_interop.py`.
+- The shared ORM surface (`scripts/proof/orm/surface.json`, replayed by
+  every documented ORM recipe in 11 languages) gains the scoped cancel
+  and the capability probe. That is what proves the new arity and
+  `pragma_function_list` work through each binding's own SQLite build,
+  not just through rusqlite and CPython's.
+
+## Unreleased — claim timestamp upgrade procedure
+
+- Upgrade all Honker processes sharing a database before relying on `claimed_at`.
+  Mixed old/new workers can retain an earlier attempt's timestamp. The README
+  now describes a stop/upgrade/resume cutover and a maintenance-only reset to
+  unknown timestamps if mixed workers already ran. Job state and leases survive.
+- CI checks the procedure against the actual pre-column extension and the
+  current extension. Legacy in-flight claims remain unknown until a new claim.
+
+## Unreleased — remaining core lookup errors
+
+- Queue deadlines, scheduler deadlines, scheduler updates, and stream checkpoint
+  reads now report database errors instead of returning zero. Genuine absent
+  rows/deadlines still return zero. A corrupt checkpoint is not a new consumer.
+
+## Unreleased — SQL call context for protected job transitions
+
+- `honker_claim_batch`, `honker_fail`, `honker_sweep_expired`, and a
+  `honker_retry` that dead-letters the job must run as a separate SELECT
+  after write/RETURNING cursors are finished. They are not supported inside
+  triggers or write statements. A `honker_retry` that returns the job to
+  pending has no savepoint and is not restricted.
+- The error now names the function the caller used and explains how to call
+  it, instead of only saying that SQL statements are in progress.
+- Explicit caller transactions remain supported; the docs recommend
+  `BEGIN IMMEDIATE`.
+- Do not remove savepoint protection to restore old invocation patterns: it
+  prevents failed transitions from silently losing jobs.
+
+## Unreleased — retry claim ownership
+
+- `honker_retry` checks ownership in the same statement that changes the
+  job. Before, it read the row and then wrote it in a separate statement,
+  so another connection could cancel or reclaim the job in between. Retry
+  then overwrote the new worker's claim, or moved a cancelled job into
+  `_honker_dead`.
+- Pending branch: one `UPDATE` guarded by worker, `state = 'processing'`,
+  an unexpired lease and `attempts < max_attempts`. It uses no savepoint,
+  so it still works inside triggers and `INSERT ... SELECT`.
+- Exhausted branch: a guarded `DELETE ... RETURNING` and the
+  `_honker_dead` insert in one savepoint, the same shape as `fail()`. A
+  dead row is written only from a row that DELETE removed.
+  A short read after the failed UPDATE decides whether to open that
+  savepoint, so a miss opens none. The DELETE rechecks every guard.
+- A claim that was cancelled, reclaimed or expired returns 0, as before.
+  Retry's first statement is a write, so it never holds an old read
+  snapshot. Commits from other connections, including unrelated ones, do
+  not cause `database is locked` errors; busy_timeout covers waiting for
+  the lock.
+
+## Unreleased — `claimed_at` on `_honker_live`
+
+- New nullable `claimed_at INTEGER` column on `_honker_live`: when the
+  CURRENT attempt started. Nothing else could answer that.
+  `created_at` includes queue wait, `run_at` is when the job became
+  ready, and `claim_expires_at` moves on every heartbeat.
+- NULL until the first claim. Set to `unixepoch()` on every successful
+  claim and reclaim, so it tracks the current attempt and not the first
+  one. Cleared when `retry` returns the job to pending — a job waiting
+  in the queue is not running. `heartbeat()` deliberately leaves it
+  alone; refreshing it there would reintroduce exactly the blind spot
+  the column exists to fix.
+- Exposed in `claim_batch`'s RETURNING and JSON, and in `get_job`'s
+  JSON. Both are additive; no binding declares
+  `serde(deny_unknown_fields)`, so existing consumers ignore it until
+  they opt in.
+- Validity window, documented in README under "How long has this job
+  been running": `claimed_at` is the start of the CURRENT claim and is
+  only meaningful while `claim_expires_at >= unixepoch()`. A claim that
+  lapses without a reclaim leaves `worker_id`, `claim_expires_at` and
+  `claimed_at` on the row, all stale together, until the next claim
+  overwrites all three. Nothing clears them, by design — there is no
+  expiry sweep for processing rows, and blanking `claimed_at` alone
+  would throw away the abandoned attempt's start time while leaving the
+  other two stale anyway.
+- Existing databases migrate with `ALTER TABLE ... ADD COLUMN`, matching
+  the `enabled` and `max_attempts` migrations, and tolerating the
+  "duplicate column" error when a concurrent bootstrap wins the race.
+  `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that
+  already exists, which is what the migration test pins.
+- No language binding maps `claimed_at` onto its job type yet, so for
+  now it is read in SQL. #136 tracks adding it to the full job shape
+  per binding.
+- Tests: NULL before first claim, first claim, heartbeat-does-not-move,
+  retry clears, reclaim resets to the reclaim time (bounded by a clock
+  read taken either side of the reclaim, not just "moved off the old
+  value"), ack and fail both remove the row, an expired claim keeps
+  `claimed_at` alongside the rest of the stale claim, plus a migration
+  test proving a pre-column database gains the column, keeps its rows
+  with `claimed_at` NULL rather than a backfilled timestamp, and ends
+  up with the same columns in the same order as a fresh database.
+
+## Unreleased — Core SQLite error propagation
+
+- `honker-core` no longer discards SQLite errors in five lookups.
+  `retry`, `fail`, `get_job`, `lock_acquire`, and `result_get` ended in
+  `.ok()`, which mapped every error to "no row", not just
+  `QueryReturnedNoRows`. A broken stored value turned into a silent
+  no-op: `retry`/`fail` reported "not our claim", `get_job` reported a
+  missing job, `lock_acquire` reported the lock as held so no leader
+  could ever start. All five now use `OptionalExtension::optional()?`.
+- `fail()` could lose a job outright. It runs
+  `DELETE FROM _honker_live ... RETURNING`, so the row is already gone
+  when the row mapper decodes it. Measured: propagating the mapper's
+  error does **not** undo that DELETE — the job ended up in neither
+  `_honker_live` nor `_honker_dead`. The delete-decode-insert now runs
+  inside a `SAVEPOINT honker_fail` that rolls back on any error, so a
+  failed `fail()` leaves the job claimable instead of destroyed.
+  SAVEPOINT rather than BEGIN/COMMIT so it nests under a caller's
+  transaction and rolls back only its own work.
+- The same delete-then-more-work pattern was live at three more sites,
+  and all three were measured losing the job the same way (`live=0,
+  dead=0`) before the fix:
+  - `dead_letter_exhausted_claimable`, reached by **every ordinary
+    claim** — no `fail()` call needed. It deletes the whole matching set
+    before decoding any of it, so one bad `attempts` value lost every
+    job beside it too.
+  - `retry()`'s dead-letter branch — `DELETE` then `INSERT` as two
+    statements. A failing `_honker_dead` INSERT destroyed the job.
+  - `sweep_expired` — same `DELETE ... RETURNING` then decode then
+    INSERT shape.
+- The savepoint wrapper is now one shared helper, `in_savepoint`, used
+  at all four sites instead of copied four times. Two defects in the
+  original copy are fixed in it:
+  - The rollback result is no longer discarded. `let _ =
+    conn.execute_batch("ROLLBACK TO SAVEPOINT ...")` hid exactly the
+    kind of error this change exists to surface. A failed undo is now
+    reported, with the original cause kept intact in the message.
+  - A failed `RELEASE` no longer strands the caller inside the
+    transaction the savepoint opened. `RELEASE` of the outermost
+    savepoint is the COMMIT, so it can fail — measured on a
+    rollback-journal database with a concurrent reader: the caller got
+    `database is locked` **and** a connection with
+    `is_autocommit() == false` whose own reads claimed the job had been
+    dead-lettered. Bindings hold long-lived connections, so every later
+    call joined that transaction. The helper now ends it.
+- `ack_batch` and `claim_batch`'s claiming UPDATE deliberately stay
+  savepoint-free; both now carry a comment saying why.
+- 27 regression tests. At each of the five `.ok()` sites: a genuine miss
+  and a broken stored type. At each of the four savepoint sites: the
+  live row survives a decode failure and a failing `_honker_dead`
+  INSERT, and a genuine miss still returns 0/None. Plus the
+  `SELECT honker_*(...)` scalar-function path — the only one bindings
+  and ORM users take, and previously untested — for `fail`,
+  `claim_batch`, and `sweep_expired`.
 
 ## 2026-08-27 — Node 0.5.1
 

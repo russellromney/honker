@@ -1,8 +1,8 @@
 """Tests for task expiration.
 
 Jobs enqueued with `expires=N` become unclaimable N seconds after
-enqueue. The claim path filters expired rows; `queue.sweep_expired()`
-moves them into `_honker_dead`.
+enqueue. The claim path never returns expired rows and moves them into
+`_honker_dead`; `queue.sweep_expired()` does the same for a whole queue.
 """
 
 import time
@@ -94,25 +94,24 @@ def test_enqueue_with_tx_sets_expires(db_path):
     assert before + 118 <= exp <= before + 122
 
 
-def test_expired_job_ignores_claim_but_sweep_cleans_up(db_path):
-    """Even without sweep, the claim path doesn't return expired jobs,
-    so they don't get worked on. Sweep just reclaims table space.
+def test_claim_skips_an_expired_job_and_dead_letters_it(db_path):
+    """The claim path never returns an expired job. Since the claim v2
+    change it also moves it to `_honker_dead` itself, so a later
+    `sweep_expired()` finds nothing left to do.
     """
     db = honker.open(db_path)
     q = db.queue("exp-workflow")
 
     q.enqueue({"i": 1}, expires=-1)
 
-    # Row exists in _honker_live but claim finds nothing.
     assert q.claim_one("w1") is None
     rows = db.query(
         "SELECT COUNT(*) AS c FROM _honker_live WHERE queue='exp-workflow'"
     )
-    assert rows[0]["c"] == 1
-
-    # Sweep moves it.
-    assert q.sweep_expired() == 1
-    rows = db.query(
-        "SELECT COUNT(*) AS c FROM _honker_live WHERE queue='exp-workflow'"
-    )
     assert rows[0]["c"] == 0
+    dead = db.query(
+        "SELECT last_error FROM _honker_dead WHERE queue='exp-workflow'"
+    )
+    assert [r["last_error"] for r in dead] == ["expired"]
+
+    assert q.sweep_expired() == 0

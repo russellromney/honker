@@ -62,6 +62,38 @@ jobs:
           . .venv/bin/activate
           python -m pytest -q -n 0 -o addopts="" -m linux_only tests/test_fault_injection.py --tb=short
 
+  lifecycle-torture:
+    # tests/test_lifecycle_torture.py, long variant: several minutes per
+    # seed instead of the PR run's 25 s. Seeds are random each night
+    # and printed, so a failure can be rerun with the same seed.
+    name: lifecycle torture · ${{ matrix.os }}
+    timeout-minutes: 30
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        run: rustup default stable
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+      - name: Build honker-extension
+        run: cargo build --locked --release -p honker-extension
+      - name: Long lifecycle torture run
+        shell: bash
+        env:
+          HONKER_TORTURE_SECONDS: "240"
+        run: |
+          export HONKER_TORTURE_SEEDS="$RANDOM,$RANDOM,$RANDOM"
+          echo "HONKER_TORTURE_SEEDS=$HONKER_TORTURE_SEEDS"
+          uv run --no-project --managed-python --python 3.14 --with pytest \
+            python -m pytest tests/test_lifecycle_torture.py -o addopts="" -q -rsxX --tb=short
+
   packaged-installs:
     name: packaged installs · ubuntu
     timeout-minutes: 25

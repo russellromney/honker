@@ -154,6 +154,49 @@
       "expect": {"kind": "json_len", "n": 0}
     },
     {
+      "id": "enqueue_cancel_scoped",
+      "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL)",
+      "args": ["$ns:qcs", "{\"n\":2}", 0, 3],
+      "store": "job_cs",
+      "expect": {"kind": "int_gt", "n": 0}
+    },
+    {
+      "id": "cancel_scoped_wrong_queue",
+      "sql": "SELECT honker_cancel(?, ?)",
+      "args": ["$ns:qc", "$job_cs"],
+      "expect": {"kind": "int_eq", "n": 0}
+    },
+    {
+      "id": "get_after_wrong_queue_cancel",
+      "sql": "SELECT honker_get_job(?)",
+      "args": ["$job_cs"],
+      "expect": {"kind": "contains", "s": "$ns:qcs"}
+    },
+    {
+      "id": "cancel_scoped",
+      "sql": "SELECT honker_cancel(?, ?)",
+      "args": ["$ns:qcs", "$job_cs"],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
+      "id": "cancel_scoped_idempotent",
+      "sql": "SELECT honker_cancel(?, ?)",
+      "args": ["$ns:qcs", "$job_cs"],
+      "expect": {"kind": "int_eq", "n": 0}
+    },
+    {
+      "id": "get_cancelled_scoped",
+      "sql": "SELECT honker_get_job(?)",
+      "args": ["$job_cs"],
+      "expect": {"kind": "empty_string"}
+    },
+    {
+      "id": "cancel_capability_probe",
+      "sql": "SELECT EXISTS(SELECT 1 FROM pragma_function_list WHERE name = 'honker_cancel' AND narg = 2)",
+      "args": [],
+      "expect": {"kind": "int_eq", "n": 1}
+    },
+    {
       "id": "enqueue_b1",
       "sql": "SELECT honker_enqueue(?, ?, NULL, NULL, ?, ?, NULL)",
       "args": ["$ns:qb", "{\"i\":1}", 0, 3],

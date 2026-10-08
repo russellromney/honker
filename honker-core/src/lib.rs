@@ -34,14 +34,31 @@
 //! entry-point symbols, row-materialization into Python dicts or JS
 //! objects — stays in the respective binding crate.
 
+#[cfg(test)]
+mod claim_v2_tests;
 pub mod cron;
+#[cfg(test)]
+mod fencing_tests;
 mod honker_ops;
 #[cfg(feature = "kernel-watcher")]
 mod kernel_watcher;
+#[cfg(test)]
+mod lookup_error_tests;
+#[cfg(test)]
+mod retry_tests;
+#[cfg(test)]
+mod savepoint_context_tests;
+#[cfg(test)]
+mod scheduler_tick_tests;
 #[cfg(feature = "shm-fast-path")]
 mod shm_watcher;
 
 pub use honker_ops::attach_honker_functions;
+// Connect-time capability probe for the queue-scoped
+// `honker_cancel(queue, job_id)`. Bindings call this (or run the SQL
+// string themselves) to detect a vendored extension that only has the
+// older global 1-arg form.
+pub use honker_ops::{CANCEL_QUEUE_SCOPED_PROBE_SQL, has_queue_scoped_cancel};
 // Shared by the loadable extension's own watcher SQL functions so every
 // honker_* function coerces integer arguments the same way.
 pub use honker_ops::{arg_i64, arg_opt_i64};
@@ -381,9 +398,25 @@ pub fn attach_notify(conn: &Connection) -> Result<(), Error> {
 ///
 /// Schema:
 ///
-///   * `_honker_live`  — pending + processing jobs. Partial index
-///     `_honker_live_claim` restricts to those two states so dead-row
-///     history never slows down the claim hot path.
+///   * `_honker_live`  — live jobs. `state` is one of:
+///       - `scheduled`: `run_at` is in the future
+///       - `pending`: due, waiting for a worker
+///       - `processing`: claimed. A lapsed lease stays `processing`
+///         until a claim takes it or moves it to `_honker_dead`.
+///
+///     Indexes, each partial so a claim only reads rows it can act on:
+///       - `_honker_live_ready (queue, priority DESC, run_at, id)
+///         WHERE state='pending'`: the claim order. Future and in-flight
+///         rows are not in it, so a claim stops after `n` rows.
+///       - `_honker_live_scheduled (queue, run_at) WHERE
+///         state='scheduled'`: promotion when `run_at` passes.
+///       - `_honker_live_expiry (queue, expires_at) WHERE expires_at IS
+///         NOT NULL`: expiry.
+///       - `_honker_live_processing_deadline (queue, claim_expires_at)
+///         WHERE state='processing'`: lapsed leases.
+///
+///     Databases from before the `scheduled` state are migrated by
+///     [`bootstrap_honker_schema`].
 ///   * `_honker_dead`  — terminal rows (retry-exhausted or explicitly
 ///     failed). Never scanned by the claim path; retention policy is
 ///     the user's problem.
@@ -404,14 +437,18 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       attempts INTEGER NOT NULL DEFAULT 0,
       max_attempts INTEGER NOT NULL DEFAULT 3,
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-      expires_at INTEGER
+      expires_at INTEGER,
+      claimed_at INTEGER
     );
-    CREATE INDEX IF NOT EXISTS _honker_live_claim
+    CREATE INDEX IF NOT EXISTS _honker_live_ready
       ON _honker_live(queue, priority DESC, run_at, id)
-      WHERE state IN ('pending', 'processing');
-    CREATE INDEX IF NOT EXISTS _honker_live_pending_deadline
-      ON _honker_live(queue, run_at)
       WHERE state = 'pending';
+    CREATE INDEX IF NOT EXISTS _honker_live_scheduled
+      ON _honker_live(queue, run_at)
+      WHERE state = 'scheduled';
+    CREATE INDEX IF NOT EXISTS _honker_live_expiry
+      ON _honker_live(queue, expires_at)
+      WHERE expires_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS _honker_live_processing_deadline
       ON _honker_live(queue, claim_expires_at)
       WHERE state = 'processing';
@@ -524,7 +561,95 @@ pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
             Err(e) => return Err(e.into()),
         }
     }
+    // Migration: `claimed_at` on _honker_live. When the current attempt
+    // started. `created_at` includes queue wait, `run_at` is when the
+    // job became ready, and `claim_expires_at` moves on every heartbeat
+    // — none of them answer "how long has this attempt been running".
+    //
+    // Nullable with no default: NULL until the first claim. A default
+    // would date every pre-existing row to migration time and read as a
+    // claim that never happened.
+    //
+    // CREATE TABLE IF NOT EXISTS does not add columns to a table that
+    // already exists, so an existing database only gets this here.
+    let has_claimed_at: bool = {
+        let mut stmt = conn
+            .prepare("SELECT 1 FROM pragma_table_info('_honker_live') WHERE name='claimed_at'")?;
+        stmt.query_row([], |_| Ok(true)).unwrap_or(false)
+    };
+    if !has_claimed_at {
+        match conn.execute("ALTER TABLE _honker_live ADD COLUMN claimed_at INTEGER", []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    migrate_claim_v2(conn)?;
     Ok(())
+}
+
+/// The index every pre-`scheduled` database has. Its presence is the
+/// migration marker for [`migrate_claim_v2`].
+const LEGACY_CLAIM_INDEX: &str = "_honker_live_claim";
+
+fn index_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        [name],
+        |r| r.get(0),
+    )
+}
+
+/// Migrate a database written before the `scheduled` state. Runs once:
+/// the last step drops `_honker_live_claim`, which is the marker.
+///
+/// 1. Future `pending` rows become `scheduled`. Older builds wrote every
+///    job as `pending`; the claim's ready index must not hold future
+///    rows.
+/// 2. `pending`/`scheduled` rows with no attempts left move to
+///    `_honker_dead` with `'max attempts exceeded'`. The claim no longer
+///    sweeps the whole due backlog for them (older builds did that on
+///    every claim); only lapsed leases are swept.
+/// 3. Drop `_honker_live_claim` and `_honker_live_pending_deadline`;
+///    the new indexes already exist (`BOOTSTRAP_HONKER_SQL`).
+///
+/// Safe when several processes bootstrap at once. The first statement
+/// in the savepoint is a write, so it takes the write lock on the
+/// newest snapshot and waits on `busy_timeout` like any write; the
+/// marker is then checked again under the lock. A process that lost
+/// the race sees the marker gone and does nothing. The steps commit
+/// together or not at all.
+///
+/// Workers from an older build must be stopped first: they still write
+/// future jobs as `pending` and never promote `scheduled` rows.
+fn migrate_claim_v2(conn: &Connection) -> rusqlite::Result<()> {
+    if !index_exists(conn, LEGACY_CLAIM_INDEX)? {
+        return Ok(());
+    }
+    honker_ops::in_savepoint(conn, "honker_bootstrap", || {
+        // Take the write lock before reading anything (matches no rows).
+        conn.execute("UPDATE _honker_live SET state = state WHERE 0", [])?;
+        if !index_exists(conn, LEGACY_CLAIM_INDEX)? {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "UPDATE _honker_live SET state = 'scheduled'
+              WHERE state = 'pending' AND run_at > unixepoch();
+             INSERT INTO _honker_dead
+               (id, queue, payload, priority, run_at, max_attempts,
+                attempts, last_error, created_at)
+             SELECT id, queue, payload, priority, run_at, max_attempts,
+                    attempts, 'max attempts exceeded', created_at
+               FROM _honker_live
+              WHERE state IN ('pending', 'scheduled')
+                AND attempts >= max_attempts;
+             DELETE FROM _honker_live
+              WHERE state IN ('pending', 'scheduled')
+                AND attempts >= max_attempts;
+             DROP INDEX _honker_live_claim;
+             DROP INDEX IF EXISTS _honker_live_pending_deadline;",
+        )
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -2408,6 +2533,110 @@ while True:
     }
 
     #[test]
+    fn bootstrap_pre_claimed_at_database_gains_the_column_and_keeps_its_rows() {
+        // A database created before `claimed_at` existed. The table is
+        // already there, so `CREATE TABLE IF NOT EXISTS` is a no-op and
+        // cannot add the column — only the ALTER TABLE migration can.
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE _honker_live (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              queue TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'pending',
+              priority INTEGER NOT NULL DEFAULT 0,
+              run_at INTEGER NOT NULL DEFAULT (unixepoch()),
+              worker_id TEXT,
+              claim_expires_at INTEGER,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              max_attempts INTEGER NOT NULL DEFAULT 3,
+              created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+              expires_at INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _honker_live (id, queue, payload, state, attempts, created_at)
+             VALUES (7, 'emails', '{\"legacy\":true}', 'processing', 2, 1000)",
+            [],
+        )
+        .unwrap();
+
+        bootstrap_honker_schema(&conn).unwrap();
+
+        let has: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('_honker_live') WHERE name='claimed_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(
+            has,
+            "claimed_at must be added to a table that already existed; \
+             CREATE TABLE IF NOT EXISTS cannot do it"
+        );
+
+        // The pre-existing row survives untouched, and its claimed_at is
+        // NULL. A default would date every legacy row to migration time
+        // and read as a claim that never happened.
+        let (payload, attempts, created_at, claimed_at): (String, i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT payload, attempts, created_at, claimed_at
+                   FROM _honker_live WHERE id = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            payload, "{\"legacy\":true}",
+            "existing row data must survive"
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(created_at, 1000);
+        assert_eq!(
+            claimed_at, None,
+            "a migrated row must have claimed_at NULL, not a backfilled timestamp"
+        );
+
+        // Idempotent: the second bootstrap must not error on the column
+        // it just added.
+        bootstrap_honker_schema(&conn).unwrap();
+
+        // A migrated table and a fresh one must be the same table. Not
+        // just the same set of names — the same names in the same `cid`
+        // order, so anything that reads _honker_live positionally (a
+        // `SELECT *` in a user's own SQL, a dump and restore) behaves
+        // identically on both. ALTER TABLE ADD COLUMN appends, and the
+        // CREATE TABLE puts claimed_at last, which is what makes this
+        // hold; it breaks the moment someone inserts a column mid-list
+        // in BOOTSTRAP_HONKER_SQL. Measured: moving claimed_at above
+        // expires_at in the CREATE TABLE fails this and nothing else.
+        let migrated_cols = live_column_names(&conn);
+        let fresh = mem();
+        bootstrap_honker_schema(&fresh).unwrap();
+        let fresh_cols = live_column_names(&fresh);
+        assert_eq!(
+            migrated_cols, fresh_cols,
+            "a migrated _honker_live must have the same columns in the same order as a fresh one"
+        );
+        assert_eq!(
+            migrated_cols.last().map(String::as_str),
+            Some("claimed_at"),
+            "claimed_at is appended by ALTER TABLE, so the fresh CREATE TABLE must put it last too"
+        );
+    }
+
+    fn live_column_names(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM pragma_table_info('_honker_live') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
     fn bootstrap_honker_schema_creates_tables_and_index() {
         let conn = mem();
         bootstrap_honker_schema(&conn).unwrap();
@@ -2415,7 +2644,7 @@ while True:
         // Idempotent.
         bootstrap_honker_schema(&conn).unwrap();
 
-        // _honker_live has the 12 columns we expect (Python binding
+        // _honker_live has the 13 columns we expect (Python binding
         // and the extension have historically disagreed on _honker_dead
         // column count; this pins both).
         let live_cols: Vec<String> = conn
@@ -2425,8 +2654,9 @@ while True:
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(live_cols.len(), 12);
+        assert_eq!(live_cols.len(), 13);
         assert!(live_cols.contains(&"expires_at".to_string()));
+        assert!(live_cols.contains(&"claimed_at".to_string()));
 
         let dead_cols: Vec<String> = conn
             .prepare("SELECT name FROM pragma_table_info('_honker_dead')")
@@ -2441,16 +2671,27 @@ while True:
         assert!(dead_cols.contains(&"max_attempts".to_string()));
         assert!(dead_cols.contains(&"created_at".to_string()));
 
-        // Partial index present.
-        let idx: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type='index' AND name='_honker_live_claim'",
-                [],
-                |r| r.get(0),
+        // The claim-v2 partial indexes, and none of the legacy ones.
+        let idx: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='index' AND tbl_name='_honker_live'
+                   AND name LIKE '_honker_live_%' ORDER BY name",
             )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(idx, 1);
+        assert_eq!(
+            idx,
+            vec![
+                "_honker_live_expiry",
+                "_honker_live_processing_deadline",
+                "_honker_live_ready",
+                "_honker_live_scheduled",
+            ]
+        );
 
         // _honker_locks table present for db.lock() support.
         let locks_cols: Vec<String> = conn

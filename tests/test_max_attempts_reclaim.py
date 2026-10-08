@@ -60,9 +60,15 @@ def test_reclaim_past_max_attempts_moves_to_dead(db_path):
 
 
 def test_exhausted_pending_is_not_claimable(db_path):
-    """Pending rows that already sit at attempts >= max_attempts
-    (e.g. after a schema change lowering max_attempts, or a direct
-    SQL write) must dead-letter on claim, not re-enter processing.
+    """A pending row that already sits at attempts >= max_attempts must
+    not re-enter processing.
+
+    The API cannot write this shape: enqueue rejects max_attempts < 1, a
+    retry with no attempts left dead-letters, and the claim v2 bootstrap
+    migration dead-letters such rows from older builds. Only a direct
+    SQL write makes it. The claim skips the row and leaves it alone; it
+    no longer scans the due backlog for exhausted rows on every claim
+    (that scan made each claim cost O(due backlog)).
     """
     db = honker.open(db_path)
     q = db.queue("stale", max_attempts=3)
@@ -78,13 +84,15 @@ def test_exhausted_pending_is_not_claimable(db_path):
             "WHERE id=?",
             [job_id],
         )
+    other = q.enqueue({"n": 2})
 
+    job = q.claim_one("w")
+    assert job is not None and job.id == other
     assert q.claim_one("w") is None
-    dead = db.query(
-        "SELECT last_error FROM _honker_dead WHERE id=?", [job_id]
+    live = db.query(
+        "SELECT state, attempts FROM _honker_live WHERE id=?", [job_id]
     )
-    assert len(dead) == 1
-    assert dead[0]["last_error"] == "max attempts exceeded"
+    assert [(r["state"], r["attempts"]) for r in live] == [("pending", 3)]
 
 
 def test_in_flight_claim_still_valid_is_not_dead_lettered(db_path):

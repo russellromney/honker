@@ -231,7 +231,7 @@ jobs:
 
   python:
     name: python · honker
-    timeout-minutes: 10
+    timeout-minutes: 13
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -285,6 +285,19 @@ jobs:
             . .venv/bin/activate
           fi
           python -m pytest tests/ -q -n 0 --tb=short
+      # Multi-process lifecycle torture test against the raw loadable
+      # extension (tests/test_lifecycle_torture.py). It is marked `slow`
+      # so the run above deselects it; it runs here on its own, without
+      # xdist. It needs a sqlite3 that can load extensions, which macOS
+      # setup-python lacks, so it runs on uv's managed CPython. It fails,
+      # never skips, when the extension cannot be loaded. Windows has no
+      # SIGKILL, so it is not run there.
+      - name: Lifecycle torture test (raw extension, multi-process)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          uv run --no-project --managed-python --python "${{ matrix.python-version }}" --with pytest \
+            python -m pytest tests/test_lifecycle_torture.py -o addopts="" -q -rsxX --tb=short
       - name: Prove the documented Python ORM recipes
         shell: bash
         run: |
@@ -428,6 +441,21 @@ jobs:
         run: |
           npm ci
           npx napi build --platform --release --features kernel-watcher,shm-fast-path
+      # `napi build` regenerates index.js and index.d.ts. They are
+      # committed, so a diff here means someone edited them by hand or
+      # bumped the version without rebuilding. The 0.5.1 bump did the
+      # first: it changed the version checks but left the error messages
+      # at 0.5.0. The output does not depend on the platform, so one
+      # runner is enough.
+      - name: Check generated loader is up to date
+        if: runner.os == 'Linux'
+        working-directory: packages/honker-node
+        shell: bash
+        run: |
+          if ! git diff --exit-code -- index.js index.d.ts; then
+            echo "::error::index.js or index.d.ts differs from napi build output. Run 'npx napi build --platform --release' in packages/honker-node and commit the result."
+            exit 1
+          fi
       - name: Test Node ↔ Python stream checkpoint journeys
         shell: bash
         run: |
@@ -515,6 +543,9 @@ jobs:
           dotnet-version: "10.0.x"
       - uses: mlugg/setup-zig@v2
         with:
+          # honker.zig uses @cImport, which Zig 0.17 removed. Pin until the
+          # C++ binding moves to the build system's translate-c.
+          version: 0.16.0
           use-cache: false
       - uses: oven-sh/setup-bun@v2
       - uses: ruby/setup-ruby@v1
@@ -746,6 +777,66 @@ jobs:
           HONKER_TEST_DB="$RUNNER_TEMP/orm-kotlin.db" \
             mvn -B -q compile exec:java -Dexec.mainClass=dev.honker.ormproof.ExposedProof
 
+  claimed-at-upgrade:
+    name: upgrade · legacy and current claim timestamps
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build current and pinned pre-column extensions
+        env:
+          LEGACY_COMMIT: c18c263af2d94ca56ff0f9a7174bf7d1c1fc9b52
+        run: |
+          cargo build --release --locked -p honker-extension
+          mkdir -p "$RUNNER_TEMP/honker-current" "$RUNNER_TEMP/honker-legacy-source" "$RUNNER_TEMP/honker-legacy"
+          cp target/release/libhonker_ext.so "$RUNNER_TEMP/honker-current/"
+          git fetch --no-tags --depth=1 origin "$LEGACY_COMMIT"
+          git archive "$LEGACY_COMMIT" | tar -x -C "$RUNNER_TEMP/honker-legacy-source"
+          # The archived sources have older mtimes and the same crate versions.
+          # A shared target can incorrectly reuse the current extension as legacy.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/honker-legacy-target" cargo build --release --locked -p honker-extension --manifest-path "$RUNNER_TEMP/honker-legacy-source/Cargo.toml"
+          cp "$RUNNER_TEMP/honker-legacy-target/release/libhonker_ext.so" "$RUNNER_TEMP/honker-legacy/"
+      - name: Prove supported cutover and mixed-version recovery
+        run: |
+          python3 scripts/proof/claimed-at-upgrade.py --legacy-extension "$RUNNER_TEMP/honker-legacy/libhonker_ext.so" --extension "$RUNNER_TEMP/honker-current/libhonker_ext.so"
+
+  claim-v2-upgrade:
+    name: upgrade · legacy queue rows into claim v2
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build current and pinned pre-claim-v2 extensions
+        env:
+          # Last main before the `scheduled` state (#179 merged).
+          LEGACY_COMMIT: 28587ee49223b3c04dd793503b2836fb7c29934e
+        run: |
+          cargo build --release --locked -p honker-extension
+          mkdir -p "$RUNNER_TEMP/honker-current" "$RUNNER_TEMP/honker-legacy-source" "$RUNNER_TEMP/honker-legacy"
+          cp target/release/libhonker_ext.so "$RUNNER_TEMP/honker-current/"
+          git fetch --no-tags --depth=1 origin "$LEGACY_COMMIT"
+          git archive "$LEGACY_COMMIT" | tar -x -C "$RUNNER_TEMP/honker-legacy-source"
+          # A separate target dir: a shared one can reuse the current build as legacy.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/honker-legacy-target" cargo build --release --locked -p honker-extension --manifest-path "$RUNNER_TEMP/honker-legacy-source/Cargo.toml"
+          cp "$RUNNER_TEMP/honker-legacy-target/release/libhonker_ext.so" "$RUNNER_TEMP/honker-legacy/"
+      - name: Prove the migration and concurrent bootstrap
+        run: |
+          python3 scripts/proof/claim-v2-upgrade.py --legacy-extension "$RUNNER_TEMP/honker-legacy/libhonker_ext.so" --extension "$RUNNER_TEMP/honker-current/libhonker_ext.so"
+
   ci-ok:
     # THE required status check for everything in *this* workflow.
     #
@@ -780,6 +871,8 @@ jobs:
     needs:
       - lint
       - rust
+      - claimed-at-upgrade
+      - claim-v2-upgrade
       - perf-regression
       - wake-latency
       - python
