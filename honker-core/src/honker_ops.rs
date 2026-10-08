@@ -2042,16 +2042,39 @@ fn scheduler_wake(_conn: &Connection) -> rusqlite::Result<()> {
 /// must be delivered.
 pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 
-/// Record one boundary of a schedule whose stored payload is not a
-/// valid JSON payload, instead of enqueueing it: a `_honker_dead` row
-/// with the schedule's queue, payload, priority and max_attempts,
-/// `run_at` = the boundary, `attempts` = 0 and `last_error` = `error`.
-/// Returns the row's id.
+/// Why `task` cannot be enqueued, or None if it can. Only the two
+/// rejections `enqueue` makes from the row itself count: a payload that
+/// fails [`super::validate_json_payload`] and `max_attempts < 1`. Any
+/// other error (SQLite) is returned.
+fn unfireable_reason(task: &DueTask) -> rusqlite::Result<Option<String>> {
+    let rejected = super::validate_json_payload(&task.payload)
+        .and_then(|()| check_max_attempts("honker_scheduler_tick", task.max_attempts));
+    match rejected {
+        Ok(()) => Ok(None),
+        Err(rusqlite::Error::UserFunctionError(e)) => Ok(Some(format!(
+            "{e} (schedule {:?}); fire not enqueued, fix the schedule \
+             with honker_scheduler_update",
+            task.name
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Record one boundary of a schedule that cannot be enqueued (see
+/// [`unfireable_reason`]): a `_honker_dead` row with the schedule's
+/// queue, payload, priority and max_attempts, `run_at` = the boundary,
+/// `attempts` = 0 and `last_error` = `error`. Returns the row's id.
 ///
-/// The id comes from `_honker_live`'s AUTOINCREMENT, like every other
-/// dead row's, so it cannot collide with a job that dies later. The
-/// placeholder live row is deleted again inside the tick's savepoint;
-/// no other connection sees it.
+/// The id is drawn from `_honker_live`'s AUTOINCREMENT counter in
+/// `sqlite_sequence` without inserting into `_honker_live`, so no user
+/// trigger on that table sees a job that never existed. SQLite gives
+/// the next AUTOINCREMENT row an id one larger than the larger of
+/// `sqlite_sequence.seq` and the table's largest rowid, so after the
+/// bump no later live job can reuse this id, and neither can a later
+/// dead row (dead ids are live ids). The counter row only exists after
+/// the first live insert, so it is created at 0 if missing; the
+/// `max(...)` over both tables covers a counter that is behind them.
+/// Runs inside the tick's savepoint, which holds the write lock.
 fn dead_letter_unfireable(
     conn: &Connection,
     now: i64,
@@ -2059,26 +2082,23 @@ fn dead_letter_unfireable(
     fire_at: i64,
     error: &str,
 ) -> rusqlite::Result<i64> {
+    conn.prepare_cached(
+        "INSERT INTO sqlite_sequence (name, seq)
+         SELECT '_honker_live', 0
+          WHERE NOT EXISTS
+                (SELECT 1 FROM sqlite_sequence WHERE name = '_honker_live')",
+    )?
+    .execute([])?;
     let id: i64 = conn
         .prepare_cached(
-            "INSERT INTO _honker_live
-               (queue, payload, priority, run_at, max_attempts, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             RETURNING id",
+            "UPDATE sqlite_sequence
+                SET seq = max(seq,
+                              (SELECT COALESCE(max(id), 0) FROM _honker_live),
+                              (SELECT COALESCE(max(id), 0) FROM _honker_dead)) + 1
+              WHERE name = '_honker_live'
+          RETURNING seq",
         )?
-        .query_row(
-            rusqlite::params![
-                task.queue,
-                task.payload,
-                task.priority,
-                fire_at,
-                task.max_attempts,
-                now
-            ],
-            |r| r.get(0),
-        )?;
-    conn.prepare_cached("DELETE FROM _honker_live WHERE id = ?1")?
-        .execute(rusqlite::params![id])?;
+        .query_row([], |r| r.get(0))?;
     conn.prepare_cached(
         "INSERT INTO _honker_dead
            (id, queue, payload, priority, run_at, max_attempts,
@@ -2106,9 +2126,9 @@ fn dead_letter_unfireable(
 /// Returns a JSON array of `{name, queue, fire_at, job_id}` fires,
 /// ordered by task name and then by `fire_at`.
 ///
-/// A task whose stored payload fails [`super::validate_json_payload`]
-/// (written by raw SQL or before the JSON payload contract) is not
-/// enqueued and does not fail the tick. Each of its due boundaries
+/// A task whose stored row `enqueue` would reject (a payload that fails
+/// [`super::validate_json_payload`], or `max_attempts < 1`; written by raw
+/// SQL or an older build) is not enqueued and does not fail the tick. Each of its due boundaries
 /// becomes one `_honker_dead` row whose `last_error` names the schedule
 /// ([`dead_letter_unfireable`]), and its `next_fire_at` advances like a
 /// fired task's. Those boundaries are not in the returned array. A bad
@@ -2195,18 +2215,11 @@ fn scheduler_tick_inner(conn: &Connection, tick_at: i64) -> rusqlite::Result<Str
     let now = now_unix(conn)?;
     let mut out = Vec::new();
     for task in tasks {
-        // A schedule row written before the JSON payload contract (raw
-        // SQL, or an older build) can hold text `enqueue` now rejects.
-        // Checked once per task: the payload is the same at every boundary.
-        let bad_payload = match super::validate_json_payload(&task.payload) {
-            Ok(()) => None,
-            Err(rusqlite::Error::UserFunctionError(e)) => Some(format!(
-                "{e} (schedule {:?}); fire not enqueued, fix the payload \
-                 with honker_scheduler_update",
-                task.name
-            )),
-            Err(e) => return Err(e),
-        };
+        // A schedule row written by raw SQL or an older build can hold
+        // what `enqueue` now rejects: a payload that is not valid JSON, or
+        // max_attempts < 1. Such a task cannot fire. Checked once per
+        // task: the row is the same at every boundary.
+        let unfireable = unfireable_reason(&task)?;
         let mut next_fire_at = task.next_fire_at;
         let mut fires_this_task: i64 = 0;
         while next_fire_at <= tick_at {
@@ -2220,8 +2233,7 @@ fn scheduler_tick_inner(conn: &Connection, tick_at: i64) -> rusqlite::Result<Str
                     super::cron::next_after_unix(&task.cron_expr, tick_at).map_err(to_sql_err)?;
                 break;
             }
-            check_max_attempts("honker_scheduler_tick", task.max_attempts)?;
-            match &bad_payload {
+            match &unfireable {
                 // Enqueue at this boundary. `run_at` is NULL (claimable
                 // immediately); `expires` is the task's expires_s if set.
                 // max_attempts comes from the schedule row, not a constant.
@@ -3167,6 +3179,15 @@ mod payload_tests {
     fn a_dead_lettered_fire_does_not_collide_with_later_dead_jobs() {
         let conn = db();
         plant_legacy_schedules(&conn, &[("aaa-legacy", "not json")]);
+        // No live row was ever inserted, so the AUTOINCREMENT counter row
+        // does not exist yet: the empty-table case.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_sequence WHERE name = '_honker_live'"
+            ),
+            0
+        );
         tick(&conn, 120).unwrap();
         let dead_ids: Vec<i64> = conn
             .prepare("SELECT id FROM _honker_dead ORDER BY id")
@@ -3201,6 +3222,136 @@ mod payload_tests {
             count(&conn, "SELECT COUNT(*) FROM _honker_dead"),
             dead_ids.len() as i64 + 1
         );
+    }
+
+    /// A dead-lettered fire never touches `_honker_live`: a user INSERT
+    /// or DELETE trigger there must not see a job that never existed.
+    /// Healthy fires in the same tick still insert normally, and their ids
+    /// stay clear of the dead rows' ids.
+    #[test]
+    fn a_dead_lettered_fire_does_not_fire_live_table_triggers() {
+        let conn = db();
+        // The healthy row sorts first, so the counter already exists and
+        // the bad fires draw ids between healthy ones.
+        plant_legacy_schedules(&conn, &[("aaa-healthy", "{}"), ("bbb-legacy", "not json")]);
+        conn.execute_batch(
+            "CREATE TABLE trigger_log (op TEXT, payload TEXT);
+             CREATE TRIGGER user_live_insert AFTER INSERT ON _honker_live
+             BEGIN INSERT INTO trigger_log VALUES ('insert', NEW.payload); END;
+             CREATE TRIGGER user_live_delete AFTER DELETE ON _honker_live
+             BEGIN INSERT INTO trigger_log VALUES ('delete', OLD.payload); END;",
+        )
+        .unwrap();
+        let fires = tick(&conn, 120).unwrap();
+        let healthy = fires.len() as i64;
+        assert!(healthy > 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_dead"), healthy);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM trigger_log WHERE payload = 'not json'"
+            ),
+            0,
+            "a live-table trigger saw the dead-lettered fire"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM trigger_log WHERE op = 'insert' AND payload = '{}'"
+            ),
+            healthy
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM trigger_log WHERE op = 'delete'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM _honker_live l JOIN _honker_dead d ON l.id = d.id"
+            ),
+            0
+        );
+        // Every id handed out is distinct and the counter covers them all.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT seq FROM sqlite_sequence WHERE name = '_honker_live'"
+            ),
+            count(
+                &conn,
+                "SELECT max((SELECT max(id) FROM _honker_live), (SELECT max(id) FROM _honker_dead))"
+            )
+        );
+        let job: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('backups', '{}', NULL, NULL, 0, 1, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(job > count(&conn, "SELECT max(id) FROM _honker_dead"));
+    }
+
+    /// A legacy schedule row with `max_attempts < 1` (raw SQL; register
+    /// rejects it since #180) is handled like a bad payload: dead-lettered
+    /// per boundary with an error naming it, advanced, and the other
+    /// schedules keep firing.
+    #[test]
+    fn a_legacy_schedule_with_zero_max_attempts_is_dead_lettered() {
+        let conn = db();
+        plant_legacy_schedules(&conn, &[("aaa-zero", "{}"), ("zzz-healthy", "{}")]);
+        conn.execute(
+            "UPDATE _honker_scheduler_tasks SET max_attempts = 0 WHERE name = 'aaa-zero'",
+            [],
+        )
+        .unwrap();
+        let fires = tick(&conn, 120).expect("max_attempts 0 must not fail the tick");
+        assert!(!fires.is_empty());
+        assert!(
+            fires.iter().all(|f| f["name"] == "zzz-healthy"),
+            "{fires:?}"
+        );
+        let healthy = fires.len() as i64;
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_live"), healthy);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_dead"), healthy);
+        let error: String = conn
+            .query_row("SELECT last_error FROM _honker_dead LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            error.contains("max_attempts must be at least 1, got 0")
+                && error.contains("\"aaa-zero\"")
+                && error.contains("honker_scheduler_update"),
+            "{error}"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(DISTINCT next_fire_at) FROM _honker_scheduler_tasks"
+            ),
+            1
+        );
+        assert!(tick(&conn, 120).unwrap().is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_dead"), healthy);
+        // Fixing max_attempts through the public API makes it fire.
+        conn.query_row(
+            "SELECT honker_scheduler_update('aaa-zero', NULL, NULL, NULL, NULL, 0, 5, 1)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        let soonest = count(&conn, "SELECT honker_scheduler_soonest()");
+        let names: Vec<String> = tick(&conn, soonest)
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["aaa-zero", "zzz-healthy"]);
     }
 
     /// The tick is atomic (#173). If recording a skipped fire fails, the

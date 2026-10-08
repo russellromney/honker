@@ -278,12 +278,12 @@ any number of processes can tick at once:
   is enqueued once.
 - If any enqueue fails, the tick returns the error and changes nothing:
   no job, no advance. The next tick fires those boundaries.
-- A schedule whose stored payload is not valid JSON (a row written by raw
-  SQL or by a build before the JSON payload contract) is not enqueued and
-  does not fail the tick. Each of its due boundaries becomes one
-  `_honker_dead` row whose `last_error` names the schedule, and its
-  `next_fire_at` advances. Other schedules fire normally. Fix it with
-  `honker_scheduler_update`.
+- A schedule row that enqueue would reject (a payload that is not valid
+  JSON, or `max_attempts < 1`, written by raw SQL or an older build) is
+  not enqueued and does not fail the tick. Each of its due boundaries
+  becomes one `_honker_dead` row whose `last_error` names the schedule,
+  and its `next_fire_at` advances. Other schedules fire normally. Fix it
+  with `honker_scheduler_update`.
 - Inside a deferred `BEGIN`, call it before the transaction reads
   anything (or use `BEGIN IMMEDIATE`). Then a commit from another
   connection cannot fail it with "database is locked".

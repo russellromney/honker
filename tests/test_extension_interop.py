@@ -1332,6 +1332,20 @@ def test_extension_tick_dead_letters_a_legacy_payload_without_blocking(ext_db_pa
         "VALUES ('aaa-legacy', 'backups', '@every 1s', 'not json', 0, ?, 1, 3)",
         (start,),
     )
+    # max_attempts < 1 is the other row-level rejection; same handling.
+    conn.execute(
+        "INSERT INTO _honker_scheduler_tasks "
+        "(name, queue, cron_expr, payload, priority, next_fire_at, enabled, "
+        " max_attempts) "
+        "VALUES ('bbb-zero', 'backups', '@every 1s', '{}', 0, ?, 1, 0)",
+        (start,),
+    )
+    # A user trigger on _honker_live must never see a dead-lettered fire.
+    conn.execute("CREATE TABLE trigger_log (payload TEXT)")
+    conn.execute(
+        "CREATE TRIGGER user_live_insert AFTER INSERT ON _honker_live "
+        "BEGIN INSERT INTO trigger_log VALUES (NEW.payload); END"
+    )
     conn.commit()
 
     good_fires = []
@@ -1357,16 +1371,30 @@ def test_extension_tick_dead_letters_a_legacy_payload_without_blocking(ext_db_pa
 
     dead = conn.execute(
         "SELECT run_at, payload, attempts, last_error FROM _honker_dead "
-        "ORDER BY run_at"
+        "WHERE payload = 'not json' ORDER BY run_at"
     ).fetchall()
     assert [d[0] for d in dead] == boundaries
     for run_at, payload, attempts, last_error in dead:
-        assert payload == "not json"
         assert attempts == 0
         assert "honker: payload must be valid JSON" in last_error
         assert '"aaa-legacy"' in last_error
+    zero = conn.execute(
+        "SELECT run_at, last_error FROM _honker_dead "
+        "WHERE payload = '{}' ORDER BY run_at"
+    ).fetchall()
+    assert [z[0] for z in zero] == boundaries
+    for _, last_error in zero:
+        assert "max_attempts must be at least 1, got 0" in last_error
+        assert '"bbb-zero"' in last_error
+    assert conn.execute("SELECT COUNT(*) FROM _honker_dead").fetchone()[0] == 12
+    logged = conn.execute("SELECT payload FROM trigger_log").fetchall()
+    assert logged == [('{"ok":true}',)] * len(boundaries)
     nexts = conn.execute(
         "SELECT name, next_fire_at FROM _honker_scheduler_tasks ORDER BY name"
     ).fetchall()
-    assert nexts == [("aaa-legacy", start + 6), ("good", start + 6)]
+    assert nexts == [
+        ("aaa-legacy", start + 6),
+        ("bbb-zero", start + 6),
+        ("good", start + 6),
+    ]
     conn.close()
