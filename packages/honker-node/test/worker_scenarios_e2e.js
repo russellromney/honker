@@ -439,7 +439,10 @@ test('C6: an idle worker with four claim loops uses almost no CPU', { skip: SKIP
       open(dbPath).queue('c6').enqueue({ key: 'warm' });
       const w = add(await startWorker(dbPath, { queue: 'c6', loops: 4, cpuAfterS: 5 }));
       const cpu = await w.waitFor((e) => e.tag === 'CPU', 15000, 'CPU report');
-      assert.ok(cpu.seconds < 0.5, `idle worker used ${cpu.seconds} s CPU in 5 s`);
+      // A wake loop that spins burns ~5 s here. The idle baseline is
+      // ~0.22 s on an M-series Mac (watcher thread plus timers) and about
+      // twice that on a shared CI runner, so 1 s still separates them.
+      assert.ok(cpu.seconds < 1.0, `idle worker used ${cpu.seconds} s CPU in 5 s`);
     });
   } finally {
     cleanup();
