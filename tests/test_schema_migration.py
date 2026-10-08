@@ -262,6 +262,10 @@ def _skip_or_fail(msg):
 
 
 def _write_with_npm_release(tmp_path, db_file) -> dict:
+    if sys.platform == "win32":
+        # honker-node 0.5.1's optionalDependencies list darwin and linux
+        # binaries only; there is no released Windows build to upgrade from.
+        pytest.skip("the npm release ships no win32 native binding")
     node, npm = shutil.which("node"), shutil.which("npm")
     if node is None or npm is None:
         _skip_or_fail("node/npm not on PATH")

@@ -460,8 +460,11 @@ def test_two_scheduler_processes_fire_each_boundary_once(tmp_path):
     finally:
         for proc in procs:
             _terminate(proc)
-    for proc in procs:
-        assert proc.returncode == 0, proc.stderr.read() if proc.stderr else ""
+    if sys.platform != "win32":
+        # terminate() is TerminateProcess on Windows (exit 1), so only
+        # POSIX can tell a clean SIGTERM stop from a crash.
+        for proc in procs:
+            assert proc.returncode == 0, proc.stderr.read() if proc.stderr else ""
 
     next_due, jobs = _beats_fired_and_enqueued(db)
     fired = next_due - first_due

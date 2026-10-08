@@ -953,12 +953,16 @@ def test_c2_cancel_in_flight_is_dropped_and_worker_continues(db_path, handler):
 
 
 def _locked_mid_run(db_path: str, lock_s: float) -> None:
-    """The worker's first attempt fails and is retried with a 1 s
+    """The worker's first attempt fails and is retried with a 2 s
     delay. While that retry is scheduled another connection takes the
-    write lock, so the sleeping worker wakes and claims into the lock."""
+    write lock, so the sleeping worker wakes and claims into the lock.
+
+    run_at has one-second resolution, so a 2 s delay leaves the job
+    'scheduled' for between 1 and 2 s; a 1 s delay can leave almost
+    no window. The lock (3 s or more) always covers the due time."""
     db = honker.open(db_path)
     _q, work = _work_queue(db, "c3")
-    worker, ledger = _start_task_worker(db_path, queue="c3", retry_delay_s=1)
+    worker, ledger = _start_task_worker(db_path, queue="c3", retry_delay_s=2)
     try:
         flaky = work("flaky", fail_once=True)
         assert _wait_until(
