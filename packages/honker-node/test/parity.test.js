@@ -12,6 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const honker = require('..');
+const { knownBug } = require('./helpers');
 const realOpen = honker.open.bind(honker);
 
 const deferredCleanupDirs = new Set();
@@ -229,18 +230,70 @@ test('queue: enqueue with opts.tx routes through transaction', () => {
   }
 });
 
-test('queue: sweepExpired returns a count', () => {
+test('queue: sweepExpired moves only expired jobs to dead', async () => {
   const { path: p, cleanup } = tmpdb();
   try {
     const db = honker.open(p);
     const q = db.queue('sweep');
-    q.enqueue({});
-    const n = q.sweepExpired();
-    assert.ok(n >= 0);
+    const keep = q.enqueue({ keep: true });
+    const gone = q.enqueue({ keep: false }, { expires: 1 });
+    assert.equal(q.sweepExpired(), 0, 'nothing has expired yet');
+    // expires_at has one-second resolution and expiry is strict.
+    await new Promise((r) => setTimeout(r, 2100));
+    assert.equal(q.sweepExpired(), 1);
+    assert.equal(q.getJob(gone), null);
+    assert.equal(q.getJob(keep).state, 'pending');
+    const dead = db.query('SELECT id, last_error FROM _honker_dead');
+    assert.deepEqual(dead, [{ id: gone, last_error: 'expired' }]);
   } finally {
     cleanup();
   }
 });
+
+for (const shape of ['trigger', 'insert_select']) {
+  test(`queue: claim inside a write statement (${shape}) names the function and changes nothing`, () => {
+    // #167: honker_claim_batch needs its own savepoint, which SQLite
+    // refuses inside a trigger or INSERT ... SELECT.
+    const { path: p, cleanup } = tmpdb();
+    try {
+      const db = honker.open(p);
+      const q = db.queue('trig');
+      const jid = q.enqueue({ n: 1 });
+      {
+        const tx = db.transaction();
+        tx.execute('CREATE TABLE orders (id INTEGER PRIMARY KEY)');
+        tx.execute('CREATE TABLE claims (rows TEXT)');
+        if (shape === 'trigger') {
+          tx.execute(
+            'CREATE TRIGGER claim_on_order AFTER INSERT ON orders BEGIN ' +
+              "SELECT honker_claim_batch('trig', 'trigger-worker', 1, 60); END",
+          );
+        }
+        tx.commit();
+      }
+      const tx = db.transaction();
+      assert.throws(() => {
+        tx.execute('INSERT INTO orders VALUES (1)');
+        if (shape === 'insert_select') {
+          tx.execute("INSERT INTO claims SELECT honker_claim_batch('trig', 'w', 1, 60)");
+        }
+      }, /honker_claim_batch requires a separate SELECT/);
+      tx.rollback();
+      assert.equal(q.getJob(jid).state, 'pending');
+      assert.equal(db.query('SELECT COUNT(*) AS c FROM orders')[0].c, 0);
+
+      // The supported shape: a separate SELECT in the same transaction.
+      const ok = db.transaction();
+      ok.execute('DROP TRIGGER IF EXISTS claim_on_order');
+      ok.execute('INSERT INTO orders VALUES (2)');
+      const rows = ok.query("SELECT honker_claim_batch('trig', 'w', 1, 60) AS r");
+      ok.commit();
+      assert.deepEqual(JSON.parse(rows[0].r).map((r) => r.id), [jid]);
+    } finally {
+      cleanup();
+    }
+  });
+}
 
 // ---------------------------------------------------------------------
 // Stream — publish / readSince / consumer offsets
@@ -289,6 +342,43 @@ test('stream: consumer offsets + readFromConsumer', () => {
     s.saveOffset('c1', evs1[evs1.length - 1].offset);
     const evs2 = s.readFromConsumer('c1', 10);
     assert.equal(evs2.length, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test('stream: a corrupt consumer checkpoint raises instead of replaying', async (t) => {
+  // #166: an unreadable checkpoint used to read as offset 0, so the
+  // consumer silently replayed the whole stream.
+  const { path: p, cleanup } = tmpdb();
+  try {
+    const db = honker.open(p);
+    const s = db.stream('orders');
+    for (let n = 0; n < 3; n++) s.publish({ n });
+    s.saveOffset('billing', 2);
+    assert.equal(s.getOffset('billing'), 2);
+    const tx = db.transaction();
+    tx.execute("UPDATE _honker_stream_consumers SET offset = 'garbage' WHERE name = 'billing'");
+    tx.commit();
+    // No replay: every read path refuses the checkpoint.
+    assert.throws(() => s.readFromConsumer('billing', 10));
+    await assert.rejects(async () => {
+      const sub = s.subscribe('billing');
+      try {
+        await sub.next();
+      } finally {
+        sub.close();
+      }
+    });
+    // A consumer that never saved is still a plain offset 0.
+    assert.equal(s.getOffset('new-consumer'), 0);
+    await knownBug(
+      t,
+      'Stream.getOffset reads the checkpoint with its own SELECT, not the #166 core path, so it returns the text as the offset and reads fail later with "Invalid function parameter type Text at index 1" (#186)',
+      () => {
+        assert.throws(() => s.getOffset('billing'), /offset/);
+      },
+    );
   } finally {
     cleanup();
   }
