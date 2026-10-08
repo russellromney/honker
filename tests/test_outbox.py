@@ -294,9 +294,15 @@ async def test_stuck_handler_past_visibility_timeout_is_reclaimed(db_path):
     assert rows[0]["c"] == 0
 
 
-async def test_heartbeat_prevents_reclaim_for_long_running_job(db_path):
+@pytest.mark.parametrize("heartbeat", [True, False])
+async def test_heartbeat_prevents_reclaim_for_long_running_job(db_path, heartbeat):
     """The flip side: a legitimately long handler that heartbeats must not
-    get its claim stolen."""
+    get its claim stolen.
+
+    Leases expire at one-second resolution and a claim is stealable
+    only once unixepoch() > claim_expires_at, so a 1 s lease is
+    guaranteed stealable 2.5 s after the claim. The intruder waits that
+    long; the no-heartbeat control proves it would have stolen."""
     db = honker.open(db_path)
     q = db.queue("long", visibility_timeout_s=1)
     q.enqueue({"n": 1})
@@ -309,11 +315,12 @@ async def test_heartbeat_prevents_reclaim_for_long_running_job(db_path):
 
     async def heartbeat_loop():
         for _ in range(10):
-            heartbeats.append(job.heartbeat(extend_s=1))
+            if heartbeat:
+                heartbeats.append(job.heartbeat(extend_s=1))
             await asyncio.sleep(0.3)
 
     async def intruder():
-        await asyncio.sleep(1.2)  # wait past visibility timeout
+        await asyncio.sleep(2.5)  # always past a 1 s lease
         stolen = q.claim_one("intruder")
         return stolen
 
@@ -321,7 +328,6 @@ async def test_heartbeat_prevents_reclaim_for_long_running_job(db_path):
     int_task = asyncio.create_task(intruder())
 
     stolen = await asyncio.wait_for(int_task, timeout=5.0)
-    assert stolen is None, "heartbeated job was stolen"
 
     hb_task.cancel()
     try:
@@ -329,9 +335,15 @@ async def test_heartbeat_prevents_reclaim_for_long_running_job(db_path):
     except asyncio.CancelledError:
         pass
 
-    # All heartbeats succeeded.
-    assert all(heartbeats)
-    assert job.ack() is True
+    if heartbeat:
+        assert stolen is None, "heartbeated job was stolen"
+        # All heartbeats succeeded.
+        assert heartbeats and all(heartbeats)
+        assert job.ack() is True
+    else:
+        assert stolen is not None and stolen.attempts == 2
+        assert job.ack() is False
+        assert stolen.ack() is True
 
 
 async def test_outbox_worker_stops_cleanly_on_cancel(db_path):

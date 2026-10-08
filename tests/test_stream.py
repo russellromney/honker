@@ -395,3 +395,26 @@ def test_large_payload_round_trips(db_path):
     )
     import json as j
     assert j.loads(rows[0]["payload"]) == big
+
+
+async def test_corrupt_consumer_checkpoint_raises_instead_of_replaying(db_path):
+    """#166: a checkpoint that cannot be read used to look like a new
+    consumer at offset 0, so the consumer silently replayed the whole
+    stream. It must raise."""
+    db = honker.open(db_path)
+    s = db.stream("orders")
+    for n in range(3):
+        s.publish({"n": n})
+    s.save_offset("billing", 2)
+    assert s.get_offset("billing") == 2
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_stream_consumers SET offset = 'garbage' "
+            "WHERE name = 'billing'"
+        )
+    with pytest.raises(Exception, match="offset"):
+        s.get_offset("billing")
+    with pytest.raises(Exception, match="offset"):
+        s.subscribe(consumer="billing")
+    # A consumer that never saved is still a plain offset 0.
+    assert s.get_offset("new-consumer") == 0

@@ -94,6 +94,53 @@ jobs:
           uv run --no-project --managed-python --python 3.14 --with pytest \
             python -m pytest tests/test_lifecycle_torture.py -o addopts="" -q -rsxX --tb=short
 
+  mixed-workload-soak:
+    # tests/test_soak.py::test_mixed_workload_soak_accounts_for_every_job,
+    # long variant: 5 minutes per binding instead of the PR run's 40 s.
+    # The seed is random each night and printed with the summary line.
+    name: mixed-workload soak · ${{ matrix.os }}
+    timeout-minutes: 30
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        run: rustup default stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+      - name: Build Python and Node bindings
+        shell: bash
+        run: |
+          uv venv --python "3.14" .venv
+          . .venv/bin/activate
+          uv pip install pytest pytest-xdist maturin
+          (cd packages/honker && maturin develop --release --features kernel-watcher,shm-fast-path)
+          cd packages/honker-node
+          npm ci
+          npx napi build --platform --release --features kernel-watcher,shm-fast-path
+      - name: Long mixed-workload soak (Python and Node)
+        shell: bash
+        env:
+          HONKER_SOAK_SECONDS: "300"
+          HONKER_REQUIRE_NODE: "1"
+        run: |
+          export HONKER_SOAK_SEED="$RANDOM$RANDOM"
+          echo "HONKER_SOAK_SEED=$HONKER_SOAK_SEED"
+          . .venv/bin/activate
+          python -m pytest tests/test_soak.py -k mixed_workload -o addopts="" -q -n 0 -s --tb=short
+
   packaged-installs:
     name: packaged installs · ubuntu
     timeout-minutes: 25

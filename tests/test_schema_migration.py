@@ -173,3 +173,221 @@ def test_fresh_db_has_all_current_tables(db_path):
     }
     missing = expected - names
     assert not missing, f"missing tables on fresh DB: {missing}"
+
+
+# ---------------------------------------------------------------------
+# Upgrade from the latest published release.
+#
+# The tests above build legacy schemas by hand. These let the real
+# previous release write the file: the newest honker from PyPI (in a
+# scratch venv, via uv) or the newest honker-node from npm (in a
+# scratch directory) populates a database with due, delayed, in-flight,
+# exhausted and expiring jobs plus a schedule, and exits. The binding
+# under test then opens the same file and has to run everything
+# correctly, which covers the #180 bootstrap migration ('scheduled'
+# state, new indexes) on data a user would actually have. The
+# migration lives in honker-core, so the current Python binding reads
+# both files.
+#
+# Needs network. Skips when uv/npm or the registry is unavailable,
+# unless HONKER_REQUIRE_UPGRADE=1 (set in CI), where that is a failure.
+# HONKER_UPGRADE_FROM pins the PyPI version; the default is the newest.
+# ---------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+
+import pytest  # noqa: E402
+
+_OLD_PYPI_WRITER = r"""
+import json, sys, time
+import importlib.metadata as md
+import honker
+
+db = honker.open(sys.argv[1])
+ids = {"version": md.version("honker"), "file": honker.__file__}
+up = db.queue("up")
+ids["due"] = up.enqueue({"k": "due"})
+ids["delayed"] = up.enqueue({"k": "delayed"}, delay=4)
+ids["expiring"] = up.enqueue({"k": "expiring"}, delay=1, expires=1)
+
+inflight = db.queue("up-inflight", visibility_timeout_s=1)
+ids["inflight"] = inflight.enqueue({"k": "inflight"})
+assert inflight.claim_one("old-worker").id == ids["inflight"]
+
+exhausted = db.queue("up-exhausted", visibility_timeout_s=1, max_attempts=1)
+ids["exhausted"] = exhausted.enqueue({"k": "exhausted"})
+assert exhausted.claim_one("old-worker").id == ids["exhausted"]
+
+honker.Scheduler(db).add(
+    name="up-beat", queue="up-beats", schedule=honker.every_s(1), payload={"k": "beat"}
+)
+ids["now"] = time.time()
+print(json.dumps(ids), flush=True)
+"""
+
+_OLD_NPM_WRITER = r"""
+const h = require('@russellthehippo/honker-node');
+const db = h.open(process.argv[1]);
+const ids = {
+  version: require('@russellthehippo/honker-node/package.json').version,
+  file: require.resolve('@russellthehippo/honker-node'),
+};
+const up = db.queue('up');
+ids.due = up.enqueue({ k: 'due' });
+ids.delayed = up.enqueue({ k: 'delayed' }, { delay: 4 });
+ids.expiring = up.enqueue({ k: 'expiring' }, { delay: 1, expires: 1 });
+const inflight = db.queue('up-inflight', { visibilityTimeoutS: 1 });
+ids.inflight = inflight.enqueue({ k: 'inflight' });
+if (inflight.claimOne('old-worker').id !== ids.inflight) throw new Error('claim');
+const exhausted = db.queue('up-exhausted', { visibilityTimeoutS: 1, maxAttempts: 1 });
+ids.exhausted = exhausted.enqueue({ k: 'exhausted' });
+if (exhausted.claimOne('old-worker').id !== ids.exhausted) throw new Error('claim');
+db.scheduler().add({ name: 'up-beat', queue: 'up-beats', cron: '@every 1s', payload: { k: 'beat' } });
+ids.now = Date.now() / 1000;
+console.log(JSON.stringify(ids));
+db.close();
+"""
+
+
+def _skip_or_fail(msg):
+    if os.environ.get("HONKER_REQUIRE_UPGRADE") == "1":
+        pytest.fail(msg)
+    pytest.skip(msg)
+
+
+def _write_with_npm_release(tmp_path, db_file) -> dict:
+    if sys.platform == "win32":
+        # honker-node 0.5.1's optionalDependencies list darwin and linux
+        # binaries only; there is no released Windows build to upgrade from.
+        pytest.skip("the npm release ships no win32 native binding")
+    node, npm = shutil.which("node"), shutil.which("npm")
+    if node is None or npm is None:
+        _skip_or_fail("node/npm not on PATH")
+    root = tmp_path / "old-npm"
+    root.mkdir()
+    (root / "package.json").write_text('{"private": true}')
+    res = subprocess.run(
+        [npm, "install", "--no-audit", "--no-fund", "--silent",
+         "@russellthehippo/honker-node"],
+        capture_output=True, text=True, timeout=300, cwd=root,
+    )
+    if res.returncode != 0:
+        _skip_or_fail(f"could not install honker-node from npm: {res.stderr[-800:]}")
+    res = subprocess.run(
+        [node, "-e", _OLD_NPM_WRITER, db_file],
+        capture_output=True, text=True, timeout=60, cwd=root,
+    )
+    assert res.returncode == 0, res.stderr
+    return json.loads(res.stdout)
+
+
+def _write_with_pypi_release(tmp_path, db_file) -> dict:
+    old_py = _old_release_python(tmp_path)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    res = subprocess.run(
+        [old_py, "-c", _OLD_PYPI_WRITER, db_file],
+        capture_output=True, text=True, timeout=60, cwd=tmp_path, env=env,
+    )
+    assert res.returncode == 0, res.stderr
+    return json.loads(res.stdout)
+
+
+def _old_release_python(tmp_path) -> str:
+    uv = shutil.which("uv")
+    if uv is None:
+        _skip_or_fail("uv not on PATH")
+    venv = tmp_path / "old-release"
+    spec = "honker"
+    if os.environ.get("HONKER_UPGRADE_FROM"):
+        spec = f"honker=={os.environ['HONKER_UPGRADE_FROM']}"
+    py = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    steps = [
+        [uv, "venv", "-q", "--python", sys.executable, str(venv)],
+        [uv, "pip", "install", "-q", "--python", str(py), "--no-sources", spec],
+    ]
+    for cmd in steps:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=tmp_path)
+        if res.returncode != 0:
+            _skip_or_fail(f"could not install {spec} from PyPI: {res.stderr[-800:]}")
+    return str(py)
+
+
+@pytest.mark.parametrize("release", ["pypi", "npm"])
+def test_db_written_by_latest_release_runs_correctly_after_upgrade(tmp_path, release):
+    db_file = str(tmp_path / "upgrade.db")
+    if release == "pypi":
+        ids = _write_with_pypi_release(tmp_path, db_file)
+        assert "old-release" in ids["file"], f"old writer imported {ids['file']}"
+    else:
+        ids = _write_with_npm_release(tmp_path, db_file)
+        assert "old-npm" in ids["file"], f"old writer loaded {ids['file']}"
+    print(f"upgrading a database written by {release} release {ids['version']}")
+
+    db = honker.open(db_file)
+    up = db.queue("up")
+
+    # #180 bootstrap migration: the future job is 'scheduled' now and
+    # the claim-path indexes exist.
+    delayed_row = up.get_job(ids["delayed"])
+    assert delayed_row["state"] == "scheduled"
+    assert up.get_job(ids["due"])["state"] == "pending"
+    indexes = {
+        r["name"]
+        for r in db.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='_honker_live'"
+        )
+    }
+    assert {
+        "_honker_live_ready",
+        "_honker_live_scheduled",
+        "_honker_live_expiry",
+        "_honker_live_processing_deadline",
+    } <= indexes
+
+    async def run_up_queue():
+        # A normal claim loop on the upgraded file. It must get the due
+        # job at once and the delayed job when it falls due, nothing else.
+        seen = []
+        async for job in up.claim("new-worker"):
+            seen.append((job.payload["k"], time.time(), job.attempts))
+            assert job.ack()
+            if job.payload["k"] == "delayed":
+                return seen
+
+    seen = asyncio.run(asyncio.wait_for(run_up_queue(), timeout=20))
+    assert [s[0] for s in seen] == ["due", "delayed"]
+    run_at = delayed_row["run_at"]  # whole seconds
+    assert seen[1][1] >= run_at - 0.05, "delayed job ran early"
+    assert seen[1][1] <= run_at + 1.5, "delayed job ran late"
+
+    # The in-flight job's lease lapsed: reclaimed as attempt 2.
+    inflight = db.queue("up-inflight").claim_one("new-worker")
+    assert (inflight.id, inflight.attempts) == (ids["inflight"], 2)
+    assert inflight.ack()
+    # The exhausted job is dead-lettered, never handed out again.
+    assert db.queue("up-exhausted").claim_one("new-worker") is None
+    dead = {
+        r["id"]: r["last_error"]
+        for r in db.query("SELECT id, last_error FROM _honker_dead")
+    }
+    assert dead == {
+        ids["exhausted"]: "max attempts exceeded",
+        ids["expiring"]: "expired",
+    }
+
+    # The schedule the old release registered keeps firing.
+    async def run_scheduler(seconds):
+        stop = asyncio.Event()
+        asyncio.get_running_loop().call_later(seconds, stop.set)
+        await honker.Scheduler(db).run(stop)
+
+    asyncio.run(run_scheduler(2.5))
+    beats = db.query("SELECT COUNT(*) AS c FROM _honker_live WHERE queue='up-beats'")[0]["c"]
+    assert beats >= 1, "the old release's schedule did not fire after the upgrade"
+    assert db.query("PRAGMA integrity_check")[0]["integrity_check"] == "ok"

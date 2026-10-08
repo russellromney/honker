@@ -7,7 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const honker = require('..');
-const { createTempDb } = require('./helpers');
+const { createTempDb, knownBug } = require('./helpers');
 
 function tmpdb() {
   return createTempDb('honker-mantle-', honker.open.bind(honker));
@@ -212,6 +212,118 @@ test('queue.getJob misses after ack (separate from cancel)', () => {
     assert.equal(job.ack(), true);
     // After ack the row is gone — get_job misses just like after cancel.
     assert.equal(q.getJob(jid), null);
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------- user-facing negatives for the Phase Clemente core changes ----------
+
+test('queue.cancel of another queue\'s job returns false [known bug #186]', async (t) => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  try {
+    const db = open(dbPath);
+    const emails = db.queue('emails');
+    const sms = db.queue('sms');
+    const smsId = sms.enqueue({ to: '+1555' });
+    await knownBug(
+      t,
+      'Queue.cancel calls honker_cancel(id); core has the queue-scoped honker_cancel(queue, id) since #155 (#134) but the Node binding has not switched (#186)',
+      () => {
+        assert.equal(emails.cancel(smsId), false);
+        assert.notEqual(sms.getJob(smsId), null);
+      },
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('maxAttempts below 1 is rejected at enqueue with a clear error', () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  try {
+    const db = open(dbPath);
+    for (const bad of [0, -1]) {
+      // Declaring the queue does not validate; the first enqueue does.
+      const q = db.queue(`bad${bad}`, { maxAttempts: bad });
+      assert.throws(() => q.enqueue({ n: 1 }), /max_attempts must be at least 1/);
+      const tx = db.transaction();
+      assert.throws(() => q.enqueueTx(tx, { n: 1 }), /max_attempts must be at least 1/);
+      tx.rollback();
+      assert.equal(
+        db.query('SELECT COUNT(*) AS c FROM _honker_live')[0].c,
+        0,
+        'a rejected enqueue writes nothing',
+      );
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test('scheduler rejects maxAttempts below 1 and invalid schedules', () => {
+  const { path: dbPath, open, cleanup } = tmpdb();
+  try {
+    const db = open(dbPath);
+    const sched = new honker.Scheduler(db);
+    assert.throws(
+      () => sched.add({ name: 'z', queue: 'q', cron: '@every 1s', payload: null, maxAttempts: 0 }),
+      /max_attempts must be at least 1/,
+    );
+    sched.add({ name: 'ok', queue: 'q', cron: '@every 1s', payload: null });
+    assert.throws(() => sched.update('ok', { maxAttempts: 0 }), /max_attempts must be at least 1/);
+    for (const cron of ['61 * * * *', 'not a schedule', '@every 0s']) {
+      assert.throws(
+        () => sched.add({ name: `bad-${cron}`, queue: 'q', cron, payload: null }),
+        Error,
+        `cron ${JSON.stringify(cron)} must be rejected`,
+      );
+    }
+    assert.deepEqual(sched.list().map((s) => s.name), ['ok']);
+  } finally {
+    cleanup();
+  }
+});
+
+test('lookups of missing jobs and schedules are misses, not errors', () => {
+  // #166 made lookup errors raise; a genuine miss must still be a miss.
+  const { path: dbPath, open, cleanup } = tmpdb();
+  try {
+    const db = open(dbPath);
+    const q = db.queue('emails');
+    const sched = new honker.Scheduler(db);
+    assert.equal(q.getJob(424242), null);
+    assert.equal(q.cancel(424242), false);
+    assert.equal(db.getResult(424242), null);
+    assert.equal(sched.update('missing', { priority: 1 }), false);
+    assert.equal(sched.pause('missing'), false);
+    assert.equal(sched.resume('missing'), false);
+    assert.equal(sched.remove('missing'), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test('getJob shows the scheduled state until a delayed job is due', () => {
+  // #180: future run_at is 'scheduled'; a delayed retry goes back to it.
+  const { path: dbPath, open, cleanup } = tmpdb();
+  try {
+    const db = open(dbPath);
+    const q = db.queue('later');
+    const later = q.enqueue({ n: 1 }, { delay: 60 });
+    assert.equal(q.getJob(later).state, 'scheduled');
+    assert.equal(q.claimOne('w'), null);
+
+    const now = q.enqueue({ n: 2 });
+    assert.equal(q.getJob(now).state, 'pending');
+    const job = q.claimOne('w');
+    assert.equal(job.id, now);
+    assert.equal(job.retry(60, 'later'), true);
+    assert.equal(q.getJob(now).state, 'scheduled');
+    assert.equal(job.retry(0), false, 'the claim is gone');
+
+    assert.equal(q.cancel(later), true, 'cancel accepts scheduled rows');
+    assert.equal(q.getJob(later), null);
   } finally {
     cleanup();
   }
