@@ -1,5 +1,88 @@
 # CHANGELOG
 
+## Unreleased — JSON payload contract
+
+- **Breaking:** every payload accepted by Honker core must be JSON that a JSON
+  decoder can read back. Queue enqueue, stream publish, notifications, task
+  results, and scheduler register or update all validate before the write.
+  Objects, arrays, strings, numbers, booleans, and `null` remain valid
+  payloads. Typed binding APIs encode values where documented; raw JSON APIs
+  and direct SQL callers must pass serialized JSON text.
+- Validation parses into `serde_json::Value` — the same thing the read side
+  does — rather than scanning the grammar structurally. A structural scan does
+  not unescape strings, range-check numbers, or bound nesting, so it accepted
+  text that no decoder can read. Three payload classes that used to enqueue
+  now fail at the producer instead:
+  - **Lone surrogates**, such as `"\ud800"` or `{"a":"\ud800"}`. Valid by the
+    JSON grammar, not representable as UTF-8. Both `json.dumps` in Python and
+    `JSON.stringify` in Node can emit these.
+  - **Numbers outside f64 range**, such as `1e999`, `-1e999`, or
+    `{"a":1e999}`.
+  - **Nesting deeper than 128 levels**, which is `serde_json`'s own recursion
+    limit. SQLite's `json_valid()` allows about 1000, so honker is now the
+    stricter of the two on depth.
+
+  This is intended, not a regression. A producer emitting any of these was
+  creating a job that a consumer could not decode — the failure moved from an
+  unrelated process at read time to the caller that caused it. If you were
+  relying on one of these shapes, encode it: escape a surrogate pair properly,
+  send an out-of-range number as a string, or flatten the nesting.
+- Rejection messages now name the actual problem and carry serde's own text.
+  Text that is not JSON gets
+  `honker: payload must be valid JSON: <serde message>`. Text that parses as
+  JSON but cannot be decoded gets
+  `honker: payload is valid JSON but cannot be decoded: <serde message>` —
+  telling that caller their payload "must be valid JSON" would send them
+  hunting for a syntax error they do not have.
+- The stricter parse is not measurable at the enqueue floor:
+  `tests/test_performance_floors.py::test_enqueue_throughput_floor_one_tx`
+  (10,000 enqueues in one transaction) went from 0.235 s to 0.241 s median on
+  an M-series laptop, about 23.5 µs to 24.1 µs per enqueue against a 3.0 s
+  floor. The enqueue cost is dominated by the SQLite insert and binding
+  marshaling, not by the JSON check.
+- **Check `_honker_scheduler_tasks` before upgrading.** Existing rows are not
+  validated retroactively. A legacy `_honker_live` row is inert: it still
+  claims, retries, and dead-letters, and the decode failure lands on whichever
+  consumer reads it. A legacy `_honker_scheduler_tasks` row whose payload is
+  not valid JSON cannot be fired any more, because the tick's enqueue
+  validates it. The same goes for a row with `max_attempts < 1`, which
+  register has rejected since claim v2 and which used to fail every tick.
+  `honker_scheduler_tick` does not enqueue such a row and does not fail: each
+  due boundary of that schedule becomes one `_honker_dead` row (queue,
+  payload, `run_at` = the boundary, `attempts` = 0), and its `next_fire_at`
+  advances like any other schedule's. Every other schedule in the same tick
+  fires normally, and nothing is fired or reported twice. The tick's return
+  value lists enqueued jobs only, as before. The dead row takes its id from
+  `_honker_live`'s AUTOINCREMENT counter without inserting into
+  `_honker_live`, so triggers on that table never see it. `last_error` names
+  the schedule:
+
+  ```text
+  honker: payload must be valid JSON: expected ident at line 1 column 2
+    (schedule "nightly-report"); fire not enqueued, fix the schedule with
+    honker_scheduler_update
+  honker_scheduler_tick: max_attempts must be at least 1, got 0
+    (schedule "nightly-report"); fire not enqueued, fix the schedule with
+    honker_scheduler_update
+  ```
+
+  Watch `_honker_dead` for these, or find them up front with the query below
+  (and `WHERE max_attempts < 1`). Repair a row with
+  `honker_scheduler_update(name, ...)`, or drop it with
+  `honker_scheduler_unregister(name)`. Boundaries that passed while the row
+  was bad are not replayed.
+- **`save_result` takes raw text in most bindings** and now requires that text
+  to be JSON. Rust, Go, Node, Bun, Ruby, Elixir, C++, JVM, and Kotlin all pass
+  the value through unserialized, unlike their `enqueue` / `publish` / `notify`
+  methods. `save_result(id, "done", ttl)` used to store `done` and now fails —
+  pass `'"done"'`. Python and .NET serialize for you and are unaffected.
+- The migration detection query in the guide,
+  `SELECT id FROM _honker_live WHERE NOT json_valid(payload)` (and the same
+  query over `_honker_scheduler_tasks`), still does not agree with honker
+  exactly. `json_valid()` returns 1 for lone surrogates, for `1e999`, and for
+  nesting between 129 and about 1000 levels, so it will miss legacy rows that
+  honker now rejects. To find every row that will not decode, decode it.
+
 ## Unreleased — atomic scheduler tick (issue #173)
 
 - `honker_scheduler_tick` runs in one savepoint, and its first statement

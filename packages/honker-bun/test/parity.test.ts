@@ -433,7 +433,7 @@ maybe("honker-bun parity — Results", () => {
   test(
     "sweepResults returns non-negative",
     withDb((db) => {
-      db.saveResult(1, "x", 60);
+      db.saveResult(1, JSON.stringify("x"), 60);
       const n = db.sweepResults();
       expect(n).toBeGreaterThanOrEqual(0);
     }),

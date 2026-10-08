@@ -563,7 +563,7 @@ func TestSweepResultsExpired(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.SaveResult(1, "val", 1); err != nil {
+	if err := db.SaveResult(1, `"val"`, 1); err != nil {
 		t.Fatalf("save result: %v", err)
 	}
 	time.Sleep(2 * time.Second)

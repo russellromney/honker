@@ -381,7 +381,7 @@ class HonkerParityTest < Minitest::Test
   end
 
   def test_results_sweep_removes_expired
-    @db.save_result(1, "v1", ttl_s: 3600)
+    @db.save_result(1, JSON.dump("v1"), ttl_s: 3600)
     swept = @db.sweep_results
     # Nothing expired yet; sweep is a no-op but returns a count.
     assert_equal 0, swept

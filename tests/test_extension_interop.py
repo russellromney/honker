@@ -194,7 +194,7 @@ def test_extension_registers_notify_function(ext_db_path):
     conn.load_extension(_EXT_PATH)
 
     conn.execute("BEGIN IMMEDIATE")
-    row = conn.execute("SELECT notify('orders', 'hello')").fetchone()
+    row = conn.execute("SELECT notify('orders', '\"hello\"')").fetchone()
     assert row[0] >= 1  # returned inserted id
     conn.execute("COMMIT")
 
@@ -1306,4 +1306,95 @@ def test_extension_max_attempts_below_one_is_rejected(ext_db_path, sql, value):
         conn.execute(sql, [value]).fetchone()
     assert conn.execute("SELECT count(*) FROM _honker_live").fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM _honker_scheduler_tasks").fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_tick_dead_letters_a_legacy_payload_without_blocking(ext_db_path):
+    """A schedule row whose payload is not JSON (raw SQL, or a build before
+    the JSON payload contract) must not stop the tick. The good schedule
+    fires every boundary exactly once; the bad one gets one `_honker_dead`
+    row per boundary naming it, and is never enqueued."""
+    conn = _open_ext(ext_db_path)
+    conn.execute(
+        "SELECT honker_scheduler_register('good', 'backups', '@every 1s', "
+        "'{\"ok\":true}', 0, NULL)"
+    )
+    conn.commit()
+    start = int(conn.execute(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='good'"
+    ).fetchone()[0])
+    # 'aaa' sorts before 'good', so the tick reaches the bad row first.
+    conn.execute(
+        "INSERT INTO _honker_scheduler_tasks "
+        "(name, queue, cron_expr, payload, priority, next_fire_at, enabled, "
+        " max_attempts) "
+        "VALUES ('aaa-legacy', 'backups', '@every 1s', 'not json', 0, ?, 1, 3)",
+        (start,),
+    )
+    # max_attempts < 1 is the other row-level rejection; same handling.
+    conn.execute(
+        "INSERT INTO _honker_scheduler_tasks "
+        "(name, queue, cron_expr, payload, priority, next_fire_at, enabled, "
+        " max_attempts) "
+        "VALUES ('bbb-zero', 'backups', '@every 1s', '{}', 0, ?, 1, 0)",
+        (start,),
+    )
+    # A user trigger on _honker_live must never see a dead-lettered fire.
+    conn.execute("CREATE TABLE trigger_log (payload TEXT)")
+    conn.execute(
+        "CREATE TRIGGER user_live_insert AFTER INSERT ON _honker_live "
+        "BEGIN INSERT INTO trigger_log VALUES (NEW.payload); END"
+    )
+    conn.commit()
+
+    good_fires = []
+    # One tick per boundary, then one tick that catches up three at once.
+    for at in [start, start + 1, start + 2, start + 5]:
+        fires = json.loads(
+            conn.execute("SELECT honker_scheduler_tick(?)", (at,)).fetchone()[0]
+        )
+        conn.commit()
+        assert {f["name"] for f in fires} == {"good"}, fires
+        good_fires += [f["fire_at"] for f in fires]
+        # Same instant again: nothing repeats.
+        again = conn.execute("SELECT honker_scheduler_tick(?)", (at,)).fetchone()[0]
+        conn.commit()
+        assert json.loads(again) == []
+
+    boundaries = list(range(start, start + 6))
+    assert good_fires == boundaries
+    live = conn.execute(
+        "SELECT payload FROM _honker_live WHERE queue='backups'"
+    ).fetchall()
+    assert live == [('{"ok":true}',)] * len(boundaries)
+
+    dead = conn.execute(
+        "SELECT run_at, payload, attempts, last_error FROM _honker_dead "
+        "WHERE payload = 'not json' ORDER BY run_at"
+    ).fetchall()
+    assert [d[0] for d in dead] == boundaries
+    for run_at, payload, attempts, last_error in dead:
+        assert attempts == 0
+        assert "honker: payload must be valid JSON" in last_error
+        assert '"aaa-legacy"' in last_error
+    zero = conn.execute(
+        "SELECT run_at, last_error FROM _honker_dead "
+        "WHERE payload = '{}' ORDER BY run_at"
+    ).fetchall()
+    assert [z[0] for z in zero] == boundaries
+    for _, last_error in zero:
+        assert "max_attempts must be at least 1, got 0" in last_error
+        assert '"bbb-zero"' in last_error
+    assert conn.execute("SELECT COUNT(*) FROM _honker_dead").fetchone()[0] == 12
+    logged = conn.execute("SELECT payload FROM trigger_log").fetchall()
+    assert logged == [('{"ok":true}',)] * len(boundaries)
+    nexts = conn.execute(
+        "SELECT name, next_fire_at FROM _honker_scheduler_tasks ORDER BY name"
+    ).fetchall()
+    assert nexts == [
+        ("aaa-legacy", start + 6),
+        ("bbb-zero", start + 6),
+        ("good", start + 6),
+    ]
     conn.close()
