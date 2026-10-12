@@ -8,9 +8,12 @@ in the same database file.
 
 from __future__ import annotations
 
+import asyncio
+import heapq
 import json
 import os
 import queue
+import random
 import sqlite3
 import subprocess
 import sys
@@ -390,6 +393,16 @@ def poll_claim(db_path, queue, worker, seconds):
         close_db(db)
 
 
+def hold_batch(db_path, queue, worker, n):
+    # Claims up to n jobs on a 2 s lease and never finishes them; the
+    # parent SIGKILLs it, leaving the jobs in flight with no owner.
+    db = honker.open(db_path)
+    q = db.queue(queue, visibility_timeout_s=2)
+    jobs = q.claim_batch(worker, int(n))
+    print("CLAIMED " + json.dumps([j.id for j in jobs]), flush=True)
+    time.sleep(120)
+
+
 async def main():
     role = sys.argv[1]
     if role == "task-worker":
@@ -400,6 +413,8 @@ async def main():
         hold_claim(sys.argv[2], sys.argv[3], sys.argv[4])
     elif role == "heartbeat-claim":
         await heartbeat_claim(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
+    elif role == "hold-batch":
+        hold_batch(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
     elif role == "poll-claim":
         poll_claim(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
     elif role == "claim":
@@ -1216,3 +1231,142 @@ def test_expired_job_held_by_a_killed_worker_never_runs_again(db_path):
         "SELECT state, attempts, last_error FROM _honker_jobs WHERE id=?", [job_id]
     )
     assert rows == [{"state": "dead", "attempts": 1, "last_error": "expired"}]
+
+
+# ---------------------------------------------------------------------
+# A large backlog through the public API.
+# ---------------------------------------------------------------------
+
+
+def _backlog_run(db_path: str, n: int, seed: int) -> dict:
+    """Queue `n` mixed jobs, leave some in flight under a killed worker,
+    then drain with one README-style claim loop. Returns the per-claim
+    latencies and the problems found (wrong order, early run, a job
+    missing or claimed twice, wrong dead-letter outcome).
+
+    Mix: priorities 0-9; 25% with run_at in the past (spread over ten
+    minutes); 2.5% delayed 3-4 s, so they fall due during the drain;
+    5% with expires=1, expired before the drain starts; n/200 held by
+    a worker that is killed, whose 2 s leases lapse during the drain."""
+    rng = random.Random(seed)
+    db = honker.open(db_path)
+    q = db.queue("backlog", visibility_timeout_s=30)
+    kinds = {}
+    now = int(time.time())
+    with db.transaction() as tx:
+        for i in range(n):
+            r = rng.random()
+            prio = rng.randint(0, 9)
+            if r < 0.05:
+                kind, opts = "expired", dict(expires=1)
+            elif r < 0.075:
+                kind, opts = "delayed", dict(delay=rng.choice([3, 4]))
+            elif r < 0.325:
+                kind, opts = "past", dict(run_at=now - rng.randint(1, 600))
+            else:
+                kind, opts = "now", {}
+            kinds[q.enqueue({"i": i, "kind": kind}, priority=prio, tx=tx, **opts)] = kind
+
+    holder = _spawn("hold-batch", db_path, "backlog", "doomed", str(max(1, n // 200)))
+    try:
+        held = set(_json_line(_line(holder, timeout=30.0), prefix="CLAIMED "))
+    finally:
+        _kill(holder)
+    rows = {
+        r["id"]: r
+        for r in db.query(
+            "SELECT id, priority, run_at, expires_at, state, claim_expires_at "
+            "FROM _honker_live WHERE queue='backlog'"
+        )
+    }
+    assert held and all(rows[j]["state"] == "processing" for j in held)
+    # Every expires=1 job must be expired before the drain starts.
+    max_exp = max(r["expires_at"] for r in rows.values() if r["expires_at"])
+    time.sleep(max(0.0, max_exp + 0.05 - time.time()))
+
+    expected = {j for j, k in kinds.items() if k != "expired"}
+
+    def due_at(j):
+        # A lapsed lease is claimable once unixepoch() > claim_expires_at.
+        r = rows[j]
+        return r["claim_expires_at"] + 1 if j in held else r["run_at"]
+
+    def order_key(j):
+        r = rows[j]
+        return (-r["priority"], r["run_at"], j)
+
+    async def drain():
+        it = q.claim("drainer", idle_poll_s=1.0)
+        got = []
+        while len(got) < len(expected):
+            t0 = time.time()
+            job = await asyncio.wait_for(it.__anext__(), 30.0)
+            t1 = time.time()
+            assert job.ack()
+            got.append((job.id, job.attempts, t0, t1))
+        return got
+
+    started = time.time()
+    claims = asyncio.run(drain())
+    drain_s = time.time() - started
+
+    problems = []
+    ids = [c[0] for c in claims]
+    if len(set(ids)) != len(ids):
+        problems.append(f"{len(ids) - len(set(ids))} jobs claimed twice")
+    if set(ids) != expected:
+        problems.append(
+            f"missing {sorted(expected - set(ids))[:10]}, "
+            f"unexpected {sorted(set(ids) - expected)[:10]}"
+        )
+    # Order: the claimed job must rank at or above every job that was
+    # certainly due when the claim started (unixepoch() >= floor(t0)),
+    # and must itself have been due by the time it returned.
+    waiting = sorted(expected, key=due_at)
+    ready, seen, k = [], set(), 0
+    for jid, attempts, t0, t1 in claims:
+        while k < len(waiting) and due_at(waiting[k]) <= int(t0):
+            heapq.heappush(ready, (order_key(waiting[k]), waiting[k]))
+            k += 1
+        while ready and ready[0][1] in seen:
+            heapq.heappop(ready)
+        if jid in rows and due_at(jid) > int(t1):
+            problems.append(f"job {jid} claimed at {t1:.2f}, before it was due {due_at(jid)}")
+        if jid in rows and ready and ready[0][0] < order_key(jid):
+            problems.append(f"job {jid} {order_key(jid)} claimed before {ready[0][1]} {ready[0][0]}")
+        if attempts != (2 if jid in held else 1):
+            problems.append(f"job {jid} attempts={attempts}, held={jid in held}")
+        seen.add(jid)
+
+    dead = {r["id"]: r["last_error"] for r in db.query("SELECT id, last_error FROM _honker_dead")}
+    want_dead = {j: "expired" for j, k in kinds.items() if k == "expired"}
+    if dead != want_dead:
+        problems.append(f"dead-letter mismatch: {len(dead)} dead, {len(want_dead)} expected")
+    live = db.query("SELECT COUNT(*) AS c FROM _honker_live")[0]["c"]
+    if live:
+        problems.append(f"{live} jobs still live")
+    lat = sorted(c[3] - c[2] for c in claims)
+    return {
+        "p50_ms": lat[len(lat) // 2] * 1000,
+        "p99_ms": lat[int(len(lat) * 0.99)] * 1000,
+        "drain_s": drain_s,
+        "held": len(held),
+        "problems": problems,
+    }
+
+
+def test_large_backlog_drains_in_order_with_bounded_claim_latency(tmp_path):
+    """About 20k mixed jobs through the Python API: every job is
+    accounted for, claims follow priority then run_at, delayed jobs
+    never run early, a killed worker's jobs come back as attempt 2, and
+    the median claim through q.claim() at 20k stays within a generous
+    factor of the median at 1k."""
+    seed = int(os.environ.get("HONKER_BACKLOG_SEED") or random.randrange(1 << 30))
+    small = _backlog_run(str(tmp_path / "small.db"), 1_000, seed)
+    big = _backlog_run(str(tmp_path / "big.db"), 20_000, seed)
+    print(f"backlog seed={seed} 1k={small} 20k={big}")
+    assert small["problems"] == [], f"seed {seed}: {small['problems'][:20]}"
+    assert big["problems"] == [], f"seed {seed}: {big['problems'][:20]}"
+    assert big["p50_ms"] <= 4 * small["p50_ms"] + 1.0, (
+        f"claim p50 {big['p50_ms']:.3f} ms at 20k vs {small['p50_ms']:.3f} ms at 1k"
+    )

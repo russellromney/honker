@@ -96,10 +96,12 @@ jobs:
 
   mixed-workload-soak:
     # tests/test_soak.py::test_mixed_workload_soak_accounts_for_every_job,
-    # long variant: 5 minutes per binding instead of the PR run's 40 s.
-    # The seed is random each night and printed with the summary line.
+    # long variant: 5 minutes per binding instead of the PR run's 40 s,
+    # then five short runs per binding, each with its own seed. Seeds are
+    # random each night and printed, so a failure can be rerun with
+    # HONKER_SOAK_SEED=<seed>.
     name: mixed-workload soak · ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 50
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -140,6 +142,31 @@ jobs:
           echo "HONKER_SOAK_SEED=$HONKER_SOAK_SEED"
           . .venv/bin/activate
           python -m pytest tests/test_soak.py -k mixed_workload -o addopts="" -q -n 0 -s --tb=short
+      - name: Short mixed-workload soaks, five seeds (Python and Node)
+        # Every seed runs even after a failure; the step fails at the
+        # end and lists each failing seed.
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          HONKER_SOAK_SECONDS: "40"
+          HONKER_REQUIRE_NODE: "1"
+        run: |
+          . .venv/bin/activate
+          failed=()
+          for run in 1 2 3 4 5; do
+            export HONKER_SOAK_SEED="$RANDOM$RANDOM"
+            echo "::group::run $run: HONKER_SOAK_SEED=$HONKER_SOAK_SEED"
+            if ! python -m pytest tests/test_soak.py -k mixed_workload -o addopts="" -q -n 0 -s --tb=short; then
+              failed+=("$HONKER_SOAK_SEED")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            for seed in "${failed[@]}"; do
+              echo "::error::mixed-workload soak failed; reproduce with HONKER_SOAK_SEED=$seed HONKER_SOAK_SECONDS=40"
+            done
+            exit 1
+          fi
 
   packaged-installs:
     name: packaged installs · ubuntu

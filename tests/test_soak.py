@@ -666,7 +666,15 @@ def _soak_beat_stub():
 
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is Unix-only")
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "needs POSIX signals: workers stop cleanly on SIGTERM and the soak "
+        "asserts exit code 0; Windows has no SIGTERM delivery (terminate() "
+        "is TerminateProcess) and the Python worker's asyncio signal "
+        "handlers are Unix-only"
+    ),
+)
 @pytest.mark.parametrize("binding", ["python", "node"])
 def test_mixed_workload_soak_accounts_for_every_job(tmp_path, binding):
     if binding == "node" and not _node_binding_available():
