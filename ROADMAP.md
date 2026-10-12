@@ -12,6 +12,158 @@ new work without renumbering. Names are unique. Each phase header
 should include adjacency links (`After: ... · Before: ...`) when the
 ordering matters.
 
+## Phase Clemente — Job API Correctness
+
+> Active. Five breaking changes that ship as one release.
+
+Issue #119 asked for typed job payloads. Delivering it exposed that the
+job API was never sound: queue handles reached outside their queue, the
+payload contract was undocumented and unenforced, and decode failures
+came back as plausible-looking values. This phase fixes the contract
+rather than the symptom, while alpha still makes that cheap.
+
+### What ships
+
+- **#124** — Node typed payloads, full job details, `getJob` reshaped to a
+  camelCase decoded `JobSnapshot`. Closes #119. *Breaking.*
+- **#136** — the same job details and typed payloads in the other ten
+  bindings. Nine PRs, additive.
+- **#133 / #138** — five core lookups stop swallowing SQLite errors.
+  `fail()` gets a SAVEPOINT: propagating the error alone deleted the job
+  from both tables. *Silent job loss under schema damage.*
+- **#135 / #140** — `claimed_at` in core. Nullable, set on every claim and
+  reclaim, cleared by retry, untouched by heartbeat. Core emits it in
+  `claim_batch` and `get_job` JSON, but **no binding maps it yet** — #136
+  excluded it on purpose, so "how long has this been running" is answerable
+  only from raw SQL until a follow-up exposes it per binding.
+- **#152 / #153** — payload must be valid JSON, enforced at the five core
+  entry points rather than by a table CHECK. Bare scalars stay legal: the
+  contract is valid JSON, nothing more. *Breaking.*
+  Validation parses into `serde_json::Value`, matching the read side, not
+  the cheaper `IgnoredAny` — a validator more permissive than the decoder
+  would leave the guarantee false. Measured cost: +0.6 us per enqueue
+  against ~24 us, so the perf objection did not survive checking. Three
+  break classes, all previously accepted silently and now rejected at the
+  producer: lone surrogates (`"\ud800"`, which Python and Node both emit),
+  out-of-range numbers (`1e999`), and nesting past serde_json's 128-level
+  limit. Closes #146 — decoded is now genuinely always safe.
+- **#134** — `Queue.getJob` and `Queue.cancel` scope to their queue in
+  every binding; `Database.getJob` and `Database.cancel` are the global
+  forms. Core gains `honker_cancel(queue, job_id)`. *Breaking.*
+- **#152 read side** — a decode failure throws instead of returning the
+  raw string. Once writes are validated it can only mean legacy data or
+  corruption. *Breaking.*
+- **#149** — Elixir `get_job` returns a struct, so `row["state"]` becomes
+  `row.state`. *Breaking.*
+
+### Sequence
+
+1. Independent adversarial review of every open PR. Not merged before this.
+   **Both rounds are complete on all fifteen PRs.** Round one asked whether
+   the code was correct. It found a defect shared by six bindings — a
+   `run_at`/`created_at` transposition that passed every test, because the
+   claimed-job assertion compared against an undelayed enqueue where the two
+   fields are equal to the second. Round two asked a different question: is
+   this complete, well designed, and does it make sense to a user. It found
+   two high-severity bugs that round one missed.
+
+   - **#153** — one legacy non-JSON row in `_honker_scheduler_tasks` stops
+     **every** schedule permanently. `scheduler_tick` errors, no
+     `next_fire_at` advances, healthy schedules never fire again. The error
+     named neither the row nor the queue. Fixed.
+   - **#138** — a panicking body skipped `in_savepoint`'s undo entirely,
+     leaving the DELETE applied and `is_autocommit()` false. The next
+     `fail()` on that connection then returned `Ok(0)`: a silent miss from
+     inside the leaked transaction, the exact bug class #138 exists to
+     close. Latent today, since no current body panics. Fixed with a drop
+     guard.
+
+   The rest of round two was about tests that pass for the wrong reason,
+   which is where this project's defects actually live:
+
+   - **#155** — the repo's own `.ok()` trap landed in a *new test helper*.
+     With the table name typo'd, 8 of 10 tests still passed; every "the row
+     is gone" assertion was proving nothing.
+   - **#148** — `spec/phase_mantle_spec.rb` had never run in CI, and it was
+     the only pre-existing spec reading a `get_job` result's fields, which
+     is exactly what that PR reshaped. Now wired in. Added to #147.
+   - **#142** — a commit message stated a proof that does not reproduce, and
+     `required` on the public `JobRow` was a source break the CHANGELOG said
+     was not one.
+   - **#140** — round one's own reported mutation count was wrong (14 tests
+     fail, not 5), and its "loose bound" nit was a real hole: under a
+     back-dated write the old assertion passes and the new one fails.
+
+   Reviewers were told to break each guard and watch the test fail. Every
+   round-two finding above came from that, not from reading.
+2. Merge `#124` → the nine #136 binding PRs → `#138` → `#140` → `#153`.
+3. Second pass, one PR per binding: #134 scoping, `Database.*` globals, and
+   the #152 loud decode together. They touch the same files, so splitting
+   them manufactures conflicts. `honker-jvm` already has the target shape
+   (`db.getJob(id).filter(job -> name.equals(job.queue()))`) — use it as the
+   reference.
+4. One release PR. One migration guide covering all five breaks.
+
+Opened by round two, not yet scheduled: **#159** (`Queue.getResult` and
+`Queue.saveResult` reach across queues — same class as #134, which does not
+name it), **#160** (no way to find payloads the new contract rejects; needed
+before the release, not after), **#161** (rollback errors do not tell an
+operator the job survived, which is the one fact they need).
+
+### Migration reality
+
+Every binding already JSON-encodes on enqueue, so the JSON contract breaks
+almost nobody. The exceptions are C++, whose `honker_cpp_enqueue` takes a
+bare `const char* payload_json` with nothing validating it, and anyone
+writing raw `honker_enqueue` SQL through the extension path. No table
+rebuild.
+
+The table that matters is `_honker_scheduler_tasks`, not `_honker_live`. A
+legacy non-JSON row in `_honker_live` is inert — it sits there until someone
+reads it. One in `_honker_scheduler_tasks` stops **every** schedule
+permanently: `scheduler_tick` errors, no `next_fire_at` advances, and healthy
+schedules never fire again. Found in the #153 round-two review and fixed
+there, to the extent that the error now names the offending row. The rows
+still have to be found and repaired.
+
+Detection is harder than it looks, and the query this section used to give
+was wrong:
+
+    -- INCOMPLETE. Finds outright non-JSON only.
+    SELECT id FROM _honker_live WHERE NOT json_valid(payload);
+
+SQLite's `json_valid` and serde_json do not agree. Measured on SQLite 3.51.0,
+`json_valid` returns 1 for all three break classes honker now rejects: lone
+surrogates (`"\ud800"`), out-of-range numbers (`1e999`), and nesting past 128
+levels. So the query above misses exactly the rows that are surprising, and
+catches only the ones that were obviously broken. The disagreement runs one
+way — no false positives — so what it does find is real.
+
+There is no SQL-only fix, because core exposes no validator UDF. Until one
+exists, detection means reading candidate rows back through a binding and
+catching the decode error. Both payload tables need it:
+
+    SELECT id, payload FROM _honker_live;
+    SELECT id, payload FROM _honker_scheduler_tasks WHERE payload IS NOT NULL;
+
+Exposing `honker_payload_valid(text)` would make this a one-line query and is
+worth doing before the release, not after.
+
+### Deliberately not in this phase
+
+- **#137** queue-event APIs for the other bindings. Blocked until the
+  queue-event core reaches `main`; `feat/node-queue-events` still has no PR.
+- **#146** closes when #153 lands. Validated JSON makes decoded always safe.
+- Codec / non-JSON payloads. Considered and rejected: nothing reads into
+  the payload, and the roadmap's dedup work puts structured keys in their
+  own column. Revisit only if someone arrives with a real use case.
+
+### Open question
+
+Whether this is *the* break, after which the surface holds stable. Six
+registries publish honker and there is an external user building against
+it. If it is, the release notes should say so.
+
 ## Phase Kernel-JVM — Kernel Watcher Fails On Linux
 
 > Known broken, excluded by name in CI
