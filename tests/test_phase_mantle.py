@@ -177,3 +177,57 @@ def test_queue_cancel_processing_invalidates_ack(tmp_path):
     assert q.cancel(jid) is True
     # Worker's ack now returns False — same shape as expired claim.
     assert job.ack() is False
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Queue.cancel still calls the global honker_cancel(id), so a handle "
+        "for one queue deletes another queue's job. Core has the queue-scoped "
+        "honker_cancel(queue, id) since #155 (#134); the binding has not "
+        "switched (#185)."
+    ),
+)
+def test_queue_cancel_of_another_queues_job_returns_false(tmp_path):
+    db = honker.open(str(tmp_path / "t.db"))
+    emails = db.queue("emails")
+    sms = db.queue("sms")
+    sms_id = sms.enqueue({"to": "+1555"})
+    assert emails.cancel(sms_id) is False
+    assert sms.get_job(sms_id) is not None
+
+
+def test_lookups_of_missing_jobs_and_schedules_are_misses_not_errors(tmp_path):
+    """#166 turned lookup errors into exceptions; a genuine miss must
+    still read as a plain miss."""
+    db = honker.open(str(tmp_path / "t.db"))
+    q = db.queue("emails")
+    sched = Scheduler(db)
+    assert q.get_job(424242) is None
+    assert q.cancel(424242) is False
+    assert q.get_result(424242) == (False, None)
+    assert sched.update("missing", priority=1) is False
+    assert sched.pause("missing") is False
+    assert sched.resume("missing") is False
+    assert sched.remove("missing") is False
+
+
+def test_get_job_shows_the_scheduled_state_until_the_job_is_due(tmp_path):
+    """#180: a job with a future run_at is 'scheduled', not 'pending',
+    and a delayed retry goes back to 'scheduled'."""
+    db = honker.open(str(tmp_path / "t.db"))
+    q = db.queue("later")
+    jid = q.enqueue({"n": 1}, delay=60)
+    assert q.get_job(jid)["state"] == "scheduled"
+    assert q.claim_one("w") is None
+
+    now = q.enqueue({"n": 2})
+    assert q.get_job(now)["state"] == "pending"
+    job = q.claim_one("w")
+    assert job.id == now
+    assert job.retry(delay_s=60, error="later") is True
+    assert q.get_job(now)["state"] == "scheduled"
+    assert job.retry(delay_s=0) is False  # the claim is gone
+
+    assert q.cancel(jid) is True  # cancel accepts scheduled rows
+    assert q.get_job(jid) is None

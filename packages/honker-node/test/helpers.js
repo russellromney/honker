@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const assert = require('node:assert/strict');
 
 const deferredCleanupDirs = new Set();
 let deferredCleanupInstalled = false;
@@ -115,8 +116,24 @@ function createTempDb(prefix, openFn) {
   };
 }
 
+// node:test has no strict xfail. Wrap the body of a test that pins a
+// known bug: it passes while the body fails an assertion, fails with
+// XPASS once the bug is fixed (drop the wrapper then), and rethrows any
+// other error so an unrelated breakage is not mistaken for the bug.
+async function knownBug(t, reason, fn) {
+  try {
+    await fn();
+  } catch (err) {
+    if (!(err instanceof assert.AssertionError)) throw err;
+    t.diagnostic(`known bug (${reason}): ${err.message.split('\n')[0]}`);
+    return;
+  }
+  assert.fail(`XPASS: this known bug no longer reproduces; remove knownBug(). ${reason}`);
+}
+
 module.exports = {
   cleanupDir,
   createTempDb,
+  knownBug,
   sleepSync,
 };

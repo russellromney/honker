@@ -284,6 +284,12 @@ jobs:
           else
             . .venv/bin/activate
           fi
+          # The upgrade-from-release tests in test_schema_migration.py
+          # must run here, not skip on a missing uv/npm or registry.
+          # On Windows only the PyPI variant runs: honker 0.5.0 has a
+          # win_amd64 wheel, but honker-node 0.5.1 has no win32 binary,
+          # and that test skips with that reason.
+          export HONKER_REQUIRE_UPGRADE=1
           python -m pytest tests/ -q -n 0 --tb=short
       # Multi-process lifecycle torture test against the raw loadable
       # extension (tests/test_lifecycle_torture.py). It is marked `slow`
@@ -465,6 +471,17 @@ jobs:
             VENV_PY=.venv/bin/python
           fi
           "$VENV_PY" -m pytest tests/test_node_python_interop.py -q --tb=short
+      - name: Mixed-workload soak through the Node API
+        # Runs the Node variant of tests/test_soak.py; the python job
+        # has no Node binding and skips it. HONKER_REQUIRE_NODE makes a
+        # missing binding fail here instead of skipping. Not on Windows:
+        # the soak's chaos and its clean-stop checks need POSIX signals
+        # (SIGKILL mid-write, SIGTERM handled as a graceful stop).
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          HONKER_REQUIRE_NODE: "1"
+        run: .venv/bin/python -m pytest tests/test_soak.py -k "mixed_workload and node" -q --tb=short -n 0 -s
       - name: Test (extension resolver — no addon load)
         working-directory: packages/honker-node
         shell: bash
@@ -498,7 +515,7 @@ jobs:
       - name: Test (parity — node API surface)
         working-directory: packages/honker-node
         shell: bash
-        run: node --test test/parity.test.js
+        run: node --test test/parity.test.js test/phase_mantle.js
       - name: Test (direct proof — python writes, node updateEvents observes)
         working-directory: packages/honker-node
         shell: bash
@@ -515,6 +532,10 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/cross_lang_queue_stream_notify.js
+      - name: Test worker-loop scenarios (multi-process, real clock)
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/worker_scenarios_e2e.js
       - name: Test watcher backend proofs
         working-directory: packages/honker-node
         shell: bash
