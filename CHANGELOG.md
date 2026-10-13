@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## Unreleased — busy error codes from honker functions
+
+- A lock conflict inside a `honker_*` SQL function or `notify` now
+  reaches the caller with its SQLite code: `SQLITE_BUSY` (5),
+  `SQLITE_LOCKED` (6), or their extended codes such as
+  `SQLITE_BUSY_SNAPSHOT` (517). Before, every error from these functions
+  was `SQLITE_ERROR` (1) with the text "database is locked", so a
+  binding could only detect a retryable conflict by matching the
+  message. Python `sqlite3`, for example, now reports
+  `sqlite_errorcode == 5`.
+- Cause: rusqlite reports a function error with
+  `sqlite3_result_error_code(code)` followed by
+  `sqlite3_result_error(msg)`, and the second call sets the code back to
+  `SQLITE_ERROR`. honker also wrapped every SQLite error into a message
+  before it got there. Lock conflicts are now returned with their code
+  and no message, so SQLite supplies its own text for the code.
+- Every other error keeps `SQLITE_ERROR` and its message. That includes
+  the "requires a separate SELECT" call-context error (#167), which
+  SQLite raises as `SQLITE_BUSY` but which a retry cannot fix.
+- The PyO3 (Python) and napi (Node) bindings turn errors into
+  `RuntimeError` / `Error` with the message text, which is unchanged.
+
 ## Unreleased — atomic scheduler tick (issue #173)
 
 - `honker_scheduler_tick` runs in one savepoint, and its first statement

@@ -230,6 +230,100 @@ def raw_sql_enqueue(db_path, ext_path, commit):
     conn.close()
 
 
+def wait_file(path):
+    deadline = time.monotonic() + 60
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            raise SystemExit("timed out waiting for " + path)
+        time.sleep(0.02)
+
+
+def hold_exclusive(db_path, release_file):
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.execute("BEGIN EXCLUSIVE")
+    print("LOCKED", flush=True)
+    wait_file(release_file)
+    conn.execute("ROLLBACK")
+    conn.close()
+
+
+def busy_call(api, db_path, op, go_file, retry_file):
+    # Open, and for "ack" claim the job, before READY: the lock does
+    # not exist yet. Then make one call under the lock, report what it
+    # raised, and make the same call again once the lock is gone.
+    if api == "pyo3":
+        db = honker.open(db_path)
+        q = db.queue("busy-" + op)
+        if op == "ack":
+            job = q.claim_one("w-ack")
+
+        def call():
+            if op == "enqueue":
+                return q.enqueue({{"k": "under-lock"}})
+            if op == "claim":
+                claimed = q.claim_one("w-claim")
+                return claimed.id if claimed else None
+            if op == "ack":
+                return job.ack()
+            raise SystemExit("unknown op " + op)
+    else:
+        # The stdlib sqlite3 default timeout (busy_timeout) is 5 s.
+        conn = sqlite3.connect(db_path)
+        honker.load_extension(conn)
+        if op == "ack":
+            claimed = conn.execute(
+                "SELECT honker_claim_batch('busy-ack', 'w-ack', 1, 300)"
+            ).fetchone()[0]
+            job_id = json.loads(claimed)[0]["id"]
+
+        def call():
+            if op == "enqueue":
+                return conn.execute(
+                    "SELECT honker_enqueue('busy-enqueue', ?, NULL, NULL, 0, 3, NULL)",
+                    (json.dumps({{"k": "under-lock"}}),),
+                ).fetchone()[0]
+            if op == "claim":
+                rows = json.loads(conn.execute(
+                    "SELECT honker_claim_batch('busy-claim', 'w-claim', 1, 300)"
+                ).fetchone()[0])
+                return rows[0]["id"] if rows else None
+            if op == "ack":
+                return conn.execute(
+                    "SELECT honker_ack(?, 'w-ack')", (job_id,)
+                ).fetchone()[0]
+            if op == "tick":
+                return json.loads(conn.execute(
+                    "SELECT honker_scheduler_tick(unixepoch())"
+                ).fetchone()[0])
+            raise SystemExit("unknown op " + op)
+
+    print("READY", flush=True)
+    wait_file(go_file)
+    started = time.monotonic()
+    try:
+        result = call()
+    except Exception as err:
+        seen = {{
+            "type": type(err).__module__ + "." + type(err).__qualname__,
+            "message": str(err),
+            "sqlite_errorcode": getattr(err, "sqlite_errorcode", None),
+            "sqlite_errorname": getattr(err, "sqlite_errorname", None),
+            "waited_s": time.monotonic() - started,
+        }}
+        if api == "sqlite3":
+            seen["in_transaction"] = conn.in_transaction
+        print("ERROR " + json.dumps(seen), flush=True)
+    else:
+        print("UNEXPECTED " + json.dumps(result), flush=True)
+        return
+    wait_file(retry_file)
+    print("RESULT " + json.dumps(call()), flush=True)
+    if api == "pyo3":
+        close_db(db)
+    else:
+        conn.close()
+
+
 async def main():
     role = sys.argv[1]
     if role == "claim":
@@ -254,6 +348,10 @@ async def main():
         await listen_once(sys.argv[2], sys.argv[3])
     elif role == "raw-sql-enqueue":
         raw_sql_enqueue(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif role == "hold-exclusive":
+        hold_exclusive(sys.argv[2], sys.argv[3])
+    elif role == "busy-call":
+        busy_call(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
     else:
         raise SystemExit(f"unknown role: {{role}}")
 
@@ -567,3 +665,150 @@ def test_raw_sql_transaction_enqueue_wakes_python_worker(db_path):
         assert rows[0]["c"] == 1
     finally:
         _kill(worker)
+
+
+# ---------------------------------------------------------------------
+# A write lock held past busy_timeout: what the user sees.
+#
+# Another process holds BEGIN EXCLUSIVE while the user's enqueue,
+# claim, ack (and, through the extension, scheduler tick) run. Each
+# call waits out its busy_timeout (5 s in both Python paths) and
+# raises. Nothing is half-done, and the same call succeeds once the
+# lock is gone.
+# ---------------------------------------------------------------------
+
+
+def _extension_unavailable() -> str | None:
+    if not HAS_LOAD_EXTENSION:
+        return f"{sys.executable}'s sqlite3 cannot load extensions"
+    try:
+        honker.extension_info()
+    except FileNotFoundError as err:
+        return str(err)
+    return None
+
+
+BUSY_OPS = {
+    "pyo3": ("enqueue", "claim", "ack"),
+    "sqlite3": ("enqueue", "claim", "ack", "tick"),
+}
+
+# What the user catches when a call outlasts busy_timeout.
+BUSY_ERRORS = {
+    # Python stdlib sqlite3 + honker.load_extension: the error comes
+    # from inside the honker_* function, so it carries SQLite's code.
+    # PR #184 changed it from SQLITE_ERROR (1) to SQLITE_BUSY (5); the
+    # message was "database is locked" before and after.
+    "sqlite3": {
+        "type": "sqlite3.OperationalError",
+        "message": "database is locked",
+        "sqlite_errorcode": 5,
+        "sqlite_errorname": "SQLITE_BUSY",
+        "in_transaction": False,
+    },
+    # PyO3 binding: every call runs in db.transaction(), whose BEGIN
+    # IMMEDIATE hits the lock before any honker_* function runs, and
+    # the binding maps errors to RuntimeError(str(e)) itself. So #184
+    # changes nothing here: no code is exposed, only the message. Pinned
+    # as-is so a binding PR that adds a typed busy error has to update
+    # this on purpose.
+    "pyo3": {
+        "type": "builtins.RuntimeError",
+        "message": "database is locked",
+        "sqlite_errorcode": None,
+        "sqlite_errorname": None,
+    },
+}
+
+
+def _busy_state(db) -> dict:
+    """The rows each call under the lock could have touched."""
+
+    def jobs(queue: str) -> list[dict]:
+        return db.query(
+            "SELECT id, state, worker_id, attempts FROM _honker_live "
+            "WHERE queue = ? UNION ALL "
+            "SELECT id, 'dead', NULL, attempts FROM _honker_dead "
+            "WHERE queue = ? ORDER BY id",
+            [queue, queue],
+        )
+
+    return {
+        "enqueue": jobs("busy-enqueue"),
+        "claim": jobs("busy-claim"),
+        "ack": jobs("busy-ack"),
+        "tick": jobs("busy-tick"),
+        "next_fire_at": db.query(
+            "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name = 'busy-tick'"
+        )[0]["next_fire_at"],
+    }
+
+
+@pytest.mark.parametrize("api", ["sqlite3", "pyo3"])
+def test_calls_under_a_write_lock_past_busy_timeout(db_path, api):
+    if api == "sqlite3":
+        reason = _extension_unavailable()
+        if reason:
+            pytest.skip(reason)
+    ops = BUSY_OPS[api]
+    db = honker.open(db_path)
+    claim_id = db.queue("busy-claim").enqueue({"k": "claim-me"})
+    ack_id = db.queue("busy-ack").enqueue({"k": "ack-me"})
+    db.queue("busy-enqueue")
+    honker.Scheduler(db).add(
+        name="busy-tick", queue="busy-tick", schedule=honker.every_s(1)
+    )
+    tmp = os.path.dirname(db_path)
+    go, retry, release = (os.path.join(tmp, n) for n in ("go", "retry", "release"))
+    children = {op: _spawn("busy-call", api, db_path, op, go, retry) for op in ops}
+    holder = None
+    try:
+        for proc in children.values():
+            assert _line(proc) == "READY"
+        before = _busy_state(db)
+        assert before["ack"] == [
+            {"id": ack_id, "state": "processing", "worker_id": "w-ack", "attempts": 1}
+        ]
+
+        holder = _spawn("hold-exclusive", db_path, release)
+        assert _line(holder) == "LOCKED"
+        open(go, "w").close()
+        seen = {
+            op: _json_line(_line(proc, timeout=30.0), prefix="ERROR ")
+            for op, proc in children.items()
+        }
+        waited = {op: err.pop("waited_s") for op, err in seen.items()}
+        print(f"{api}: " + json.dumps(seen, indent=1))
+        assert seen == {op: BUSY_ERRORS[api] for op in ops}
+        assert all(s > 4.0 for s in waited.values()), f"gave up before busy_timeout: {waited}"
+        # Nothing half-done while the lock is still held: no orphan
+        # job, no claim, no ack, no fired tick.
+        assert _busy_state(db) == before
+
+        open(release, "w").close()
+        _finish(holder)
+        open(retry, "w").close()
+        results = {op: _json_line(_line(proc)) for op, proc in children.items()}
+        for proc in children.values():
+            _finish(proc)
+    finally:
+        for proc in [*children.values(), holder]:
+            if proc is not None:
+                _kill(proc)
+
+    after = _busy_state(db)
+    # enqueue: exactly one job, the one the retry returned.
+    assert [j["id"] for j in after["enqueue"]] == [results["enqueue"]]
+    # claim: the retry claimed the waiting job, once.
+    assert results["claim"] == claim_id
+    assert after["claim"] == [
+        {"id": claim_id, "state": "processing", "worker_id": "w-claim", "attempts": 1}
+    ]
+    # ack: the retry acked; the job is gone, not dead or reclaimable.
+    assert results["ack"] in (True, 1)
+    assert after["ack"] == []
+    if "tick" in ops:
+        fired = results["tick"]
+        assert len(fired) >= 1
+        assert len(after["tick"]) == len(fired)
+        assert after["next_fire_at"] > before["next_fire_at"]

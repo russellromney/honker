@@ -297,3 +297,187 @@ test('pruneNotifications maxKeep is gap-safe and validates bounds', () => {
     cleanup();
   }
 });
+
+// ---------------------------------------------------------------------
+// A write lock held past busy_timeout: what the user sees.
+//
+// Another process holds BEGIN EXCLUSIVE (node:sqlite) while separate
+// processes call enqueue, claimOne, job.ack() and scheduler.tick().
+// Each waits out the binding's 5 s busy_timeout and throws. Nothing is
+// half-done, and the same call succeeds once the lock is gone.
+//
+// The napi binding is not changed by #184: every call runs in
+// db.transaction(), whose BEGIN IMMEDIATE hits the lock before any
+// honker_* function runs, and napi_err() maps the error to a plain
+// Error with code 'GenericFailure' and SQLite's message. No SQLite code
+// is exposed. Pinned as-is so a binding PR that adds a typed busy error
+// has to change it on purpose.
+// ---------------------------------------------------------------------
+
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const BUSY_PRELUDE = `
+const fs = require('node:fs');
+const out = (line) => fs.writeSync(1, line + '\\n');
+function waitFile(p) {
+  const deadline = Date.now() + 60000;
+  while (!fs.existsSync(p)) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for ' + p);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
+}
+`;
+
+const BUSY_HOLDER = `${BUSY_PRELUDE}
+const { DatabaseSync } = require('node:sqlite');
+const [dbPath, release] = process.argv.slice(1);
+const db = new DatabaseSync(dbPath);
+db.exec('BEGIN EXCLUSIVE');
+out('LOCKED');
+waitFile(release);
+db.exec('ROLLBACK');
+db.close();
+`;
+
+const BUSY_CALLER = `${BUSY_PRELUDE}
+const honker = require(${JSON.stringify(path.resolve(__dirname, '..'))});
+const [dbPath, op, go, retry] = process.argv.slice(1);
+const db = honker.open(dbPath);
+const q = db.queue('busy-' + op);
+const job = op === 'ack' ? q.claimOne('w-ack') : null;
+const sched = db.scheduler();
+const call = () => {
+  if (op === 'enqueue') return q.enqueue({ k: 'under-lock' });
+  if (op === 'claim') return q.claimOne('w-claim')?.id ?? null;
+  if (op === 'ack') return job.ack();
+  if (op === 'tick') return sched.tick();
+  throw new Error('unknown op ' + op);
+};
+out('READY');
+waitFile(go);
+const started = Date.now();
+try {
+  out('UNEXPECTED ' + JSON.stringify(call()));
+  process.exit(0);
+} catch (err) {
+  out('ERROR ' + JSON.stringify({
+    class: err.constructor.name,
+    message: err.message,
+    code: err.code ?? null,
+    waitedMs: Date.now() - started,
+  }));
+}
+waitFile(retry);
+out('RESULT ' + JSON.stringify(call()));
+db.close();
+`;
+
+function busyChild(code, args) {
+  const proc = spawn(process.execPath, ['-e', code, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const lines = [];
+  let buf = '';
+  let stderr = '';
+  proc.stdout.on('data', (d) => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      lines.push(buf.slice(0, i));
+      buf = buf.slice(i + 1);
+    }
+  });
+  proc.stderr.on('data', (d) => { stderr += d; });
+  const exited = new Promise((resolve) => proc.on('exit', resolve));
+  return {
+    proc,
+    exited,
+    async line(prefix, timeoutMs = 30000) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const i = lines.findIndex((l) => l.startsWith(prefix));
+        if (i >= 0) return lines.splice(i, 1)[0].slice(prefix.length).trim();
+        if (proc.exitCode !== null) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      throw new Error(`no ${prefix} line; lines=${JSON.stringify(lines)} stderr=${stderr}`);
+    },
+  };
+}
+
+function busyState(db) {
+  const jobs = (queue) => db.query(
+    'SELECT id, state, worker_id, attempts FROM _honker_live WHERE queue = ? ' +
+    "UNION ALL SELECT id, 'dead', NULL, attempts FROM _honker_dead WHERE queue = ? ORDER BY id",
+    [queue, queue],
+  );
+  return {
+    enqueue: jobs('busy-enqueue'),
+    claim: jobs('busy-claim'),
+    ack: jobs('busy-ack'),
+    tick: jobs('busy-tick'),
+    nextFireAt: db.query("SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name = 'busy-tick'")[0].next_fire_at,
+  };
+}
+
+test('calls under a write lock held past busy_timeout throw, change nothing, and succeed after', { timeout: 60000 }, async () => {
+  const { path: dbPath, dir, open, cleanup } = tmpdb();
+  const ops = ['enqueue', 'claim', 'ack', 'tick'];
+  const children = [];
+  try {
+    const db = open(dbPath);
+    const claimId = db.queue('busy-claim').enqueue({ k: 'claim-me' });
+    const ackId = db.queue('busy-ack').enqueue({ k: 'ack-me' });
+    db.queue('busy-enqueue');
+    db.scheduler().add({ name: 'busy-tick', queue: 'busy-tick', schedule: '@every 1s', payload: {} });
+    const [go, retry, release] = ['go', 'retry', 'release'].map((n) => path.join(dir, n));
+
+    const callers = Object.fromEntries(ops.map((op) => {
+      const c = busyChild(BUSY_CALLER, [dbPath, op, go, retry]);
+      children.push(c);
+      return [op, c];
+    }));
+    for (const c of Object.values(callers)) await c.line('READY');
+    const before = busyState(db);
+    assert.deepEqual(before.ack, [{ id: ackId, state: 'processing', worker_id: 'w-ack', attempts: 1 }]);
+
+    const holder = busyChild(BUSY_HOLDER, [dbPath, release]);
+    children.push(holder);
+    await holder.line('LOCKED');
+    fs.writeFileSync(go, '');
+    const seen = {};
+    const waited = {};
+    for (const op of ops) {
+      const err = JSON.parse(await callers[op].line('ERROR '));
+      waited[op] = err.waitedMs;
+      delete err.waitedMs;
+      seen[op] = err;
+    }
+    console.log('napi: ' + JSON.stringify(seen));
+    const expected = { class: 'Error', message: 'database is locked', code: 'GenericFailure' };
+    assert.deepEqual(seen, Object.fromEntries(ops.map((op) => [op, expected])));
+    assert.ok(Object.values(waited).every((ms) => ms > 4000), `gave up before busy_timeout: ${JSON.stringify(waited)}`);
+    // Nothing half-done while the lock is still held.
+    assert.deepEqual(busyState(db), before);
+
+    fs.writeFileSync(release, '');
+    assert.equal(await holder.exited, 0);
+    fs.writeFileSync(retry, '');
+    const results = {};
+    for (const op of ops) results[op] = JSON.parse(await callers[op].line('RESULT '));
+    for (const c of Object.values(callers)) assert.equal(await c.exited, 0);
+
+    const after = busyState(db);
+    assert.deepEqual(after.enqueue.map((j) => j.id), [results.enqueue]);
+    assert.equal(results.claim, claimId);
+    assert.deepEqual(after.claim, [{ id: claimId, state: 'processing', worker_id: 'w-claim', attempts: 1 }]);
+    assert.equal(results.ack, true);
+    assert.deepEqual(after.ack, []);
+    assert.ok(results.tick.length >= 1);
+    assert.equal(after.tick.length, results.tick.length);
+    assert.ok(after.nextFireAt > before.nextFireAt);
+  } finally {
+    for (const c of children) if (c.proc.exitCode === null) c.proc.kill();
+    cleanup();
+  }
+});
