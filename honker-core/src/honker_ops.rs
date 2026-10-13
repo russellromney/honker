@@ -1242,6 +1242,7 @@ fn enqueue_at(
     max_attempts: i64,
     expires: Option<i64>,
 ) -> rusqlite::Result<i64> {
+    super::validate_json_payload(payload)?;
     let run_at_val: i64 = match (delay, run_at) {
         (Some(d), _) => now + d,
         (None, Some(r)) => r,
@@ -1964,6 +1965,7 @@ pub fn scheduler_register(
     max_attempts: i64,
 ) -> rusqlite::Result<i64> {
     check_max_attempts("honker_scheduler_register", max_attempts)?;
+    super::validate_json_payload(payload)?;
     let now = now_unix(conn)?;
     let next_fire_at = super::cron::next_after_unix(cron_expr, now).map_err(to_sql_err)?;
     conn.execute(
@@ -2040,6 +2042,82 @@ fn scheduler_wake(_conn: &Connection) -> rusqlite::Result<()> {
 /// must be delivered.
 pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 
+/// Why `task` cannot be enqueued, or None if it can. Only the two
+/// rejections `enqueue` makes from the row itself count: a payload that
+/// fails [`super::validate_json_payload`] and `max_attempts < 1`. Any
+/// other error (SQLite) is returned.
+fn unfireable_reason(task: &DueTask) -> rusqlite::Result<Option<String>> {
+    let rejected = super::validate_json_payload(&task.payload)
+        .and_then(|()| check_max_attempts("honker_scheduler_tick", task.max_attempts));
+    match rejected {
+        Ok(()) => Ok(None),
+        Err(rusqlite::Error::UserFunctionError(e)) => Ok(Some(format!(
+            "{e} (schedule {:?}); fire not enqueued, fix the schedule \
+             with honker_scheduler_update",
+            task.name
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Record one boundary of a schedule that cannot be enqueued (see
+/// [`unfireable_reason`]): a `_honker_dead` row with the schedule's
+/// queue, payload, priority and max_attempts, `run_at` = the boundary,
+/// `attempts` = 0 and `last_error` = `error`. Returns the row's id.
+///
+/// The id is drawn from `_honker_live`'s AUTOINCREMENT counter in
+/// `sqlite_sequence` without inserting into `_honker_live`, so no user
+/// trigger on that table sees a job that never existed. SQLite gives
+/// the next AUTOINCREMENT row an id one larger than the larger of
+/// `sqlite_sequence.seq` and the table's largest rowid, so after the
+/// bump no later live job can reuse this id, and neither can a later
+/// dead row (dead ids are live ids). The counter row only exists after
+/// the first live insert, so it is created at 0 if missing; the
+/// `max(...)` over both tables covers a counter that is behind them.
+/// Runs inside the tick's savepoint, which holds the write lock.
+fn dead_letter_unfireable(
+    conn: &Connection,
+    now: i64,
+    task: &DueTask,
+    fire_at: i64,
+    error: &str,
+) -> rusqlite::Result<i64> {
+    conn.prepare_cached(
+        "INSERT INTO sqlite_sequence (name, seq)
+         SELECT '_honker_live', 0
+          WHERE NOT EXISTS
+                (SELECT 1 FROM sqlite_sequence WHERE name = '_honker_live')",
+    )?
+    .execute([])?;
+    let id: i64 = conn
+        .prepare_cached(
+            "UPDATE sqlite_sequence
+                SET seq = max(seq,
+                              (SELECT COALESCE(max(id), 0) FROM _honker_live),
+                              (SELECT COALESCE(max(id), 0) FROM _honker_dead)) + 1
+              WHERE name = '_honker_live'
+          RETURNING seq",
+        )?
+        .query_row([], |r| r.get(0))?;
+    conn.prepare_cached(
+        "INSERT INTO _honker_dead
+           (id, queue, payload, priority, run_at, max_attempts,
+            attempts, last_error, created_at, died_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?8)",
+    )?
+    .execute(rusqlite::params![
+        id,
+        task.queue,
+        task.payload,
+        task.priority,
+        fire_at,
+        task.max_attempts,
+        error,
+        now
+    ])?;
+    Ok(id)
+}
+
 /// For each registered task whose `next_fire_at <= now_unix`,
 /// enqueue the payload into its queue and advance `next_fire_at`
 /// to the next boundary. Keeps advancing within one tick while
@@ -2047,6 +2125,15 @@ pub const SCHEDULER_MAX_CATCHUP_FIRES: i64 = 64;
 /// outage), up to [`SCHEDULER_MAX_CATCHUP_FIRES`] per task.
 /// Returns a JSON array of `{name, queue, fire_at, job_id}` fires,
 /// ordered by task name and then by `fire_at`.
+///
+/// A task whose stored row `enqueue` would reject (a payload that fails
+/// [`super::validate_json_payload`], or `max_attempts < 1`; written by raw
+/// SQL or an older build) is not enqueued and does not fail the tick. Each of its due boundaries
+/// becomes one `_honker_dead` row whose `last_error` names the schedule
+/// ([`dead_letter_unfireable`]), and its `next_fire_at` advances like a
+/// fired task's. Those boundaries are not in the returned array. A bad
+/// row cannot stop the other schedules, and is reported once per
+/// boundary instead of on every tick.
 ///
 /// Atomic on its own, in autocommit or inside a caller's transaction
 /// (#173). Everything runs in one savepoint, and its first statement is
@@ -2128,6 +2215,11 @@ fn scheduler_tick_inner(conn: &Connection, tick_at: i64) -> rusqlite::Result<Str
     let now = now_unix(conn)?;
     let mut out = Vec::new();
     for task in tasks {
+        // A schedule row written by raw SQL or an older build can hold
+        // what `enqueue` now rejects: a payload that is not valid JSON, or
+        // max_attempts < 1. Such a task cannot fire. Checked once per
+        // task: the row is the same at every boundary.
+        let unfireable = unfireable_reason(&task)?;
         let mut next_fire_at = task.next_fire_at;
         let mut fires_this_task: i64 = 0;
         while next_fire_at <= tick_at {
@@ -2141,27 +2233,37 @@ fn scheduler_tick_inner(conn: &Connection, tick_at: i64) -> rusqlite::Result<Str
                     super::cron::next_after_unix(&task.cron_expr, tick_at).map_err(to_sql_err)?;
                 break;
             }
-            // Enqueue at this boundary. `run_at` is NULL (claimable
-            // immediately); `expires` is the task's expires_s if set.
-            // max_attempts comes from the schedule row, not a constant.
-            check_max_attempts("honker_scheduler_tick", task.max_attempts)?;
-            let job_id = enqueue_at(
-                conn,
-                now,
-                &task.queue,
-                &task.payload,
-                None,
-                None,
-                task.priority,
-                task.max_attempts,
-                task.expires_s,
-            )?;
-            out.push(json!({
-                "name": task.name,
-                "queue": task.queue,
-                "fire_at": next_fire_at,
-                "job_id": job_id,
-            }));
+            match &unfireable {
+                // Enqueue at this boundary. `run_at` is NULL (claimable
+                // immediately); `expires` is the task's expires_s if set.
+                // max_attempts comes from the schedule row, not a constant.
+                None => {
+                    let job_id = enqueue_at(
+                        conn,
+                        now,
+                        &task.queue,
+                        &task.payload,
+                        None,
+                        None,
+                        task.priority,
+                        task.max_attempts,
+                        task.expires_s,
+                    )?;
+                    out.push(json!({
+                        "name": task.name,
+                        "queue": task.queue,
+                        "fire_at": next_fire_at,
+                        "job_id": job_id,
+                    }));
+                }
+                // This boundary can never become a job a worker decodes.
+                // Record it in `_honker_dead` and advance as if it fired:
+                // the other tasks keep firing, and each skipped boundary
+                // is reported exactly once.
+                Some(error) => {
+                    dead_letter_unfireable(conn, now, &task, next_fire_at, error)?;
+                }
+            }
             fires_this_task += 1;
             // Advance to the next boundary strictly after this one.
             next_fire_at =
@@ -2291,6 +2393,9 @@ pub fn scheduler_update(
     if let Some(Some(m)) = max_attempts {
         check_max_attempts("honker_scheduler_update", m)?;
     }
+    if let Some(payload) = payload {
+        super::validate_json_payload(payload)?;
+    }
     // Verify exists first so we can return 0 cleanly without dynamic SQL gymnastics.
     let exists: bool = conn
         .query_row(
@@ -2379,6 +2484,7 @@ pub fn result_save(
     value: &str,
     ttl_s: i64,
 ) -> rusqlite::Result<i64> {
+    super::validate_json_payload(value)?;
     if ttl_s > 0 {
         conn.execute(
             "INSERT INTO _honker_results (job_id, value, expires_at)
@@ -2435,6 +2541,7 @@ pub fn stream_publish(
     key: Option<&str>,
     payload: &str,
 ) -> rusqlite::Result<i64> {
+    super::validate_json_payload(payload)?;
     // Stream row INSERT advances data_version on commit — same wake
     // path as enqueue. No synthetic notification row (see enqueue).
     let offset: i64 = conn.query_row(
@@ -2534,6 +2641,780 @@ fn check_max_attempts(func: &str, max_attempts: i64) -> rusqlite::Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use crate::{attach_honker_functions, bootstrap_honker_schema};
+    use rusqlite::params;
+
+    // Bare scalars are JSON. A stricter validator is most likely to break
+    // these by accident, and #152 settled that they must keep working.
+    const VALID_JSON_PAYLOADS: [&str; 6] = ["{}", "[]", "42", "\"str\"", "true", "null"];
+
+    // Valid by the JSON grammar, but no decoder can represent them: a lone
+    // surrogate is not valid UTF-8, and 1e999 overflows f64. A structural
+    // scan accepts all of these; `serde_json::Value` -- the read side --
+    // rejects them. Accepting them at enqueue is how a Python producer
+    // creates a job a Rust consumer cannot decode.
+    const UNDECODABLE_JSON_PAYLOADS: [&str; 5] = [
+        r#""\ud800""#,
+        r#"{"a":"\ud800"}"#,
+        "1e999",
+        r#"{"a":1e999}"#,
+        "-1e999",
+    ];
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        bootstrap_honker_schema(&conn).unwrap();
+        attach_honker_functions(&conn).unwrap();
+        conn
+    }
+
+    fn assert_payload_error<T>(result: rusqlite::Result<T>) {
+        let err = result.err().expect("non-JSON payload must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("honker: payload must be valid JSON"),
+            "expected the JSON payload contract error, got: {err}"
+        );
+        assert!(
+            text.contains("line 1 column"),
+            "the error must pass serde's own message through so it names \
+             the real problem, got: {err}"
+        );
+    }
+
+    /// Text that parses as JSON but cannot be decoded gets its own message.
+    /// Telling this caller their payload "must be valid JSON" would send
+    /// them hunting for a syntax error they do not have.
+    fn assert_undecodable_payload_error<T>(result: rusqlite::Result<T>, payload: &str) {
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("undecodable JSON payload must be rejected: {payload}"));
+        let text = err.to_string();
+        assert!(
+            text.contains("honker: payload is valid JSON but cannot be decoded"),
+            "expected the undecodable-JSON error for {payload}, got: {err}"
+        );
+        assert!(
+            text.contains("line 1 column"),
+            "the error must pass serde's own message through for {payload}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn orm_select_enqueue_rejects_non_json_payload() {
+        let conn = db();
+        let result = conn.query_row(
+            "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+            ["not json"],
+            |r| r.get::<_, i64>(0),
+        );
+        assert_payload_error(result);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn enqueue_accepts_every_json_payload_shape() {
+        let conn = db();
+        for payload in VALID_JSON_PAYLOADS {
+            let id: i64 = conn
+                .query_row(
+                    "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+                    [payload],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_live WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
+    fn stream_publish_rejects_non_json_payload() {
+        let conn = db();
+        let result = conn.query_row(
+            "SELECT honker_stream_publish('orders', NULL, ?1)",
+            ["not json"],
+            |r| r.get::<_, i64>(0),
+        );
+        assert_payload_error(result);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_stream", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn stream_publish_accepts_every_json_payload_shape() {
+        let conn = db();
+        for payload in VALID_JSON_PAYLOADS {
+            let offset: i64 = conn
+                .query_row(
+                    "SELECT honker_stream_publish('orders', NULL, ?1)",
+                    [payload],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_stream WHERE offset = ?1",
+                    [offset],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
+    fn result_save_rejects_non_json_payload() {
+        let conn = db();
+        let result = conn.query_row("SELECT honker_result_save(1, ?1, 0)", ["not json"], |r| {
+            r.get::<_, i64>(0)
+        });
+        assert_payload_error(result);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn result_save_accepts_every_json_payload_shape() {
+        let conn = db();
+        for (job_id, payload) in VALID_JSON_PAYLOADS.into_iter().enumerate() {
+            let job_id = job_id as i64;
+            conn.query_row(
+                "SELECT honker_result_save(?1, ?2, 0)",
+                params![job_id, payload],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT value FROM _honker_results WHERE job_id = ?1",
+                    [job_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
+    fn scheduler_register_rejects_non_json_payload() {
+        let conn = db();
+        for sql in [
+            "SELECT honker_scheduler_register('nightly-6', 'backups', '@every 1m', ?1, 0, NULL)",
+            "SELECT honker_scheduler_register('nightly-7', 'backups', '@every 1m', ?1, 0, NULL, 3)",
+        ] {
+            let result = conn.query_row(sql, ["not json"], |r| r.get::<_, i64>(0));
+            assert_payload_error(result);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_scheduler_tasks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn scheduler_register_accepts_every_json_payload_shape() {
+        let conn = db();
+        for (index, payload) in VALID_JSON_PAYLOADS.into_iter().enumerate() {
+            let sql = if index % 2 == 0 {
+                "SELECT honker_scheduler_register('nightly', 'backups', '@every 1m', ?1, 0, NULL)"
+            } else {
+                "SELECT honker_scheduler_register('nightly', 'backups', '@every 1m', ?1, 0, NULL, 3)"
+            };
+            conn.query_row(sql, [payload], |r| r.get::<_, i64>(0))
+                .unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
+
+    #[test]
+    fn scheduler_update_rejects_non_json_payload() {
+        let conn = db();
+        conn.query_row(
+            "SELECT honker_scheduler_register('nightly', 'backups', '@every 1m', '{}', 0, NULL, 3)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        for sql in [
+            "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0)",
+            "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0, NULL, 0)",
+        ] {
+            let result = conn.query_row(sql, ["not json"], |r| r.get::<_, i64>(0));
+            assert_payload_error(result);
+        }
+        let stored: String = conn
+            .query_row(
+                "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "{}", "rejected payload must not be written");
+    }
+
+    #[test]
+    fn orm_select_enqueue_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            let result = conn.query_row(
+                "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+                [payload],
+                |r| r.get::<_, i64>(0),
+            );
+            assert_undecodable_payload_error(result, payload);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn stream_publish_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            let result = conn.query_row(
+                "SELECT honker_stream_publish('orders', NULL, ?1)",
+                [payload],
+                |r| r.get::<_, i64>(0),
+            );
+            assert_undecodable_payload_error(result, payload);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_stream", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn result_save_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            let result = conn.query_row("SELECT honker_result_save(1, ?1, 0)", [payload], |r| {
+                r.get::<_, i64>(0)
+            });
+            assert_undecodable_payload_error(result, payload);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn scheduler_register_rejects_undecodable_json_payload() {
+        let conn = db();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            for sql in [
+                "SELECT honker_scheduler_register('nightly-6', 'backups', '@every 1m', ?1, 0, NULL)",
+                "SELECT honker_scheduler_register('nightly-7', 'backups', '@every 1m', ?1, 0, NULL, 3)",
+            ] {
+                let result = conn.query_row(sql, [payload], |r| r.get::<_, i64>(0));
+                assert_undecodable_payload_error(result, payload);
+            }
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_scheduler_tasks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    #[test]
+    fn scheduler_update_rejects_undecodable_json_payload() {
+        let conn = db();
+        conn.query_row(
+            "SELECT honker_scheduler_register('nightly', 'backups', '@every 1m', '{}', 0, NULL, 3)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        for payload in UNDECODABLE_JSON_PAYLOADS {
+            for sql in [
+                "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0)",
+                "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0, NULL, 0)",
+            ] {
+                let result = conn.query_row(sql, [payload], |r| r.get::<_, i64>(0));
+                assert_undecodable_payload_error(result, payload);
+            }
+        }
+        let stored: String = conn
+            .query_row(
+                "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "{}", "rejected payload must not be written");
+    }
+
+    /// The stricter parse also bounds nesting, which the structural scan did
+    /// not -- 50,000 nested arrays used to enqueue. A consumer decoding with
+    /// `serde_json` hits the same bound, so accepting these was the same
+    /// undecodable-job bug in a third shape.
+    ///
+    /// Deliberately does not pin the exact limit: `serde_json` owns that
+    /// number and may move it. 4096 is far enough past any plausible limit to
+    /// stay a rejection, and 32 is shallow enough to stay accepted.
+    #[test]
+    fn enqueue_rejects_nesting_deeper_than_the_decoder_accepts() {
+        let conn = db();
+        let payload = format!("{}{}", "[".repeat(4096), "]".repeat(4096));
+        let result = conn.query_row(
+            "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+            [payload.as_str()],
+            |r| r.get::<_, i64>(0),
+        );
+        assert_undecodable_payload_error(result, "4096 nested arrays");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _honker_live", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "rejected payload must not be written");
+    }
+
+    /// The guard against over-tightening: ordinary nesting must still enqueue.
+    #[test]
+    fn enqueue_accepts_ordinary_nesting() {
+        let conn = db();
+        let payload = format!("{}{}", "[".repeat(32), "]".repeat(32));
+        let id: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('emails', ?1, NULL, NULL, 0, 3, NULL)",
+                [payload.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT payload FROM _honker_live WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, payload);
+    }
+
+    /// Plant schedule rows the way a pre-contract build or raw SQL could
+    /// have written them: no validation, all due at `next_fire_at = 1`.
+    fn plant_legacy_schedules(conn: &Connection, rows: &[(&str, &str)]) {
+        for (name, payload) in rows {
+            conn.execute(
+                "INSERT INTO _honker_scheduler_tasks
+                   (name, queue, cron_expr, payload, priority, next_fire_at,
+                    enabled, max_attempts)
+                 VALUES (?1, 'backups', '@every 1m', ?2, 0, 1, 1, 3)",
+                params![name, payload],
+            )
+            .unwrap();
+        }
+    }
+
+    fn tick(conn: &Connection, at: i64) -> rusqlite::Result<Vec<serde_json::Value>> {
+        let text: String =
+            conn.query_row("SELECT honker_scheduler_tick(?1)", [at], |r| r.get(0))?;
+        Ok(serde_json::from_str(&text).unwrap())
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Existing rows are not validated retroactively, so a schedule
+    /// registered before this contract can still hold text `enqueue` now
+    /// rejects. Such a schedule must not stop the others, and must not
+    /// vanish: each of its due boundaries becomes one `_honker_dead` row
+    /// whose `last_error` names the schedule, and its `next_fire_at`
+    /// advances exactly like a healthy schedule's. The healthy schedule
+    /// fires every boundary once, the bad one is reported once per
+    /// boundary, and nothing repeats on the next tick.
+    #[test]
+    fn a_legacy_schedule_payload_is_dead_lettered_without_blocking_the_tick() {
+        let conn = db();
+        // 'aaa'/'bbb' sort first, so the bad rows are reached before the
+        // healthy one.
+        plant_legacy_schedules(
+            &conn,
+            &[
+                ("aaa-legacy", "not json"),
+                ("bbb-legacy-undecodable", r#""\ud800""#),
+                ("zzz-healthy", "{}"),
+            ],
+        );
+
+        let fires = tick(&conn, 120).expect("a bad schedule row must not fail the tick");
+        assert!(!fires.is_empty());
+        assert!(
+            fires.iter().all(|f| f["name"] == "zzz-healthy"),
+            "only the healthy schedule enqueues: {fires:?}"
+        );
+        let healthy = fires.len() as i64;
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_live"), healthy);
+        for name in ["aaa-legacy", "bbb-legacy-undecodable"] {
+            let dead = count(
+                &conn,
+                &format!(
+                    "SELECT COUNT(*) FROM _honker_dead WHERE queue = 'backups' \
+                     AND last_error LIKE '%\"{name}\"%' AND attempts = 0"
+                ),
+            );
+            assert_eq!(
+                dead, healthy,
+                "{name}: one dead row per skipped boundary, like the healthy fires"
+            );
+        }
+        let not_json: String = conn
+            .query_row(
+                "SELECT last_error FROM _honker_dead WHERE payload = 'not json' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            not_json.contains("honker: payload must be valid JSON")
+                && not_json.contains("honker_scheduler_update"),
+            "{not_json}"
+        );
+        let undecodable: String = conn
+            .query_row(
+                "SELECT last_error FROM _honker_dead WHERE payload LIKE '%ud800%' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(undecodable.contains("cannot be decoded"), "{undecodable}");
+        // The dead rows' run_at values are exactly the healthy fire_at values.
+        let fire_ats: Vec<i64> = fires
+            .iter()
+            .map(|f| f["fire_at"].as_i64().unwrap())
+            .collect();
+        let dead_run_ats: Vec<i64> = conn
+            .prepare("SELECT run_at FROM _honker_dead WHERE payload = 'not json' ORDER BY run_at")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(dead_run_ats, fire_ats);
+        // Every task advanced to the same next boundary.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(DISTINCT next_fire_at) FROM _honker_scheduler_tasks \
+                 WHERE next_fire_at > 120"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM _honker_scheduler_tasks WHERE next_fire_at > 120"
+            ),
+            3
+        );
+
+        // Same instant again: nothing is due, nothing repeats.
+        assert!(tick(&conn, 120).unwrap().is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_live"), healthy);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM _honker_dead"),
+            2 * healthy
+        );
+
+        // Next boundary: the healthy one fires again, the bad ones are
+        // reported again, once each.
+        let soonest = count(&conn, "SELECT honker_scheduler_soonest()");
+        let fires = tick(&conn, soonest).unwrap();
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0]["name"], "zzz-healthy");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM _honker_dead"),
+            2 * healthy + 2
+        );
+
+        // Fixing the payload through the public API makes it fire.
+        conn.query_row(
+            "SELECT honker_scheduler_update('aaa-legacy', NULL, '{\"fixed\":true}', NULL, NULL, 0)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        let soonest = count(&conn, "SELECT honker_scheduler_soonest()");
+        let fires = tick(&conn, soonest).unwrap();
+        let names: Vec<&str> = fires.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["aaa-legacy", "zzz-healthy"]);
+    }
+
+    /// A dead-lettered fire takes its id from `_honker_live`'s sequence, so
+    /// a job that dies later cannot collide with it in `_honker_dead`.
+    #[test]
+    fn a_dead_lettered_fire_does_not_collide_with_later_dead_jobs() {
+        let conn = db();
+        plant_legacy_schedules(&conn, &[("aaa-legacy", "not json")]);
+        // No live row was ever inserted, so the AUTOINCREMENT counter row
+        // does not exist yet: the empty-table case.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_sequence WHERE name = '_honker_live'"
+            ),
+            0
+        );
+        tick(&conn, 120).unwrap();
+        let dead_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM _honker_dead ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!dead_ids.is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_live"), 0);
+        let job: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('backups', '{}', NULL, NULL, 0, 1, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(job > *dead_ids.last().unwrap());
+        let claimed: String = conn
+            .query_row(
+                "SELECT honker_claim_batch('backups', 'w', 1, 60)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(claimed.contains(&format!("\"id\":{job}")), "{claimed}");
+        let moved: i64 = conn
+            .query_row("SELECT honker_fail(?1, 'w', 'boom')", [job], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM _honker_dead"),
+            dead_ids.len() as i64 + 1
+        );
+    }
+
+    /// A dead-lettered fire never touches `_honker_live`: a user INSERT
+    /// or DELETE trigger there must not see a job that never existed.
+    /// Healthy fires in the same tick still insert normally, and their ids
+    /// stay clear of the dead rows' ids.
+    #[test]
+    fn a_dead_lettered_fire_does_not_fire_live_table_triggers() {
+        let conn = db();
+        // The healthy row sorts first, so the counter already exists and
+        // the bad fires draw ids between healthy ones.
+        plant_legacy_schedules(&conn, &[("aaa-healthy", "{}"), ("bbb-legacy", "not json")]);
+        conn.execute_batch(
+            "CREATE TABLE trigger_log (op TEXT, payload TEXT);
+             CREATE TRIGGER user_live_insert AFTER INSERT ON _honker_live
+             BEGIN INSERT INTO trigger_log VALUES ('insert', NEW.payload); END;
+             CREATE TRIGGER user_live_delete AFTER DELETE ON _honker_live
+             BEGIN INSERT INTO trigger_log VALUES ('delete', OLD.payload); END;",
+        )
+        .unwrap();
+        let fires = tick(&conn, 120).unwrap();
+        let healthy = fires.len() as i64;
+        assert!(healthy > 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_dead"), healthy);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM trigger_log WHERE payload = 'not json'"
+            ),
+            0,
+            "a live-table trigger saw the dead-lettered fire"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM trigger_log WHERE op = 'insert' AND payload = '{}'"
+            ),
+            healthy
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM trigger_log WHERE op = 'delete'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM _honker_live l JOIN _honker_dead d ON l.id = d.id"
+            ),
+            0
+        );
+        // Every id handed out is distinct and the counter covers them all.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT seq FROM sqlite_sequence WHERE name = '_honker_live'"
+            ),
+            count(
+                &conn,
+                "SELECT max((SELECT max(id) FROM _honker_live), (SELECT max(id) FROM _honker_dead))"
+            )
+        );
+        let job: i64 = conn
+            .query_row(
+                "SELECT honker_enqueue('backups', '{}', NULL, NULL, 0, 1, NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(job > count(&conn, "SELECT max(id) FROM _honker_dead"));
+    }
+
+    /// A legacy schedule row with `max_attempts < 1` (raw SQL; register
+    /// rejects it since #180) is handled like a bad payload: dead-lettered
+    /// per boundary with an error naming it, advanced, and the other
+    /// schedules keep firing.
+    #[test]
+    fn a_legacy_schedule_with_zero_max_attempts_is_dead_lettered() {
+        let conn = db();
+        plant_legacy_schedules(&conn, &[("aaa-zero", "{}"), ("zzz-healthy", "{}")]);
+        conn.execute(
+            "UPDATE _honker_scheduler_tasks SET max_attempts = 0 WHERE name = 'aaa-zero'",
+            [],
+        )
+        .unwrap();
+        let fires = tick(&conn, 120).expect("max_attempts 0 must not fail the tick");
+        assert!(!fires.is_empty());
+        assert!(
+            fires.iter().all(|f| f["name"] == "zzz-healthy"),
+            "{fires:?}"
+        );
+        let healthy = fires.len() as i64;
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_live"), healthy);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_dead"), healthy);
+        let error: String = conn
+            .query_row("SELECT last_error FROM _honker_dead LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            error.contains("max_attempts must be at least 1, got 0")
+                && error.contains("\"aaa-zero\"")
+                && error.contains("honker_scheduler_update"),
+            "{error}"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(DISTINCT next_fire_at) FROM _honker_scheduler_tasks"
+            ),
+            1
+        );
+        assert!(tick(&conn, 120).unwrap().is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_dead"), healthy);
+        // Fixing max_attempts through the public API makes it fire.
+        conn.query_row(
+            "SELECT honker_scheduler_update('aaa-zero', NULL, NULL, NULL, NULL, 0, 5, 1)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        let soonest = count(&conn, "SELECT honker_scheduler_soonest()");
+        let names: Vec<String> = tick(&conn, soonest)
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["aaa-zero", "zzz-healthy"]);
+    }
+
+    /// The tick is atomic (#173). If recording a skipped fire fails, the
+    /// healthy fires of the same tick roll back with it and no
+    /// `next_fire_at` moves, so the next tick fires them, once.
+    #[test]
+    fn a_failed_dead_letter_rolls_back_the_whole_tick() {
+        let conn = db();
+        plant_legacy_schedules(&conn, &[("aaa-legacy", "not json"), ("zzz-healthy", "{}")]);
+        conn.execute_batch(
+            "CREATE TRIGGER test_block_dead BEFORE INSERT ON _honker_dead
+             BEGIN SELECT RAISE(ABORT, 'dead insert blocked'); END;",
+        )
+        .unwrap();
+        let err = tick(&conn, 120).expect_err("the dead-letter failure reaches the caller");
+        assert!(err.to_string().contains("dead insert blocked"), "{err}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM _honker_live"), 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM _honker_scheduler_tasks WHERE next_fire_at = 1"
+            ),
+            2
+        );
+        conn.execute_batch("DROP TRIGGER test_block_dead").unwrap();
+        let fires = tick(&conn, 120).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM _honker_live"),
+            fires.len() as i64
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM _honker_dead"),
+            fires.len() as i64
+        );
+    }
+
+    #[test]
+    fn scheduler_update_accepts_every_json_payload_shape() {
+        let conn = db();
+        conn.query_row(
+            "SELECT honker_scheduler_register('nightly', 'backups', '@every 1m', '{}', 0, NULL, 3)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+        for (index, payload) in VALID_JSON_PAYLOADS.into_iter().enumerate() {
+            let sql = if index % 2 == 0 {
+                "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0)"
+            } else {
+                "SELECT honker_scheduler_update('nightly', NULL, ?1, NULL, NULL, 0, NULL, 0)"
+            };
+            conn.query_row(sql, [payload], |r| r.get::<_, i64>(0))
+                .unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT payload FROM _honker_scheduler_tasks WHERE name = 'nightly'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, payload);
+        }
+    }
 }
 
 #[cfg(test)]
