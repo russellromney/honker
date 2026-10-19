@@ -404,7 +404,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ matrix.node-version }}
       - uses: actions/setup-python@v7.0.0
