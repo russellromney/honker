@@ -40,7 +40,7 @@ jobs:
           persist-credentials: false
       - name: Set up Rust
         run: rustup default stable
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73  # v6.1.0
         with:
           dotnet-version: "10.0.x"
 
@@ -62,7 +62,7 @@ jobs:
             "native-assets/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}"
 
       - name: Upload native asset
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: native-${{ matrix.rid }}
           path: native-assets/runtimes
@@ -77,12 +77,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73  # v6.1.0
         with:
           dotnet-version: "10.0.x"
 
       - name: Download native assets
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: native-*
           path: packages/honker-dotnet/src/Honker/package-assets/runtimes
@@ -98,7 +98,7 @@ jobs:
           packages/honker-dotnet/scripts/smoke-consumer.sh artifacts/honker-dotnet
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: honker-nuget
           path: artifacts/honker-dotnet/*.nupkg
